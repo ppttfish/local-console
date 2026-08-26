@@ -1,0 +1,56 @@
+name: Release
+
+# 触发条件：v* tag 推送
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:  # 也允许手动触发（Settings → Actions → Run workflow）
+
+permissions:
+  contents: write  # 推 release 要写权限
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+        continue-on-error: true  # 历史 typecheck 错误不阻塞发版
+
+      - name: Build (electron-vite)
+        run: npm run build
+
+      # 只打 portable —— 避开 winCodeSign nsis bug
+      - name: Dist (portable)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win portable --x64 --publish always
+
+      # electron-builder 跑 publish always 会自动把 latest.yml + portable.exe 上传到 release
+      # 但只在该 release 已存在时；所以我们用 softprops/action-gh-release 兜底上传
+
+      - name: Upload artifacts (fallback)
+        if: always()
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/latest*.yml
+            dist/*.exe
+            dist/*.blockmap
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+          draft: false

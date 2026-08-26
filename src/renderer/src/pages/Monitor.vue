@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useAppStore } from '../stores/app'
+import type { PortSnapshot } from '@shared/types'
+import AddServiceDialog from '../components/AddServiceDialog.vue'
 
 const store = useAppStore()
 
@@ -8,6 +10,19 @@ const top = computed(() => {
   return [...store.ports].sort((a, b) => a.port - b.port).slice(0, 50)
 })
 
+
+const showAdd = ref(false)
+const portToAdopt = ref<PortSnapshot | null>(null)
+
+function adopt(p: PortSnapshot) {
+  portToAdopt.value = p
+  showAdd.value = true
+}
+
+function onAdded() {
+  showAdd.value = false
+  portToAdopt.value = null
+}
 function timeAgo(ts: number) {
   const s = Math.floor((Date.now() - ts) / 1000)
   if (s < 60) return `${s} 秒前`
@@ -49,6 +64,7 @@ function timeAgo(ts: number) {
             <th>PID</th>
             <th>应用</th>
             <th>命令</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -61,13 +77,28 @@ function timeAgo(ts: number) {
               <span v-else class="muted">—</span>
             </td>
             <td class="cmd" :title="p.cmd">{{ p.cmd || '—' }}</td>
+            <td>
+              <button
+                v-if="!p.app_id"
+                class="btn-adopt"
+                @click="adopt(p)"
+                title="用这个端口的进程信息建一个服务条目"
+              >加入看板</button>
+            </td>
           </tr>
           <tr v-if="top.length === 0">
-            <td colspan="5" class="muted center">暂无监听端口</td>
+            <td colspan="6" class="muted center">暂无监听端口</td>
           </tr>
         </tbody>
       </table>
     </div>
+
+    <AddServiceDialog
+      v-if="showAdd"
+      :from-port="portToAdopt"
+      @close="onAdded"
+      @added="onAdded"
+    />
   </div>
 </template>
 
@@ -138,5 +169,18 @@ table.ports {
 h3 {
   margin: 0 0 4px;
   font-size: 14px;
+}
+
+.btn-adopt {
+  background: var(--accent);
+  color: var(--accent-fg, #fff);
+  border: 0;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.btn-adopt:hover {
+  filter: brightness(1.1);
 }
 </style>

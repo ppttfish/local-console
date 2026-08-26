@@ -1,9 +1,7 @@
 /**
  * 主进程入口 —— GUI 模式（带文件日志）
- *  - 单实例锁
- *  - 托盘菜单（关窗最小化到托盘）
- *  - 9600 HTTP server（GUI 共享数据）
- *  - 开机自启
+ *
+ * 含：托盘常驻、9600 web、MCP、自动升级（GitHub Releases）
  */
 import {
   app,
@@ -12,21 +10,21 @@ import {
   Tray,
   Menu,
   ipcMain,
-  nativeImage
+  nativeImage,
+  screen
 } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, mkdirSync, existsSync } from 'node:fs'
+import { updater } from './updater.js'
 
 // 单实例锁（必须在 app 初始化前调）
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
   process.exit(0)
+} else {
+  app.on('second-instance', () => showMainWindow())
 }
-app.on('second-instance', () => {
-  // 第二实例：聚焦已有窗口（变量在下方声明）
-  showMainWindow()
-})
 
 const isDev = !app.isPackaged
 let mainWindow: BrowserWindow | null = null
@@ -54,10 +52,10 @@ process.on('unhandledRejection', (reason) => {
 
 // 业务模块
 import { initDatabase, closeDatabase } from './services/db.js'
+import { EventBus } from './services/event-bus.js'
 import { ServiceManager } from './services/service-manager.js'
 import { PortScanner } from './services/port-scanner.js'
 import { LogStreamer } from './services/log-streamer.js'
-import { EventBus } from './services/event-bus.js'
 import { PluginRegistry } from './plugins/registry.js'
 import { registerIpcHandlers } from './ipc/index.js'
 import { startMcpSubprocess } from './mcp/spawn.js'
@@ -84,27 +82,29 @@ async function createMainWindow(): Promise<void> {
   const iconPath = isDev
     ? join(__dirname, '../../build/icon.ico')
     : join(process.resourcesPath, 'icon.ico')
-  const icon = existsSync(iconPath)
-    ? nativeImage.createFromPath(iconPath)
-    : undefined
 
-  mainWindow = new BrowserWindow({
+  const opts: Electron.BrowserWindowConstructorOptions = {
     width: 1280,
-    height: 820,
-    minWidth: 960,
-    minHeight: 640,
-    title: '本地总台',
-    backgroundColor: '#0f172a',
+    height: 800,
+    minWidth: 900,
+    minHeight: 600,
     show: false,
+    icon: existsSync(iconPath) ? iconPath : undefined,
     autoHideMenuBar: true,
-    icon: icon && !icon.isEmpty() ? icon : undefined,
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
-      sandbox: false,
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: false
     }
-  })
+  }
+  if (process.platform === 'win32') {
+    // 多显示器时把窗口放到主屏，避免窗口跑到不可见坐标
+    const display = screen.getPrimaryDisplay()
+    opts.x = display.workArea.x + 50
+    opts.y = display.workArea.y + 50
+  }
+  mainWindow = new BrowserWindow(opts)
   slog('createMainWindow: BrowserWindow created')
 
   mainWindow.on('ready-to-show', () => {
@@ -122,7 +122,7 @@ async function createMainWindow(): Promise<void> {
     }
   })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    void shell.openExternal(url)
     return { action: 'deny' }
   })
   mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
@@ -135,8 +135,8 @@ async function createMainWindow(): Promise<void> {
   if (isDev && process.env['ELECTRON_RENDERER_URL']) {
     await mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    const outsideRenderer = join(process.resourcesPath, 'renderer', 'index.html')
-    const insideAsr = join(__dirname, '../renderer/index.html')
+    const outsideRenderer = join(__dirname, '../renderer/index.html')
+    const insideAsr = join(process.resourcesPath, 'renderer/index.html')
     const indexFile = existsSync(outsideRenderer) ? outsideRenderer : insideAsr
     slog(`loadFile: ${indexFile} (exists=${existsSync(indexFile)})`)
     await mainWindow.loadFile(indexFile)
@@ -174,6 +174,19 @@ function buildTray(): void {
         click: () => shell.openPath(logsDir)
       },
       { type: 'separator' },
+      {
+        label: '检查更新',
+        click: async () => {
+          const r = await updater.checkInteractive()
+          if (r.status === 'dev-skip') {
+            slog('tray: check update skipped (dev)')
+          } else if (r.status === 'available') {
+            slog(`tray: update available v${r.version}`)
+          } else {
+            slog(`tray: check result=${r.status} err=${r.error ?? '-'}`)
+          }
+        }
+      },
       {
         label: '开机自启',
         type: 'checkbox',
@@ -217,13 +230,10 @@ app.whenReady().then(async () => {
 
   // 2. 单实例在拿到锁后，初始化共享模块
   try {
-    ;(serviceManager as unknown) = new ServiceManager(bus, {
-      userData,
-      logsDir
-    })
-    ;(portScanner as unknown) = new PortScanner(bus)
-    ;(logStreamer as unknown) = new LogStreamer(bus, logsDir)
-    ;(pluginRegistry as unknown) = new PluginRegistry(bus, app.getVersion())
+    serviceManager = new ServiceManager(bus, { userData, logsDir })
+    portScanner = new PortScanner(bus)
+    logStreamer = new LogStreamer(bus, logsDir)
+    pluginRegistry = new PluginRegistry(bus, app.getVersion())
     slog('shared instances created')
   } catch (e) {
     slog(`shared instance error: ${(e as Error).message}`)
@@ -288,6 +298,14 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) void createMainWindow()
   })
 
+  // 9. 自动升级
+  try {
+    updater.init()
+    slog('updater initialized')
+  } catch (e) {
+    slog(`updater init error: ${(e as Error).message}`)
+  }
+
   slog('all init done')
 })
 
@@ -298,17 +316,8 @@ app.on('window-all-closed', () => {
 app.on('before-quit', async () => {
   isQuitting = true
   try {
-    if (serviceManager && typeof serviceManager.stopAll === 'function') {
-      await serviceManager.stopAll()
-    }
-    if (portScanner && typeof portScanner.stop === 'function') {
-      await portScanner.stop()
-    }
-    if (logStreamer && typeof logStreamer.stop === 'function') {
-      await logStreamer.stop()
-    }
+    closeDatabase()
   } catch (e) {
     slog(`before-quit error: ${(e as Error).message}`)
   }
-  closeDatabase()
 })

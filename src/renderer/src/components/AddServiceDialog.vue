@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { useAppStore } from '../stores/app'
-import type { ProjectDetection, ProjectCandidate } from '@shared/types'
+import { ref, watch } from 'vue'
 
+import { useAppStore } from '../stores/app'
+import type { ProjectDetection, ProjectCandidate, PortSnapshot } from '@shared/types'
+
+const props = defineProps<{ fromPort?: PortSnapshot | null }>()
 const emit = defineEmits<{ close: []; added: [] }>()
 const store = useAppStore()
 
@@ -14,6 +16,23 @@ const kind = ref<'service' | 'task'>('service')
 const detection = ref<ProjectDetection | null>(null)
 const error = ref('')
 const saving = ref(false)
+
+// 从已有端口入服务：把进程的 cwd/cmd/port 预填进表单，名称用「进程名@端口」。
+// cwd 为空（系统服务 / 取不到）必须让用户自己选目录再保存，避免入库后无法启动。
+function applyFromPort(p: PortSnapshot): void {
+  if (!name.value) name.value = `${p.process_name || 'port'}-${p.port}`
+  if (!port.value) port.value = p.port
+  if (p.cwd) cwd.value = p.cwd
+  if (p.cmd) command.value = p.cmd
+}
+
+watch(
+  () => props.fromPort,
+  (p) => {
+    if (p) applyFromPort(p)
+  },
+  { immediate: true }
+)
 
 async function pickFolder() {
   const r = (await store.pickFolder()) as { ok: boolean; path?: string }
@@ -67,7 +86,7 @@ async function save() {
   <div class="mask" @click.self="emit('close')">
     <div class="dialog card">
       <header>
-        <h2>添加服务</h2>
+        <h2>{{ props.fromPort ? `接管端口 :${props.fromPort.port}` : '添加服务' }}</h2>
         <button class="close" @click="emit('close')">×</button>
       </header>
 

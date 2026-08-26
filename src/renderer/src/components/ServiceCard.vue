@@ -21,6 +21,14 @@ const statusLabel = computed(() => {
   return map[props.service.status]
 })
 
+// 从端口接管的条目：本控制台没有 ServiceManager 实例在跑它，
+// 但它的端口仍被外部进程占着。状态如实显示 stopped/failed，并给个提示。
+const isAdoptedExternal = computed(
+  () =>
+    (props.service.status === 'stopped' || props.service.status === 'failed') &&
+    props.service.pid === null
+)
+
 const uptimeText = computed(() => {
   if (props.service.status !== 'running') return ''
   const s = props.service.uptime_sec
@@ -66,6 +74,11 @@ function confirmDelete() {
       </div>
     </div>
 
+    <div v-if="isAdoptedExternal" class="hint">
+      此条目从外部端口接管，本控制台未运行它。点「启动」会用上面的命令
+      在「工作区」里拉起一个新进程。
+    </div>
+
     <div class="ops">
       <button
         v-if="service.status === 'stopped' || service.status === 'failed'"
@@ -88,7 +101,12 @@ function confirmDelete() {
       </button>
 
       <button
-        v-if="service.status === 'running'"
+        :disabled="service.status !== 'running'"
+        :title="
+          service.status === 'running'
+            ? '先停止再启动'
+            : '请先启动，再使用重启'
+        "
         @click="emit('restart')"
       >
         重启
@@ -128,9 +146,34 @@ function confirmDelete() {
 }
 .row {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   align-items: baseline;
+  line-height: 1.5;
 }
+.row > .muted:first-child {
+  flex: 0 0 auto;
+  min-width: 3.5em;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.row code {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+.hint {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--bg-soft);
+  border-left: 2px solid var(--warn);
+  padding: 6px 8px;
+  border-radius: 3px;
+}
+
 code {
   font-family: 'Geist Mono', 'Cascadia Code', Consolas, monospace;
   font-size: 11.5px;

@@ -47,6 +47,19 @@ const api = {
   usageRescan: () => invoke(IpcChannels.UsageRescan),
   usageStatus: () => invoke(IpcChannels.UsageStatus),
 
+  // 自动升级
+  checkUpdate: () => invoke('app:check-update') as Promise<{
+    status: 'no-update' | 'available' | 'dev-skip' | 'error'
+    version?: string
+    error?: string
+  }>,
+  getUpdateStatus: () => invoke('app:get-update-status') as Promise<{
+    currentVersion: string
+    lastCheck: { at: number; result: string; newVersion?: string; error?: string } | null
+    downloaded: boolean
+    pendingVersion?: string
+  }>,
+
   // 事件订阅
   onStateChanged: (cb: (s: unknown) => void) => {
     const handler = (_e: unknown, payload: unknown) => cb(payload)
