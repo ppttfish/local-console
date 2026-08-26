@@ -43,6 +43,7 @@ export interface LcpApi {
   subDelete: (id: number) => Promise<unknown>
   subRefresh: (id: number) => Promise<unknown>
   subProviders: () => Promise<unknown>
+  subDiscover: () => Promise<unknown>
   onStateChanged: (cb: (s: AppState) => void) => () => void
   onServiceLog: (cb: (p: { id: string; text: string }) => void) => () => void
 }

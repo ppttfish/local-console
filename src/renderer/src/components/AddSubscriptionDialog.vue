@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import type { ProviderMeta, ConfigField, Sub } from '../types/subscription'
+import type {
+  ProviderMeta,
+  ConfigField,
+  Sub,
+  DiscoveredCredential
+} from '../types/subscription'
 
 const props = defineProps<{ editing?: Sub | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
@@ -34,11 +39,19 @@ const meta = computed<ProviderMeta | undefined>(
   () => metas.value.find((m) => m.id === provider.value)
 )
 
+const discovered = ref<DiscoveredCredential[]>([])
+const useDiscovered = ref<string>('') // 选中的 opencode authKey
+
 void (async () => {
   try {
     metas.value = (await window.lcp.subProviders()) as ProviderMeta[]
   } catch {
     metas.value = []
+  }
+  try {
+    discovered.value = (await window.lcp.subDiscover()) as DiscoveredCredential[]
+  } catch {
+    discovered.value = []
   }
   if (!provider.value && metas.value.length > 0) {
     selectProvider(props.editing?.provider ?? metas.value[0]!.id)
@@ -62,6 +75,10 @@ function selectProvider(id: string) {
   }
 }
 
+function providerLabel(providerId: string): string {
+  return metas.value.find((m) => m.id === providerId)?.label ?? providerId
+}
+
 function fieldsOf(m: ProviderMeta | undefined): ConfigField[] {
   return m?.configSchema ?? []
 }
@@ -77,8 +94,8 @@ async function save() {
     error.value = '名称必填'
     return
   }
-  // 必填校验；编辑时 credential 留空 = 保持不变
-  if (!props.editing || credential.value) {
+  // 必填校验；编辑时 credential 留空 = 保持不变；选了 opencode 发现的凭证则免填
+  if (!useDiscovered.value && (!props.editing || credential.value)) {
     if (!credential.value.trim() && m.id !== 'generic') {
       error.value = '凭证必填（API key / token）'
       return
@@ -114,6 +131,7 @@ async function save() {
         provider: provider.value,
         displayName: displayName.value,
         credential: credential.value || '-',
+        ...(useDiscovered.value ? { opencodeKey: useDiscovered.value } : {}),
         config: cfgObj
       })
     }
@@ -151,7 +169,28 @@ async function save() {
         <input v-model="displayName" placeholder="例如：Claude Max" />
       </div>
 
-      <div class="field">
+      <div v-if="!editing && discovered.length > 0" class="field">
+        <label>从 OpenCode 导入凭证</label>
+        <div class="disc-list">
+          <button
+            v-for="d in discovered"
+            :key="d.authKey"
+            type="button"
+            class="disc-item"
+            :class="{ selected: useDiscovered === d.authKey }"
+            @click="
+              useDiscovered = useDiscovered === d.authKey ? '' : d.authKey;
+              if (useDiscovered) { const pm = metas.find((x) => x.id === d.providerId); if (pm) selectProvider(pm.id); }
+            "
+          >
+            <span>{{ providerLabel(d.providerId) }}</span>
+            <code>{{ d.masked }}</code>
+          </button>
+        </div>
+        <span class="hint">检测到 OpenCode 已登录的 Provider，点选即可复用其凭证（明文不经过界面）</span>
+      </div>
+
+      <div v-if="!useDiscovered" class="field">
         <label>{{ editing ? '凭证（留空 = 不修改）' : '凭证' }}</label>
         <input
           v-model="credential"
@@ -159,7 +198,7 @@ async function save() {
           :placeholder="editing ? '••••••••' : 'sk-...'"
           autocomplete="off"
         />
-        <span class="hint">仅保存在本机 SQLite；列表中只显示前 4 位掩码</span>
+        <span class="hint">仅保存在本机 SQLite；列表中只显示掩码</span>
       </div>
 
       <div v-for="f in fieldsOf(meta)" :key="f.key" class="field">
@@ -211,6 +250,42 @@ async function save() {
 .dialog h2 {
   margin: 0 0 14px;
   font-size: 16px;
+}
+.row {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+.disc-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.disc-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.disc-item:hover {
+  border-color: var(--accent);
+}
+.disc-item.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.disc-item code {
+  font-size: 10.5px;
+  opacity: 0.75;
 }
 .field {
   display: flex;

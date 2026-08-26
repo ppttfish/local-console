@@ -54,6 +54,7 @@ const api = {
   subDelete: (id: number) => invoke(IpcChannels.SubDelete, id),
   subRefresh: (id: number) => invoke(IpcChannels.SubRefresh, id),
   subProviders: () => invoke(IpcChannels.SubProviders),
+  subDiscover: () => invoke(IpcChannels.SubDiscover),
 
   // 自动升级
   checkUpdate: () => invoke('app:check-update') as Promise<{

@@ -70,6 +70,7 @@ export function installWebBridge(): void {
       post('/api/subscription/delete', { id }).then(() => ({ ok: true })),
     subRefresh: (id) => post('/api/subscription/refresh', { id }),
     subProviders: () => post('/api/subscription/providers'),
+    subDiscover: () => post('/api/subscription/discover'),
     onStateChanged: (_cb: (s: AppState) => void) => {
       // 简易轮询代替 IPC 推送
       return () => {

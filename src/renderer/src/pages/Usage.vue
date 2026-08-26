@@ -138,10 +138,45 @@ function subStatus(s: Sub): 'active' | 'stale' | 'error' {
   return Date.now() - s.lastRefreshAt <= 10 * 60 * 1000 ? 'active' : 'stale'
 }
 
-function quotaTone(pct: number): 'ok' | 'warn' | 'danger' {
-  if (pct >= 90) return 'danger'
-  if (pct >= 70) return 'warn'
+function quotaTone(pct: number | null | undefined): 'ok' | 'warn' | 'danger' {
+  const p = pct ?? 0
+  if (p >= 90) return 'danger'
+  if (p >= 70) return 'warn'
   return 'ok'
+}
+
+/** 卡片主进度：单窗用 usedPct；多窗取最紧急（最大）的非空窗口 */
+function primaryPct(s: Sub): number | null {
+  const snap = s.lastSnapshot
+  if (!snap) return null
+  const fromWindows = (snap.windows ?? [])
+    .map((w) => w.usedPct)
+    .filter((v): v is number => typeof v === 'number')
+  if (fromWindows.length > 0) {
+    // 有 error 态的窗口（如超限）优先显示
+    return Math.max(...fromWindows)
+  }
+  return typeof snap.usedPct === 'number' ? snap.usedPct : null
+}
+
+/** 主进度对应的重置时间 */
+function primaryResetAt(s: Sub): number | null {
+  const snap = s.lastSnapshot
+  if (!snap) return null
+  const pct = primaryPct(s)
+  const hit = (snap.windows ?? []).find((w) => w.usedPct === pct)
+  if (hit?.resetAt) return hit.resetAt
+  if (snap.windowEnd) return snap.windowEnd
+  const firstWithReset = (snap.windows ?? []).find((w) => w.resetAt)
+  return firstWithReset?.resetAt ?? null
+}
+
+/** 已用/总量文案（仅单窗模型有） */
+function usedLabel(s: Sub): string | null {
+  const snap = s.lastSnapshot
+  if (!snap || typeof snap.used !== 'number') return null
+  const lim = typeof snap.limit === 'number' ? snap.limit : null
+  return lim ? `${fmtToken(snap.used)} / ${fmtToken(lim)}` : fmtToken(snap.used)
 }
 
 /** 剩余时间 → "2h 15m 后" / "3 天后" */
@@ -576,27 +611,55 @@ const granularityLabel = computed(() =>
             >刷新中…</span>
           </div>
 
-          <template v-if="s.lastSnapshot">
+          <template v-if="s.lastSnapshot && (primaryPct(s) !== null || (s.lastSnapshot.windows?.length ?? 0) > 0)">
             <div class="sub-numbers">
               <div class="sub-used">
-                已用 <strong>{{ fmtToken(s.lastSnapshot.used) }}</strong> / {{ fmtToken(s.lastSnapshot.limit) }}
+                <template v-if="usedLabel(s)">已用 <strong>{{ usedLabel(s)?.split(' / ')[0] }}</strong> / {{ usedLabel(s)?.split(' / ')[1] }}</template>
+                <template v-else-if="s.lastSnapshot.planLabel">套餐 {{ s.lastSnapshot.planLabel }}</template>
+                <template v-else>配额</template>
               </div>
-              <div class="big-pct" :class="quotaTone(s.lastSnapshot.usedPct)">
-                {{ s.lastSnapshot.usedPct.toFixed(1) }}%
+              <div class="big-pct" :class="quotaTone(primaryPct(s))">
+                {{ primaryPct(s) === null ? '—' : primaryPct(s)!.toFixed(1) + '%' }}
               </div>
             </div>
+
+            <!-- 主进度条：最紧急窗口 -->
             <div class="quota-bar">
               <div
                 class="quota-fill"
-                :class="quotaTone(s.lastSnapshot.usedPct)"
-                :style="{ width: Math.min(100, s.lastSnapshot.usedPct) + '%' }"
+                :class="quotaTone(primaryPct(s))"
+                :style="{ width: Math.min(100, primaryPct(s) ?? 0) + '%' }"
               />
             </div>
-            <div class="sub-meta">
-              <span>剩余 {{ fmtToken(s.lastSnapshot.remaining) }}</span>
-              <span v-if="s.lastSnapshot.windowEnd">
-                下次重置 {{ fmtCountdown(s.lastSnapshot.windowEnd) }}
+
+            <!-- 多窗明细 -->
+            <div
+              v-for="w in s.lastSnapshot.windows ?? []"
+              :key="w.label"
+              class="win-row"
+            >
+              <span class="win-label">{{ w.label }}</span>
+              <span class="win-bar">
+                <span
+                  class="win-fill"
+                  :class="quotaTone(w.usedPct)"
+                  :style="{ width: Math.min(100, w.usedPct ?? 0) + '%' }"
+                />
               </span>
+              <span class="win-pct" :class="quotaTone(w.usedPct)">
+                {{ w.usedPct === null ? '—' : Math.round(w.usedPct) + '%' }}
+              </span>
+              <span class="win-reset">{{ w.resetAt ? fmtCountdown(w.resetAt) : '' }}</span>
+            </div>
+
+            <div class="sub-meta">
+              <span v-if="typeof s.lastSnapshot.remaining === 'number'">
+                剩余 {{ fmtToken(s.lastSnapshot.remaining) }}
+              </span>
+              <span v-else-if="primaryResetAt(s)">
+                最近重置 {{ fmtCountdown(primaryResetAt(s)!) }}
+              </span>
+              <span v-else></span>
             </div>
           </template>
 
@@ -1184,8 +1247,60 @@ code {
 .quota-fill.warn {
   background: linear-gradient(90deg, var(--warn), #fbbf24);
 }
-.quota-fill.danger {
-  background: linear-gradient(90deg, var(--danger), #f87171);
+.win-row {
+  display: grid;
+  grid-template-columns: 84px 1fr 42px auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 11px;
+}
+.win-label {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.win-bar {
+  display: block;
+  height: 5px;
+  background: var(--bg-soft);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.win-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+.win-fill.ok {
+  background: var(--success);
+}
+.win-fill.warn {
+  background: var(--warn);
+}
+.win-fill.danger {
+  background: var(--danger);
+}
+.win-pct {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.win-pct.ok {
+  color: var(--success);
+}
+.win-pct.warn {
+  color: var(--warn);
+}
+.win-pct.danger {
+  color: var(--danger);
+}
+.win-reset {
+  color: var(--muted);
+  font-size: 10.5px;
+  min-width: 64px;
+  text-align: right;
 }
 .quota-fill.unknown {
   width: 100%;

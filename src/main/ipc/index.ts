@@ -29,8 +29,8 @@ import {
 } from '../plugins/builtin/token-usage/subscriptions.js'
 import { SubscriptionRefresher } from '../plugins/builtin/token-usage/refresh.js'
 import { listProviderMetas } from '../plugins/builtin/token-usage/providers/index.js'
+import { discoverOpencodeCredentials } from '../plugins/builtin/token-usage/opencode-auth.js'
 import type { AppState, PortSnapshot, ServiceState } from '@shared/types'
-
 let usageScanner: UsageScanner | null = null
 const subRefresher = new SubscriptionRefresher()
 
@@ -181,6 +181,10 @@ export function registerIpcHandlers(
     return getSubscription(id)
   })
   ipcMain.handle(IpcChannels.SubProviders, () => listProviderMetas())
+  ipcMain.handle(IpcChannels.SubDiscover, () =>
+    discoverOpencodeCredentials()
+  )
+
 
   // 启动 scheduler
   subRefresher.start()

@@ -33,6 +33,7 @@ import {
 } from './plugins/builtin/token-usage/subscriptions.js'
 import { SubscriptionRefresher } from './plugins/builtin/token-usage/refresh.js'
 import { listProviderMetas } from './plugins/builtin/token-usage/providers/index.js'
+import { discoverOpencodeCredentials } from './plugins/builtin/token-usage/opencode-auth.js'
 import { getDataDir, getLogDir } from './utils/paths.js'
 import { app } from 'electron'
 
@@ -263,6 +264,9 @@ async function handleApi(
     }
     if (pathname === '/api/subscription/providers' && req.method === 'GET') {
       return json(res, 200, listProviderMetas())
+    }
+    if (pathname === '/api/subscription/discover' && req.method === 'GET') {
+      return json(res, 200, discoverOpencodeCredentials())
     }
     if (pathname === '/api/subscription/get' && req.method === 'GET') {
       const id = Number(_url.searchParams.get('id'))

@@ -1,16 +1,26 @@
 /**
  * 订阅监控 —— 渲染端共享类型
- * 与主进程 src/main/plugins/builtin/token-usage/subscriptions.ts 的结构对齐
+ * 与主进程 src/main/plugins/builtin/token-usage/providers/types.ts 对齐
  */
 
+export interface QuotaWindow {
+  /** 窗口标签：'5h' / 'weekly' / 'MCP Tools' 等 */
+  label: string
+  usedPct: number | null
+  resetAt: number | null
+  valueLabel?: string | null
+}
+
 export interface QuotaSnapshot {
-  used: number
-  limit: number
-  remaining: number
-  usedPct: number
+  used?: number
+  limit?: number
+  remaining?: number
+  usedPct?: number
   windowStart?: number
   windowEnd?: number
   currency?: string
+  planLabel?: string | null
+  windows?: QuotaWindow[]
   extra?: Record<string, unknown>
 }
 
@@ -43,4 +53,11 @@ export interface ProviderMeta {
   configSchema: ConfigField[]
   color: string
   short: string
+}
+
+/** OpenCode auth.json 里发现的凭证（掩码） */
+export interface DiscoveredCredential {
+  providerId: string
+  authKey: string
+  masked: string
 }

@@ -49,7 +49,8 @@ export const IpcChannels = {
   SubUpdate: 'subscription:update',
   SubDelete: 'subscription:delete',
   SubRefresh: 'subscription:refresh',
-  SubProviders: 'subscription:providers'
+  SubProviders: 'subscription:providers',
+  SubDiscover: 'subscription:discover'
  } as const
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels]
