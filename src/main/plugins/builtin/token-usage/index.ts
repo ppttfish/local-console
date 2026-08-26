@@ -2,8 +2,11 @@
  * token-usage 插件 v2 —— 完整版
  *  - 5 agent 数据源：omp / zcode / opencode / codex / claude
  *  - USD 成本 + 缓存分读/写
+ *  - 订阅监控：6 个 provider（generic / anthropic / openai / MiniMax / kimi / zcode）
  *  - MCP：pws_query_agent_usage / pws_list_agents / pws_rescan_agents / pws_get_pricing
+ *        + pws_list_subscriptions / pws_refresh_subscription / pws_list_subscription_providers
  *  - IPC：summary / timeline / models / agents / sessions / rescan / status / pricing
+ *        + subscription:list/get/create/update/delete/refresh/providers
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
@@ -19,20 +22,35 @@ import {
   type UsageFilter
 } from './storage.js'
 import { loadPricing, type ModelPrice } from './pricing.js'
+import {
+  ensureSubscriptionSchema,
+  listSubscriptions,
+  getSubscription,
+  createSubscription,
+  updateSubscription,
+  deleteSubscription,
+  type CreateSubscriptionInput
+} from './subscriptions.js'
+import { SubscriptionRefresher } from './refresh.js'
+import { listProviderMetas } from './providers/index.js'
 
 const scanner = new UsageScanner()
+const subRefresher = new SubscriptionRefresher()
 
 export const tokenUsagePlugin: Plugin = {
   id: 'token-usage',
   name: 'Agent Token 用量统计',
-  version: '2.0.0',
+  version: '2.1.0',
   description:
-    '统计本机 agent (omp / zcode / opencode / codex / claude) 的 token 用量、成本与模型分布',
+    '统计本机 agent (omp / zcode / opencode / codex / claude) 的 token 用量、成本与模型分布；监控 AI 服务商订阅配额',
+
 
   async onLoad(ctx) {
     ensureUsageSchema()
+    ensureSubscriptionSchema()
     loadPricing()
     scanner.start()
+    subRefresher.start()
     scanner.on('scanned', (e: unknown) => {
       ctx.bus.emit('token-usage:scanned', e)
     })
@@ -41,6 +59,7 @@ export const tokenUsagePlugin: Plugin = {
 
   onUnload() {
     scanner.stop()
+    subRefresher.stop()
   },
 
   registerMcpTools(server: McpServer) {
@@ -95,6 +114,31 @@ export const tokenUsagePlugin: Plugin = {
       {},
       async () => textJson({ models: loadPricing() })
     )
+
+    // ===== 订阅监控 =====
+    server.tool(
+      'pws_list_subscriptions',
+      '列出所有已添加的 AI 服务商订阅及其最新配额快照',
+      {},
+      async () => textJson({ subscriptions: listSubscriptions() })
+    )
+
+    server.tool(
+      'pws_refresh_subscription',
+      '手动触发某条订阅的立即刷新（按 id）',
+      { id: z.number().int().positive() },
+      async (args) => {
+        await subRefresher.refreshOne(args.id)
+        return textJson({ subscription: getSubscription(args.id) })
+      }
+    )
+
+    server.tool(
+      'pws_list_subscription_providers',
+      '列出所有支持的 Provider 适配器元信息（id / label / builtin / configSchema）',
+      {},
+      async () => textJson({ providers: listProviderMetas() })
+    )
   }
 }
 
@@ -105,4 +149,15 @@ function textJson(data: unknown) {
 }
 
 // 显式 re-export
-export { scanner, type ModelPrice }
+export {
+  scanner,
+  subRefresher,
+  type ModelPrice,
+  type CreateSubscriptionInput,
+  // 给 IPC / HTTP 层用
+  listSubscriptions,
+  getSubscription,
+  createSubscription,
+  updateSubscription,
+  deleteSubscription
+}
