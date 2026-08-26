@@ -1,0 +1,110 @@
+{
+  "name": "local-console",
+  "productName": "Local Console",
+  "version": "0.2.0",
+  "description": "本地服务与批处理任务的统一管理面板；MCP-first，agent 原生可调用。",
+  "main": "out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
+    "lint": "eslint .",
+    "start": "electron .",
+    "start:web": "electron out/main/http-standalone.js",
+    "package": "npm run build && electron-builder",
+    "package:win": "npm run build && electron-builder --win --x64",
+    "package:dir": "npm run build && electron-builder --dir",
+    "package:portable": "npm run build && electron-builder --win portable --x64",
+    "mcp": "electron out/main/mcp/standalone.js"
+  },
+  "bin": {
+    "lcp": "out/cli/lcp.js"
+  },
+  "author": "you",
+  "license": "MIT",
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^2.3.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-vue": "^9.27.0",
+    "png-to-ico": "^3.0.2",
+    "sharp": "^0.34.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.3.5",
+    "vue-eslint-parser": "^9.4.3",
+    "vue-tsc": "^2.2.12",
+    "ws": "^8.21.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "better-sqlite3": "^11.1.2",
+    "chart.js": "^4.5.1",
+    "pinia": "^2.2.0",
+    "vue": "^3.4.38",
+    "vue-chartjs": "^5.3.4",
+    "vue-router": "^4.4.3"
+  },
+  "build": {
+    "appId": "com.localconsole.app",
+    "productName": "本地总台",
+    "copyright": "© 2026 Local Console",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json",
+      "!**/.DS_Store",
+      "!**/node_modules/.cache"
+    ],
+    "extraResources": [
+      {
+        "from": "out/renderer",
+        "to": "renderer"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "本地总台",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    },
+    "asar": true,
+    "compression": "maximum"
+  }
+}
