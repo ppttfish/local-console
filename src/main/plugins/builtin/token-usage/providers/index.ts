@@ -12,6 +12,8 @@ import kimi from './kimi.js'
 import zai from './zai.js'
 import zhipu from './zhipu.js'
 import openrouter from './openrouter.js'
+import opencodeGo from './opencodeGo.js'
+import commandCode from './commandCode.js'
 
 export const providers: Record<string, ProviderAdapter> = {
   generic,
@@ -22,7 +24,9 @@ export const providers: Record<string, ProviderAdapter> = {
   'minimax-io': minimaxIo,
   'minimax-cn': minimaxCn,
   kimi,
-  openrouter
+  openrouter,
+  'opencode-go': opencodeGo,
+  'command-code': commandCode
 }
 
 export interface ProviderMeta {
@@ -44,7 +48,9 @@ const META_EXTRAS: Record<string, { color: string; short: string }> = {
   'minimax-io': { color: '#f43f5e', short: 'M' },
   'minimax-cn': { color: '#fb7185', short: 'M' },
   kimi: { color: '#1e293b', short: 'K' },
-  openrouter: { color: '#8b5cf6', short: 'R' }
+  openrouter: { color: '#8b5cf6', short: 'R' },
+  'opencode-go': { color: '#0ea5e9', short: 'G' },
+  'command-code': { color: '#22c55e', short: 'C' }
 }
 
 export function listProviderMetas(): ProviderMeta[] {

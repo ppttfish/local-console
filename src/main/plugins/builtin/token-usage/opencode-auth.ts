@@ -18,7 +18,9 @@ const ALIAS_MAP: Record<string, string> = {
   'minimax-cn-coding-plan': 'minimax-cn',
   'kimi-for-coding': 'kimi',
   kimi: 'kimi',
-  openrouter: 'openrouter'
+  openrouter: 'openrouter',
+  'opencode-go': 'opencode-go',
+  'command-code': 'command-code'
 }
 
 export interface DiscoveredCredential {
