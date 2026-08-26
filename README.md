@@ -248,38 +248,131 @@ function parseYourAgentLine(line: string, ctx: ParseContext): UsageRow | null {
 
 走 **GitHub Releases + electron-updater**。`v0.2.1` 起内置。
 
-### 发版流程
+### 产物命名规则
+
+| 类型 | 命名 | 备注 |
+|---|---|---|
+| portable exe | `local-console-{ver}-portable.exe` | 单文件，开箱即用 |
+| win-unpacked | `dist/win-unpacked/` | 开发用，`.bat` 启动 |
+| 升级元数据 | `latest.yml` + `*.blockmap` | electron-updater 必读 |
+| 旧版（v0.2.1） | `本地总台-0.2.1-Portable.exe` | 中文名（v0.2.2 起改 ASCII） |
+
+### 完整发版流程
+
+**前置**：本地已 `git push` 过、有 GitHub Actions 写权限的 PAT（或 repo 开启 Actions 默认 token）。
+
+#### 1. 改源码
 
 ```bash
-# 1. 改 package.json version（如 0.2.1 → 0.3.0），提交
-git add -A && git commit -m "release: 0.3.0"
-
-# 2. 打 tag + 推
-git tag v0.3.0 && git push origin main v0.3.0
+# 改 src/、renderer/、package.json（dependencies）等
+# 改 package.json 的 version 字段：0.2.1 → 0.2.2
 ```
 
-GitHub Actions 自动跑 `.github/workflows/release.yml`：
-- windows-latest runner
-- `npm ci` → `npm run build` → `electron-builder --win portable --x64`
-- 产物 `本地总台-0.3.0-Portable.exe` + `latest.yml` + `*.blockmap`
-- 自动创建 / 更新 GitHub Release
+#### 2. typecheck + 本地 dev 验证
 
-### 升级体验
+```bash
+npm run typecheck
+npm run build
+npm run dist:portable   # 本地试打 portable（可选；winCodeSign 有 bug 见下）
+```
 
-- **被动**：本地 GUI 启动 30s 后 + 每小时一次后台检查 GitHub latest.yml
-- **主动**：托盘菜单「检查更新」或设置页「检查更新」按钮
-- **发现新版本**：主进程弹独立窗口，显示「当前 → 新」+ release notes
-- **下载**：进度条 + 速度
-- **安装**：点「立即重启并升级」→ `quitAndInstall()` → 重启新版本
-- **跳过**：点「稍后」只关弹窗，下次启动继续后台检查
+#### 3. 提交 + 推 main
 
-### 已知限制
+```bash
+git add -A
+git commit -m "feat: xxx"            # 或 fix/refactor/docs
+git push origin main
+```
 
-- portable 走 `quitAndInstall` 重启新版本，**第一次需要手动从 GitHub Releases 下载 portable.exe 安装**（之后所有更新都自动）
+#### 4. 打 tag + 推 tag（触发 Actions）
 
+```bash
+git tag v0.2.2
+git push origin v0.2.2
+```
 
+**注意**：tag 必须 `v{version}` 格式（如 `v0.2.2`），workflow 的 `on.push.tags: 'v*'` 才匹配。
 
----
+#### 5. GitHub Actions 跑
+
+打开 `https://github.com/{owner}/{repo}/actions` → 选最新 `Release` workflow：
+
+- 大约 3-5 分钟
+- 步骤：`checkout` → `setup-node` → `npm ci` → `typecheck` → `build` → `dist portable` → `upload artifacts`
+- 看到 ✅ 绿勾就是成功
+- **如果失败**：点进步骤看 stderr（最常见是 winCodeSign 网络问题，重跑 retry 即可）
+
+#### 6. 验证 release 产物
+
+打开 `https://github.com/{owner}/{repo}/releases/tag/{ver}`：
+
+- 应有 `local-console-{ver}-portable.exe`（约 180MB）
+- `latest.yml` + `latest.yml.sig`（签名）
+- `*.blockmap`（增量更新元数据）
+
+如果没有：检查 workflow log 找 `softprops/action-gh-release` 那步的输出。
+
+#### 7. 第一次手动安装（必须）
+
+由于是 **portable 模式**（不是 NSIS 安装器），用户从 GitHub Releases 第一次下载 portable.exe 后需要**手动跑一次**：
+
+1. 浏览器下 `local-console-{ver}-portable.exe`
+2. 双击运行（程序会自解压到 `%TEMP%` 并启动）
+3. 关闭时数据持久化到 `%APPDATA%\本地总台\`
+
+之后所有 `{ver+1}` 版本，**程序内自动检测**：
+
+- GUI 启动 30s 后 + 每小时一次后台检查
+- 托盘菜单「检查更新」或设置页「检查更新」按钮
+- 发现新版本 → 主进程弹窗 → 下载 → 重启安装
+
+### 常见坑
+
+| 坑 | 原因 | 解决 |
+|---|---|---|
+| Actions 失败：winCodeSign 7z 解压 | electron-builder 24 的 7z 里有 macOS symlink，win 7za 解不了 | 重新跑 workflow（网络重试会换 hash），或本地 `scripts/fix_wincodesign.ps1` 预剔 darwin |
+| release 页面空白 | workflow 的 `softprops/action-gh-release` 没匹配到文件 | 确认 `dist/` 里有 `*.exe` `latest*.yml` `*.blockmap`，看 workflow 日志 |
+| 本地 GUI 不弹升级窗 | 当前版本是 dev（源码跑） | 必须装 portable.exe 后才生效 |
+| 安装后版本不对 | 装的是旧 cache | 删 `%APPDATA%\本地总台\` 重装 |
+| tag 推错版本 | 打错 tag | `git tag -d v0.2.2 && git push origin :refs/tags/v0.2.2` 删了重打 |
+
+### 升级体验流程图
+
+```
+本地 GUI 启动
+  ↓
+30s 后 + 每小时 1 次：autoUpdater.checkForUpdates()
+  ↓ 查 GitHub Releases/latest.yml
+有新版？
+  ├─ 否 → 写 last-update-check.json = no-update
+  └─ 是 → 主进程弹独立 BrowserWindow
+          ├─ 稍后 → 关弹窗
+          └─ 立即下载 → 进度条
+                       ↓
+                    下载完成 → 按钮变「立即重启并升级」
+                       ↓
+                    autoUpdater.quitAndInstall()
+                       ↓
+                    Squirrel 钩子 → 重启新版本
+```
+
+### 降级 / 跳过版本
+
+electron-updater 不支持降级。**装旧版只能手动**：
+1. 去 `https://github.com/{owner}/{repo}/releases`
+2. 选旧 tag → 下载 portable.exe
+3. 双击运行（会覆盖当前 userData 之外的 `%TEMP%` 目录）
+
+### 私仓 / 公仓区别
+
+- **公仓**：Actions 用默认 `GITHUB_TOKEN`，无需配置
+- **私仓**：同上。token 由 GitHub 自动注入到 workflow
+
+### 不破坏现有用户的做法
+
+- 改 `appId` / `productName` 会让已有用户的 portable.exe **找不到升级**（因为 Squirrel 用 appId 找）。**不要改 appId**
+- 改 `portable.artifactName` 模板会让已发 release 的文件名前缀变 → **会破坏 latest.yml 里的 path**。要么先发新版再说，要么保持兼容
+
 
 ## 开发命令
 
