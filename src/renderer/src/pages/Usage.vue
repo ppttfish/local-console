@@ -1,5 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import AddSubscriptionDialog from '../components/AddSubscriptionDialog.vue'
+import type {
+  QuotaSnapshot,
+  Sub,
+  ConfigField,
+  ProviderMeta
+} from '../types/subscription'
 import { Line, Doughnut, Bar } from 'vue-chartjs'
 import {
   Chart as ChartJS,
@@ -114,6 +121,84 @@ const status = ref<Status | null>(null)
 const loading = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
+const tab = ref<'usage' | 'subscriptions'>('usage')
+const subs = ref<Sub[]>([])
+const providerMetas = ref<ProviderMeta[]>([])
+const dialogOpen = ref(false)
+const editingSub = ref<Sub | null>(null)
+const refreshingIds = ref<Set<number>>(new Set())
+
+function providerMetaOf(id: string): ProviderMeta | undefined {
+  return providerMetas.value.find((p) => p.id === id)
+}
+
+function subStatus(s: Sub): 'active' | 'stale' | 'error' {
+  if (s.lastError) return 'error'
+  if (!s.lastRefreshAt) return 'stale'
+  return Date.now() - s.lastRefreshAt <= 10 * 60 * 1000 ? 'active' : 'stale'
+}
+
+function quotaTone(pct: number): 'ok' | 'warn' | 'danger' {
+  if (pct >= 90) return 'danger'
+  if (pct >= 70) return 'warn'
+  return 'ok'
+}
+
+/** 剩余时间 → "2h 15m 后" / "3 天后" */
+function fmtCountdown(ts: number): string {
+  const diff = ts - Date.now()
+  if (!Number.isFinite(diff)) return '—'
+  if (diff <= 0) return '已过期'
+  const m = Math.floor(diff / 60000)
+  if (m < 60) return `${m} 分钟后`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h} 小时 ${m % 60} 分后`
+  return `${Math.floor(h / 24)} 天后`
+}
+
+async function refreshSubs() {
+  try {
+    const [list, metas] = await Promise.all([
+      window.lcp.subList(),
+      window.lcp.subProviders()
+    ])
+    subs.value = list as Sub[]
+    providerMetas.value = metas as ProviderMeta[]
+  } catch {
+    // 静默：主进程未启动订阅模块时（旧版本）不阻塞页面
+  }
+}
+
+function openAddDialog() {
+  editingSub.value = null
+  dialogOpen.value = true
+}
+
+function openEditDialog(s: Sub) {
+  editingSub.value = s
+  dialogOpen.value = true
+}
+
+async function onSubSaved() {
+  dialogOpen.value = false
+  await refreshSubs()
+}
+
+async function removeSub(s: Sub) {
+  await window.lcp.subDelete(s.id)
+  await refreshSubs()
+}
+
+async function refreshOneSub(s: Sub) {
+  refreshingIds.value.add(s.id)
+  try {
+    await window.lcp.subRefresh(s.id)
+    await refreshSubs()
+  } finally {
+    refreshingIds.value.delete(s.id)
+  }
+}
+
 const presetLabels: Record<PresetRange, string> = {
   today: '今天',
   '24h': '最近 24 小时',
@@ -190,7 +275,11 @@ async function rescan() {
 
 onMounted(() => {
   refresh()
-  pollTimer = setInterval(refresh, 30_000)
+  refreshSubs()
+  pollTimer = setInterval(() => {
+    void refresh()
+    void refreshSubs()
+  }, 30_000)
 })
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
@@ -410,18 +499,122 @@ const granularityLabel = computed(() =>
     <header class="page-header">
       <div>
         <h1>Agent Token 用量</h1>
-        <p class="muted">
+        <p class="muted" v-if="tab === 'usage'">
           扫描 <b>{{ status?.files_scanned ?? 0 }}</b> 个文件 ·
           opencode 消息 <b>{{ status?.opencode_messages ?? 0 }}</b> 条 ·
           上次扫描 {{ status?.last_scan_at ? relativeTime(status.last_scan_at) : '从未' }}
         </p>
+        <p class="muted" v-else>
+          监控已订阅的 AI 服务商配额 · 每 5 分钟自动刷新
+        </p>
       </div>
       <div class="actions">
-        <button :disabled="loading" @click="refresh">{{ loading ? '刷新中…' : '刷新' }}</button>
-        <button class="primary" :disabled="loading" @click="rescan">重新扫描</button>
+        <template v-if="tab === 'usage'">
+          <button :disabled="loading" @click="refresh">{{ loading ? '刷新中…' : '刷新' }}</button>
+          <button class="primary" :disabled="loading" @click="rescan">重新扫描</button>
+        </template>
+        <template v-else>
+          <button @click="refreshSubs">刷新列表</button>
+          <button class="primary" @click="openAddDialog">+ 添加 Provider</button>
+        </template>
       </div>
     </header>
 
+    <div class="tabs">
+      <button :class="{ active: tab === 'usage' }" @click="tab = 'usage'">Token 用量</button>
+      <button :class="{ active: tab === 'subscriptions' }" @click="tab = 'subscriptions'">
+        订阅监控
+        <span v-if="subs.length" class="tab-badge">{{ subs.length }}</span>
+      </button>
+    </div>
+
+    <template v-if="tab === 'subscriptions'">
+      <!-- 订阅监控面板 -->
+      <div v-if="subs.length === 0" class="card empty">
+        <h3>还没有添加 Provider</h3>
+        <p class="muted">
+          支持 Anthropic / OpenAI / MiniMax / Kimi / Z.AI 自动拉取，<br>
+          或用「通用」类型手动维护任意服务商的配额。
+        </p>
+        <button class="primary" style="margin-top: 10px" @click="openAddDialog">+ 添加第一个 Provider</button>
+      </div>
+
+      <div v-else class="sub-grid">
+        <div v-for="s in subs" :key="s.id" class="sub-card">
+          <div class="sub-head">
+            <div class="sub-name">
+              <span
+                class="sub-logo"
+                :style="{ background: providerMetaOf(s.provider)?.color || '#64748b' }"
+              >{{ providerMetaOf(s.provider)?.short || '?' }}</span>
+              <span>
+                {{ s.displayName }}
+                <small class="muted">{{ providerMetaOf(s.provider)?.label || s.provider }}</small>
+              </span>
+            </div>
+            <div class="sub-actions">
+              <button title="立即刷新" @click="refreshOneSub(s)">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+              </button>
+              <button title="编辑" @click="openEditDialog(s)">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+              </button>
+              <button class="danger" title="删除" @click="removeSub(s)">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="sub-status-row">
+            <span class="sub-status-tag" :class="subStatus(s)">
+              {{ subStatus(s) === 'active' ? '正常' : subStatus(s) === 'stale' ? '未同步' : '异常' }}
+            </span>
+            <span
+              v-if="refreshingIds.has(s.id)"
+              class="muted"
+              style="font-size: 11px"
+            >刷新中…</span>
+          </div>
+
+          <template v-if="s.lastSnapshot">
+            <div class="sub-numbers">
+              <div class="sub-used">
+                已用 <strong>{{ fmtToken(s.lastSnapshot.used) }}</strong> / {{ fmtToken(s.lastSnapshot.limit) }}
+              </div>
+              <div class="big-pct" :class="quotaTone(s.lastSnapshot.usedPct)">
+                {{ s.lastSnapshot.usedPct.toFixed(1) }}%
+              </div>
+            </div>
+            <div class="quota-bar">
+              <div
+                class="quota-fill"
+                :class="quotaTone(s.lastSnapshot.usedPct)"
+                :style="{ width: Math.min(100, s.lastSnapshot.usedPct) + '%' }"
+              />
+            </div>
+            <div class="sub-meta">
+              <span>剩余 {{ fmtToken(s.lastSnapshot.remaining) }}</span>
+              <span v-if="s.lastSnapshot.windowEnd">
+                下次重置 {{ fmtCountdown(s.lastSnapshot.windowEnd) }}
+              </span>
+            </div>
+          </template>
+
+          <div v-else class="quota-bar" style="margin-top: 8px">
+            <div class="quota-fill unknown" />
+          </div>
+
+          <div v-if="s.lastError" class="sub-error">{{ s.lastError }}</div>
+          <div class="sub-meta" style="margin-top: 8px">
+            <span>上次刷新 {{ s.lastRefreshAt ? relativeTime(s.lastRefreshAt) : '从未' }}</span>
+            <span v-if="!s.enabled" class="warn">已停用</span>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template v-else>
+      <!-- Token 用量（原有内容） -->
     <div class="filters card">
       <div class="filter">
         <label>平台</label>
@@ -617,10 +810,18 @@ const granularityLabel = computed(() =>
         · <code>~/.claude/projects/</code><br>
         · <code>~/.local/share/opencode/opencode.db</code> (SQLite)
       </p>
-      <p class="muted">使用任意一个 agent 跑几次对话后，点"重新扫描"即可。</p>
     </div>
+    </template>
+
+    <AddSubscriptionDialog
+      v-if="dialogOpen"
+      :editing="editingSub"
+      @close="dialogOpen = false"
+      @saved="onSubSaved"
+    />
   </div>
 </template>
+
 
 <style scoped>
 .usage {
@@ -794,5 +995,222 @@ code {
   padding: 1px 6px;
   border-radius: 3px;
   font-size: 11.5px;
+}
+/* ===== 订阅监控 ===== */
+.tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  align-self: flex-start;
+}
+.tabs button {
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.tabs button.active {
+  background: var(--card);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.tab-badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  height: 16px;
+  line-height: 16px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 10px;
+  text-align: center;
+}
+.sub-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+.sub-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  position: relative;
+  box-shadow: var(--shadow);
+  transition:
+    transform 0.15s,
+    box-shadow 0.15s;
+}
+.sub-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+.sub-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.sub-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.sub-name small {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+}
+.sub-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.sub-actions {
+  display: flex;
+  gap: 2px;
+}
+.sub-actions button {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.sub-actions button:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.sub-actions button.danger:hover {
+  color: var(--danger);
+}
+.sub-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.sub-status-tag {
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+.sub-status-tag.active {
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--success);
+}
+.sub-status-tag.stale {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--warn);
+}
+.sub-status-tag.error {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--danger);
+}
+.sub-numbers {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 6px 0 8px;
+}
+.sub-used {
+  font-size: 12px;
+  color: var(--muted);
+}
+.sub-used strong {
+  color: var(--text);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.big-pct {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.5px;
+}
+.big-pct.ok,
+.quota-fill.ok {
+  color: var(--success);
+}
+.big-pct.warn,
+.quota-fill.warn {
+  color: var(--warn);
+}
+.big-pct.danger,
+.quota-fill.danger {
+  color: var(--danger);
+}
+.quota-bar {
+  height: 8px;
+  background: var(--bg-soft);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+.quota-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s;
+}
+.quota-fill.ok {
+  background: linear-gradient(90deg, var(--success), #34d399);
+}
+.quota-fill.warn {
+  background: linear-gradient(90deg, var(--warn), #fbbf24);
+}
+.quota-fill.danger {
+  background: linear-gradient(90deg, var(--danger), #f87171);
+}
+.quota-fill.unknown {
+  width: 100%;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--accent-soft),
+    var(--accent-soft) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+}
+.sub-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.sub-error {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--danger);
+  font-size: 11px;
+  border-radius: 4px;
+  word-break: break-all;
 }
 </style>

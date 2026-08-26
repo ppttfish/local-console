@@ -17,9 +17,22 @@ import {
   listSessions
 } from '../plugins/builtin/token-usage/storage.js'
 import { UsageScanner } from '../plugins/builtin/token-usage/scanner.js'
+import {
+  ensureSubscriptionSchema,
+  listSubscriptions,
+  getSubscription,
+  createSubscription,
+  updateSubscription,
+  deleteSubscription,
+  type CreateSubscriptionInput,
+  type UpdateSubscriptionInput
+} from '../plugins/builtin/token-usage/subscriptions.js'
+import { SubscriptionRefresher } from '../plugins/builtin/token-usage/refresh.js'
+import { listProviderMetas } from '../plugins/builtin/token-usage/providers/index.js'
 import type { AppState, PortSnapshot, ServiceState } from '@shared/types'
 
 let usageScanner: UsageScanner | null = null
+const subRefresher = new SubscriptionRefresher()
 
 export function registerIpcHandlers(
   svc: ServiceManager,
@@ -147,6 +160,30 @@ export function registerIpcHandlers(
     if (!usageScanner) usageScanner = new UsageScanner()
     return usageScanner.getStats()
   })
+
+  // ===== 订阅监控 =====
+  ensureSubscriptionSchema()
+  ipcMain.handle(IpcChannels.SubList, () => listSubscriptions())
+  ipcMain.handle(IpcChannels.SubGet, (_e, id: number) => getSubscription(id))
+  ipcMain.handle(IpcChannels.SubCreate, (_e, input) =>
+    createSubscription(input as CreateSubscriptionInput)
+  )
+  ipcMain.handle(IpcChannels.SubUpdate, (_e, input) => {
+    const { id, ...patch } = input as UpdateSubscriptionInput
+    return updateSubscription(id, patch)
+  })
+  ipcMain.handle(IpcChannels.SubDelete, (_e, id: number) => {
+    deleteSubscription(id)
+    return { ok: true }
+  })
+  ipcMain.handle(IpcChannels.SubRefresh, async (_e, id: number) => {
+    await subRefresher.refreshOne(id)
+    return getSubscription(id)
+  })
+  ipcMain.handle(IpcChannels.SubProviders, () => listProviderMetas())
+
+  // 启动 scheduler
+  subRefresher.start()
 
   // 启动 scanner
   usageScanner = new UsageScanner()

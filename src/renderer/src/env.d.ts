@@ -34,6 +34,15 @@ export interface LcpApi {
   usageSessions: (args: { filter: unknown; limit?: number }) => Promise<unknown>
   usageRescan: () => Promise<unknown>
   usageStatus: () => Promise<unknown>
+
+  // 订阅监控
+  subList: () => Promise<unknown>
+  subGet: (id: number) => Promise<unknown>
+  subCreate: (input: unknown) => Promise<unknown>
+  subUpdate: (input: unknown) => Promise<unknown>
+  subDelete: (id: number) => Promise<unknown>
+  subRefresh: (id: number) => Promise<unknown>
+  subProviders: () => Promise<unknown>
   onStateChanged: (cb: (s: AppState) => void) => () => void
   onServiceLog: (cb: (p: { id: string; text: string }) => void) => () => void
 }

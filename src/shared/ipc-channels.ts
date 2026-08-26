@@ -40,7 +40,16 @@ export const IpcChannels = {
   UsageAgents: 'usage:agents',
   UsageSessions: 'usage:sessions',
   UsageRescan: 'usage:rescan',
-  UsageStatus: 'usage:status'
-} as const
+  UsageStatus: 'usage:status',
+
+  // 订阅监控
+  SubList: 'subscription:list',
+  SubGet: 'subscription:get',
+  SubCreate: 'subscription:create',
+  SubUpdate: 'subscription:update',
+  SubDelete: 'subscription:delete',
+  SubRefresh: 'subscription:refresh',
+  SubProviders: 'subscription:providers'
+ } as const
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels]
