@@ -242,6 +242,42 @@ function parseYourAgentLine(line: string, ctx: ParseContext): UsageRow | null {
 | **OMP 缓存读写合并** | Anthropic 计费里 `cache_creation` 是写入不是命中，v1 合并统计 → v1.1 拆分 |
 | **OpenCode 去重用全删全写** | db 没稳定 request_id，简化 |
 | **首次启动窗口可能最小化** | Windows 11 + `start /B` 行为 → 在 main.ts 加 `Minimized: false` 显式选项 |
+---
+
+## 自动升级
+
+走 **GitHub Releases + electron-updater**。`v0.2.1` 起内置。
+
+### 发版流程
+
+```bash
+# 1. 改 package.json version（如 0.2.1 → 0.3.0），提交
+git add -A && git commit -m "release: 0.3.0"
+
+# 2. 打 tag + 推
+git tag v0.3.0 && git push origin main v0.3.0
+```
+
+GitHub Actions 自动跑 `.github/workflows/release.yml`：
+- windows-latest runner
+- `npm ci` → `npm run build` → `electron-builder --win portable --x64`
+- 产物 `本地总台-0.3.0-Portable.exe` + `latest.yml` + `*.blockmap`
+- 自动创建 / 更新 GitHub Release
+
+### 升级体验
+
+- **被动**：本地 GUI 启动 30s 后 + 每小时一次后台检查 GitHub latest.yml
+- **主动**：托盘菜单「检查更新」或设置页「检查更新」按钮
+- **发现新版本**：主进程弹独立窗口，显示「当前 → 新」+ release notes
+- **下载**：进度条 + 速度
+- **安装**：点「立即重启并升级」→ `quitAndInstall()` → 重启新版本
+- **跳过**：点「稍后」只关弹窗，下次启动继续后台检查
+
+### 已知限制
+
+- portable 走 `quitAndInstall` 重启新版本，**第一次需要手动从 GitHub Releases 下载 portable.exe 安装**（之后所有更新都自动）
+
+
 
 ---
 
