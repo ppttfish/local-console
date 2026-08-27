@@ -25,6 +25,11 @@ export const useAppStore = defineStore('app', () => {
   const ready = ref(false)
   const theme = ref<'light' | 'dark' | 'auto'>('auto')
 
+  /** 全局 CPU/内存 30 采样滚动窗口，2s 轮询写入。ServiceCard sparkline 用 */
+  const metricWindow = 30
+  const cpuHistory = ref<number[]>([])
+  const memHistory = ref<number[]>([])
+
   // 轻量通知：服务操作失败必须可见，否则按钮像"没反应"
   const toasts = ref<Toast[]>([])
   let toastSeq = 1
@@ -74,6 +79,11 @@ export const useAppStore = defineStore('app', () => {
     totalMem.value = s.total_mem
     alerts.value = s.alerts
     capturedAt.value = s.captured_at
+    // 推入滚动历史
+    cpuHistory.value.push(s.total_cpu)
+    memHistory.value.push(s.total_mem)
+    if (cpuHistory.value.length > metricWindow) cpuHistory.value.shift()
+    if (memHistory.value.length > metricWindow) memHistory.value.shift()
   }
 
   async function refresh(): Promise<void> {
@@ -167,6 +177,8 @@ export const useAppStore = defineStore('app', () => {
     ports,
     totalCpu,
     totalMem,
+    cpuHistory,
+    memHistory,
     alerts,
     capturedAt,
     ready,

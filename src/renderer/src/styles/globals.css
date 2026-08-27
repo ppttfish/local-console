@@ -1,0 +1,195 @@
+/*
+ * Tailwind v4 + shadcn-vue 设计令牌
+ *  - 暗色判定走 [data-theme="dark"] 或 system + data-mode=auto
+ *  - 老 CSS（index.css）继续用旧变量；新组件吃新令牌；迁移完最后删 index.css
+ *  - 浅色走 shadcn 语义令牌；深色在 :root[data-theme="dark"] 下覆盖
+ */
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* 暗色变体：手暗 或 auto+系统暗 */
+@custom-variant dark (&:where([data-theme="dark"], [data-mode="auto"] *));
+
+/* 让 shadcn 的 shadcn dark 模式也吃同一套判定（class-based） */
+@custom-variant shadcn-dark (&:where(.dark, [data-theme="dark"], [data-mode="auto"] *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "微软雅黑", sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "Geist Mono", "JetBrains Mono", Menlo,
+    Consolas, monospace;
+}
+
+/* ============== 浅色令牌（默认） ============== */
+:root,
+:root[data-theme="light"] {
+  --background: #ffffff;
+  --foreground: #0f172a;
+
+  --card: #ffffff;
+  --card-foreground: #0f172a;
+
+  --popover: #ffffff;
+  --popover-foreground: #0f172a;
+
+  --primary: #0ea5e9;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f1f5f9;
+  --secondary-foreground: #0f172a;
+
+  --muted: #f1f5f9;
+  --muted-foreground: #64748b;
+
+  --accent: #f0f9ff;
+  --accent-foreground: #0369a1;
+
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+
+  --success: #10b981;
+  --success-foreground: #ffffff;
+
+  --warning: #f59e0b;
+  --warning-foreground: #ffffff;
+
+  --border: #e2e8f0;
+  --input: #e2e8f0;
+  --ring: #0ea5e9;
+
+  --radius: 0.75rem;
+}
+
+/* ============== 暗色令牌 ============== */
+:root[data-theme="dark"] {
+  --background: #0b1220;
+  --foreground: #e2e8f0;
+
+  --card: #111827;
+  --card-foreground: #e2e8f0;
+
+  --popover: #111827;
+  --popover-foreground: #e2e8f0;
+
+  --primary: #38bdf8;
+  --primary-foreground: #0b1220;
+
+  --secondary: #1e293b;
+  --secondary-foreground: #e2e8f0;
+
+  --muted: #1e293b;
+  --muted-foreground: #94a3b8;
+
+  --accent: #082f49;
+  --accent-foreground: #38bdf8;
+
+  --destructive: #f87171;
+  --destructive-foreground: #0b1220;
+
+  --success: #34d399;
+  --success-foreground: #0b1220;
+
+  --warning: #fbbf24;
+  --warning-foreground: #0b1220;
+
+  --border: #1f2937;
+  --input: #1f2937;
+  --ring: #38bdf8;
+}
+
+/* ============== 全局 ============== */
+* {
+  box-sizing: border-box;
+  border-color: var(--border);
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+/* 滚动条收一收，跟设计稿简约风匹配 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+  border-radius: 8px;
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 尊重系统减弱动效（shadcn 自带 + 自写动画兜底） */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

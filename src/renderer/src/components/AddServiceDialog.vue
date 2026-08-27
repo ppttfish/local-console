@@ -1,7 +1,29 @@
 <script setup lang="ts">
+/**
+ * 添加 / 编辑服务对话框
+ *  - shadcn Dialog 容器 + 表单字段
+ *  - 业务逻辑零修改（project detection / command backfill 校验 / 默认工作区）
+ *  - 改进：底部按钮区分主/次、错误用 Alert 图标、命令回填提示用警告色
+ */
 import { ref, watch, computed } from 'vue'
-
-import { useAppStore } from '../stores/app'
+import { AlertTriangle, FolderOpen, Search } from 'lucide-vue-next'
+import { useAppStore } from '@/stores/app'
+import {
+  DialogRoot,
+  DialogPortal,
+  DialogOverlay,
+  DialogContent,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+  Button,
+  Input,
+  Label,
+  Select,
+  Badge
+} from '@/components/ui'
+import { cn } from '@/lib/utils'
 import type {
   ProjectDetection,
   ProjectCandidate,
@@ -19,17 +41,16 @@ const store = useAppStore()
 const name = ref('')
 const cwd = ref('')
 const command = ref('')
-const port = ref<number | null>(null)
+const port = ref<string>('')
 const kind = ref<'service' | 'task'>('service')
 const detection = ref<ProjectDetection | null>(null)
 const error = ref('')
 const saving = ref(false)
+const open = ref(true)
 
-// 从已有端口入服务：把进程的 cwd/cmd/port 预填进表单，名称用「进程名@端口」。
-// cwd 为空（系统服务 / 取不到）必须让用户自己选目录再保存，避免入库后无法启动。
 function applyFromPort(p: PortSnapshot): void {
   if (!name.value) name.value = `${p.process_name || 'port'}-${p.port}`
-  if (!port.value) port.value = p.port
+  if (!port.value) port.value = String(p.port)
   if (p.cwd) cwd.value = p.cwd
   if (p.cmd) command.value = p.cmd
 }
@@ -42,7 +63,7 @@ watch(
       kind.value = ed.kind
       cwd.value = ed.cwd
       command.value = ed.command
-      port.value = ed.port
+      port.value = ed.port !== null ? String(ed.port) : ''
     } else if (p) {
       applyFromPort(p)
     }
@@ -50,13 +71,17 @@ watch(
   { immediate: true }
 )
 
-/** 回填的进程命令行（临时目录 / pnpm store）无法直接启动，保存前提醒 */
 const commandLooksBackfilled = computed(() => {
   const c = command.value.trim()
   if (!c) return false
   const first = c.split(/\s+/)[0] ?? ''
   return /^["']/.test(first) || /(^|\s)"?[A-Za-z]:[\\/][^"\s]*\.pnpm\\/.test(c)
 })
+
+const kindItems = [
+  { value: 'service', label: '长期服务（持续运行）' },
+  { value: 'task', label: '批处理任务（跑完即结束）' }
+]
 
 async function pickFolder() {
   const r = (await store.pickFolder()) as { ok: boolean; path?: string }
@@ -78,7 +103,7 @@ async function detect() {
 
 function applyCandidate(c: ProjectCandidate) {
   command.value = c.command
-  if (c.port) port.value = c.port
+  if (c.port) port.value = String(c.port)
   if (!name.value) name.value = c.label
 }
 
@@ -87,7 +112,6 @@ async function save() {
     error.value = '名称、命令均为必填'
     return
   }
-  // 全局命令（如 dsh web）不依赖项目目录：留空时落到用户主目录
   if (!cwd.value.trim()) {
     const home = store.appInfo?.homeDir
     if (!home) {
@@ -104,7 +128,7 @@ async function save() {
       kind: kind.value,
       cwd: cwd.value,
       command: command.value,
-      port: port.value
+      port: port.value ? Number(port.value) : null
     }
     if (props.editing) {
       await store.updateService({ id: props.editing.id, ...payload })
@@ -112,192 +136,180 @@ async function save() {
       await store.createService(payload)
     }
     emit('added')
+    open.value = false
   } catch (e) {
     error.value = String(e)
   } finally {
     saving.value = false
   }
 }
+
+function close() {
+  open.value = false
+  emit('close')
+}
 </script>
 
 <template>
-  <div class="mask" @click.self="emit('close')">
-    <div class="dialog card">
-      <header>
-        <h2>{{
-          props.editing
-            ? '编辑服务'
-            : props.fromPort
-              ? `接管端口 :${props.fromPort.port}`
-              : '添加服务'
-        }}</h2>
-        <button class="close" @click="emit('close')">×</button>
-      </header>
+  <DialogRoot v-model:open="open">
+    <DialogPortal>
+      <DialogOverlay />
+      <DialogContent class="max-w-[560px]">
+        <DialogHeader>
+          <DialogTitle>
+            <template v-if="editing">编辑服务</template>
+            <template v-else-if="fromPort"
+              >接管端口 :{{ fromPort.port }}</template
+            >
+            <template v-else>添加服务</template>
+          </DialogTitle>
+          <DialogDescription>
+            配置启动命令、工作目录与端口；保存后立即在启动台可用。
+          </DialogDescription>
+        </DialogHeader>
 
-      <div class="form">
-        <label>
-          名称 *
-          <input v-model="name" placeholder="如 opc-dashboard 前端" />
-        </label>
-
-        <label>
-          类型
-          <select v-model="kind">
-            <option value="service">长期服务</option>
-            <option value="task">批处理任务</option>
-          </select>
-        </label>
-
-        <label>
-          工作区文件夹
-          <div class="row">
-            <input
-              v-model="cwd"
-              placeholder="项目目录；全局命令（如 dsh web）可留空，默认用户主目录"
+        <form
+          class="flex max-h-[60vh] flex-col gap-4 overflow-y-auto pr-1"
+          @submit.prevent="save"
+        >
+          <!-- 名称 -->
+          <div class="flex flex-col gap-1.5">
+            <Label for="svc-name">名称 <span class="text-destructive">*</span></Label>
+            <Input
+              id="svc-name"
+              v-model="name"
+              placeholder="如 opc-dashboard 前端"
+              autocomplete="off"
             />
-            <button @click="pickFolder">浏览…</button>
-            <button @click="detect" :disabled="!cwd">识别</button>
           </div>
-        </label>
 
-        <div v-if="detection?.candidates.length" class="candidates">
-          <div class="muted small">识别出的启动命令：</div>
+          <!-- 类型 -->
+          <div class="flex flex-col gap-1.5">
+            <Label>类型</Label>
+            <Select v-model="kind" :items="kindItems" />
+          </div>
+
+          <!-- 工作区 -->
+          <div class="flex flex-col gap-1.5">
+            <Label for="svc-cwd">工作区文件夹</Label>
+            <div class="flex gap-2">
+              <Input
+                id="svc-cwd"
+                v-model="cwd"
+                placeholder="项目目录；全局命令（如 dsh web）可留空，默认用户主目录"
+                class="flex-1"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                title="浏览文件夹"
+                @click="pickFolder"
+              >
+                <FolderOpen class="size-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="default"
+                :disabled="!cwd"
+                @click="detect"
+              >
+                <Search class="size-4" />
+                识别
+              </Button>
+            </div>
+          </div>
+
+          <!-- 候选启动命令 -->
           <div
-            v-for="(c, i) in detection.candidates"
-            :key="i"
-            class="cand"
-            :class="{ active: command === c.command }"
-            @click="applyCandidate(c)"
+            v-if="detection?.candidates.length"
+            class="flex flex-col gap-2 rounded-md border border-border bg-muted/40 p-2.5"
           >
-            <div class="cand-cmd">{{ c.label }}</div>
-            <div class="cand-detail muted">{{ c.detail }}</div>
+            <div class="text-[11px] uppercase tracking-wider text-muted-foreground">
+              识别出的启动命令
+            </div>
+            <div class="flex max-h-44 flex-col gap-1 overflow-y-auto">
+              <button
+                v-for="(c, i) in detection.candidates"
+                :key="i"
+                type="button"
+                :class="
+                  cn(
+                    'flex w-full flex-col items-start gap-0.5 rounded-md px-2.5 py-1.5 text-left text-xs transition-colors',
+                    command === c.command
+                      ? 'bg-accent text-accent-foreground'
+                      : 'hover:bg-muted'
+                  )
+                "
+                @click="applyCandidate(c)"
+              >
+                <span class="font-mono">{{ c.label }}</span>
+                <span
+                  class="text-[11px] text-muted-foreground"
+                  :class="
+                    command === c.command && 'text-accent-foreground/80'
+                  "
+                  >{{ c.detail }}</span
+                >
+              </button>
+            </div>
           </div>
-        </div>
 
-        <label>
-          启动命令 *
-          <input v-model="command" placeholder="npm run dev" />
-        </label>
-        <div v-if="commandLooksBackfilled" class="error">
-          该命令像是从运行中进程回填的完整命令行（含临时目录或 pnpm store
-          路径），无法照此启动。请改成简短的可执行命令（如
-          <code>dsh web</code>），工作区也建议换成固定目录。
-        </div>
+          <!-- 命令 -->
+          <div class="flex flex-col gap-1.5">
+            <Label for="svc-cmd"
+              >启动命令 <span class="text-destructive">*</span></Label
+            >
+            <Input
+              id="svc-cmd"
+              v-model="command"
+              placeholder="npm run dev"
+              autocomplete="off"
+            />
+            <div
+              v-if="commandLooksBackfilled"
+              class="mt-1 flex items-start gap-1.5 rounded-md border border-warning/40 bg-warning/10 p-2 text-[11.5px] text-foreground"
+            >
+              <AlertTriangle class="mt-0.5 size-3.5 shrink-0 text-warning" />
+              <span>
+                该命令像是从运行中进程回填的完整命令行（含临时目录或
+                pnpm store 路径），无法照此启动。请改成简短的可执行命令（如
+                <code class="rounded bg-muted px-1">dsh web</code>
+                ），工作区也建议换成固定目录。
+              </span>
+            </div>
+          </div>
 
-        <label>
-          端口（可选）
-          <input v-model.number="port" type="number" placeholder="5173" />
-        </label>
+          <!-- 端口 -->
+          <div class="flex flex-col gap-1.5">
+            <Label for="svc-port">端口（可选）</Label>
+            <Input
+              id="svc-port"
+              v-model="port"
+              type="number"
+              placeholder="5173"
+              :min="0"
+              :step="1"
+            />
+          </div>
 
-        <div v-if="error" class="error">{{ error }}</div>
-      </div>
+          <div
+            v-if="error"
+            class="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[12px] text-destructive"
+          >
+            <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
+            <span>{{ error }}</span>
+          </div>
+        </form>
 
-      <footer>
-        <button @click="emit('close')">取消</button>
-        <button class="primary" :disabled="saving" @click="save">
-          {{ saving ? '保存中…' : '保存' }}
-        </button>
-      </footer>
-    </div>
-  </div>
+        <DialogFooter>
+          <Button variant="outline" type="button" @click="close">取消</Button>
+          <Button type="button" :disabled="saving" @click="save">
+            {{ saving ? '保存中…' : '保存' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </DialogPortal>
+  </DialogRoot>
 </template>
-
-<style scoped>
-.mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-}
-.dialog {
-  width: 540px;
-  max-height: 86vh;
-  display: flex;
-  flex-direction: column;
-}
-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
-}
-header h2 {
-  margin: 0;
-  font-size: 18px;
-}
-.close {
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  font-size: 20px;
-}
-.form {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  overflow: auto;
-  padding-right: 4px;
-}
-label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--muted);
-}
-.row {
-  display: flex;
-  gap: 6px;
-}
-.row input {
-  flex: 1;
-}
-.candidates {
-  background: var(--bg-soft);
-  padding: 8px;
-  border-radius: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 180px;
-  overflow: auto;
-}
-.cand {
-  padding: 6px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 12px;
-}
-.cand:hover {
-  background: var(--hover);
-}
-.cand.active {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.cand-cmd {
-  font-family: monospace;
-}
-.cand-detail {
-  font-size: 11px;
-  margin-top: 2px;
-}
-.error {
-  color: var(--danger);
-  font-size: 12px;
-}
-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 16px;
-}
-.small {
-  font-size: 11px;
-}
-</style>

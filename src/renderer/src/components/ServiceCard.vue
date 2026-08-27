@@ -1,6 +1,43 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+/**
+ * 启动台 / 服务卡片
+ *  - 视觉：shadcn Card + 边框状态色 (绿/蓝/红)
+ *  - 微交互：motion-v hover scale 1.015, press 0.985，弹簧过渡
+ *  - 业务：完全不重写（isExternalRunning / 命令回填检测 / 主按钮 / 三点菜单）
+ *  - sparkline：取 store.cpuHistory（所有卡片用同一份全局系统指标）
+ */
+import { computed, ref } from 'vue'
+import { Motion } from 'motion-v'
+import {
+  Play,
+  Square,
+  RefreshCw,
+  RotateCw,
+  ExternalLink,
+  Pencil,
+  Trash2,
+  MoreHorizontal,
+  PowerOff
+} from 'lucide-vue-next'
 import type { ServiceState } from '@shared/types'
+import { useAppStore } from '@/stores/app'
+import { springCard, springSnappy } from '@/lib/motion'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui'
+import Tooltip from '@/components/ui/Tooltip.vue'
+import Sparkline from './Sparkline.vue'
+import DropdownMenu from '@/components/ui/DropdownMenu.vue'
+import DropdownMenuContent from '@/components/ui/DropdownMenuContent.vue'
+import DropdownMenuItem from '@/components/ui/DropdownMenuItem.vue'
+import DropdownMenuSeparator from '@/components/ui/DropdownMenuSeparator.vue'
+import DialogRoot from '@/components/ui/DialogRoot.vue'
+import DialogPortal from '@/components/ui/DialogPortal.vue'
+import DialogOverlay from '@/components/ui/DialogOverlay.vue'
+import DialogContent from '@/components/ui/DialogContent.vue'
+import DialogHeader from '@/components/ui/DialogHeader.vue'
+import DialogTitle from '@/components/ui/DialogTitle.vue'
+import DialogDescription from '@/components/ui/DialogDescription.vue'
+import DialogFooter from '@/components/ui/DialogFooter.vue'
 
 const props = defineProps<{ service: ServiceState }>()
 const emit = defineEmits<{
@@ -13,6 +50,63 @@ const emit = defineEmits<{
   edit: []
   delete: []
 }>()
+
+const store = useAppStore()
+
+// 危险操作确认（删除 / 重启接管 / 结束外部进程）
+type ConfirmKind = 'delete' | 'stopExternal' | 'restartExternal' | null
+const confirmKind = ref<ConfirmKind>(null)
+const confirmOpen = computed({
+  get: () => confirmKind.value !== null,
+  set: (v: boolean) => {
+    if (!v) confirmKind.value = null
+  }
+})
+
+const confirmTitle = computed(() => {
+  switch (confirmKind.value) {
+    case 'delete':
+      return '删除服务'
+    case 'stopExternal':
+      return '结束外部进程'
+    case 'restartExternal':
+      return '重启接管'
+    default:
+      return ''
+  }
+})
+const confirmBody = computed(() => {
+  switch (confirmKind.value) {
+    case 'delete':
+      return `确认删除「${props.service.name}」？\n（不会影响外部已在运行的进程）`
+    case 'stopExternal':
+      return `结束占用端口 :${props.service.port} 的外部进程？\n${props.service.port_process_name || '未知进程'}（PID ${props.service.port_occupied_pid}）\n（这会终止该进程，之后可点「启动」由本台接管）`
+    case 'restartExternal':
+      return `重启接管 = 结束外部进程 ${props.service.port_process_name || ''}（PID ${props.service.port_occupied_pid}），\n然后用本台命令重新拉起「${props.service.name}」。继续？`
+    default:
+      return ''
+  }
+})
+const confirmActionLabel = computed(() => {
+  switch (confirmKind.value) {
+    case 'delete':
+      return '删除'
+    case 'stopExternal':
+      return '结束进程'
+    case 'restartExternal':
+      return '继续'
+    default:
+      return '确认'
+  }
+})
+
+function runConfirm() {
+  const k = confirmKind.value
+  confirmKind.value = null
+  if (k === 'delete') emit('delete')
+  else if (k === 'stopExternal') emit('stopExternal')
+  else if (k === 'restartExternal') emit('restartExternal')
+}
 
 /** 端口被外部进程占用（非本台托管）：真实的"外部接管运行中" */
 const isExternalRunning = computed(
@@ -34,21 +128,31 @@ const statusLabel = computed(() => {
   return map[props.service.status]
 })
 
-/** 状态点：外部=强调色，运行=绿晕，失败=红，过渡态=琥珀，其余灰 */
-const dotClass = computed(() => {
-  if (isExternalRunning.value) return 'external'
-  if (props.service.status === 'running') return 'running'
-  if (props.service.status === 'failed') return 'failed'
-  if (props.service.status === 'starting' || props.service.status === 'stopping')
-    return 'warn'
-  return ''
+const statusTone = computed<
+  'success' | 'muted' | 'warning' | 'destructive' | 'primary'
+>(() => {
+  if (isExternalRunning.value) return 'primary'
+  if (props.service.status === 'running') return 'success'
+  if (props.service.status === 'failed') return 'destructive'
+  if (
+    props.service.status === 'starting' ||
+    props.service.status === 'stopping'
+  )
+    return 'warning'
+  return 'muted'
 })
 
-/** 卡片边框状态色：运行绿调 / 外部蓝调 / 失败红调 */
-const cardClass = computed(() => {
-  if (isExternalRunning.value) return 'is-external'
-  if (props.service.status === 'running') return 'is-running'
-  if (props.service.status === 'failed') return 'is-failed'
+const sparklineTone = computed(() => {
+  if (isExternalRunning.value) return 'primary' as const
+  if (props.service.status === 'failed') return 'danger' as const
+  if (props.service.status === 'running') return 'success' as const
+  return 'muted' as const
+})
+
+const cardBorderClass = computed(() => {
+  if (isExternalRunning.value) return 'border-primary/45'
+  if (props.service.status === 'running') return 'border-success/45'
+  if (props.service.status === 'failed') return 'border-destructive/55'
   return ''
 })
 
@@ -81,11 +185,11 @@ const statusAside = computed(() => {
 const tileLetter = computed(
   () => [...(props.service.name || '?')][0]?.toUpperCase() ?? '?'
 )
-const tileColor = computed(
-  () =>
-    props.service.color ||
-    (props.service.status === 'failed' ? 'var(--danger)' : 'var(--accent)')
-)
+const tileColor = computed(() => {
+  if (isExternalRunning.value) return 'var(--primary)'
+  if (props.service.status === 'failed') return 'var(--destructive)'
+  return 'var(--primary)'
+})
 
 const cmdTitle = computed(
   () => `命令：${props.service.command}\n工作区：${props.service.cwd}`
@@ -99,24 +203,12 @@ const commandLooksBackfilled = computed(() => {
 })
 
 function confirmStopExternal() {
-  if (
-    confirm(
-      `结束占用端口 :${props.service.port} 的外部进程？\n${props.service.port_process_name || '未知进程'}（PID ${props.service.port_occupied_pid}）\n（这会终止该进程，之后可点「启动」由本台接管）`
-    )
-  ) {
-    emit('stopExternal')
-  }
+  confirmKind.value = 'stopExternal'
 }
 
 function onPrimary() {
   if (isExternalRunning.value) {
-    if (
-      confirm(
-        `重启接管 = 结束外部进程 ${props.service.port_process_name || ''}（PID ${props.service.port_occupied_pid}），\n然后用本台命令重新拉起「${props.service.name}」。继续？`
-      )
-    ) {
-      emit('restartExternal')
-    }
+    confirmKind.value = 'restartExternal'
     return
   }
   if (props.service.status === 'running') {
@@ -129,336 +221,286 @@ function onPrimary() {
 }
 
 function confirmDelete() {
-  if (confirm(`确认删除「${props.service.name}」？\n（不会影响外部已在运行的进程）`)) {
-    emit('delete')
-  }
+  confirmKind.value = 'delete'
 }
+
+const statusDotClass = computed(() => {
+  switch (statusTone.value) {
+    case 'success':
+      return 'bg-success shadow-[0_0_0_3px_theme(colors.success/20)]'
+    case 'primary':
+      return 'bg-primary shadow-[0_0_0_3px_theme(colors.primary/20)]'
+    case 'destructive':
+      return 'bg-destructive'
+    case 'warning':
+      return 'bg-warning'
+    default:
+      return 'bg-muted-foreground'
+  }
+})
 </script>
 
 <template>
-  <div class="svc" :class="cardClass">
+  <Motion
+    as="div"
+    :initial="{ opacity: 0, y: 8 }"
+    :animate="{ opacity: 1, y: 0 }"
+    :while-hover="{ y: -2, scale: 1.005 }"
+    :while-press="{ scale: 0.995 }"
+    :transition="springCard"
+    :class="
+      cn(
+        'group relative flex flex-col gap-3 rounded-xl border bg-card p-4 shadow-sm transition-[border-color,box-shadow]',
+        cardBorderClass,
+        'hover:shadow-md'
+      )
+    "
+  >
     <!-- 头部：图标块 + 名称/状态 -->
-    <div class="head">
-      <div class="app-icon" :style="{ color: tileColor }">
+    <div class="flex min-w-0 items-center gap-3">
+      <div
+        class="flex size-10 shrink-0 items-center justify-center rounded-[10px] border border-border text-[17px] font-bold"
+        :style="{
+          background: `color-mix(in srgb, ${tileColor} 16%, var(--card))`,
+          color: tileColor
+        }"
+      >
         <span>{{ tileLetter }}</span>
       </div>
-      <div class="meta">
-        <div class="name" :title="service.name">{{ service.name }}</div>
-        <div class="status">
-          <span class="sdot" :class="dotClass" />
-          <span class="st-text" :class="{ fail: service.status === 'failed' }">{{
-            statusLabel
-          }}</span>
-          <button
-            v-if="service.port && canOpen"
-            class="st-port clickable"
-            :title="`在浏览器打开 http://127.0.0.1:${service.port}`"
-            @click="emit('open')"
+      <div class="min-w-0 flex-1">
+        <div
+          class="truncate text-[15px] font-bold leading-tight tracking-tight"
+          :title="service.name"
+        >
+          {{ service.name }}
+        </div>
+        <div class="mt-1 flex min-h-[18px] items-center gap-1.5 text-[11px] text-muted-foreground">
+          <span :class="['size-2 shrink-0 rounded-full', statusDotClass]" />
+          <span
+            :class="[
+              service.status === 'failed' && 'font-bold text-destructive'
+            ]"
+            >{{ statusLabel }}</span
           >
-            :{{ service.port }}
-          </button>
-          <span v-else-if="service.port" class="st-port">:{{ service.port }}</span>
-          <span v-if="statusAside" class="st-up">{{ statusAside }}</span>
+          <Tooltip
+            v-if="service.port && canOpen"
+            :content="`在浏览器打开 http://127.0.0.1:${service.port}`"
+          >
+            <template #trigger>
+              <button
+                type="button"
+                class="cursor-pointer rounded border border-primary/40 bg-transparent px-1.5 py-px font-mono text-[10px] font-bold text-primary transition-colors hover:border-primary hover:bg-primary hover:text-primary-foreground"
+                @click="emit('open')"
+              >
+                :{{ service.port }}
+              </button>
+            </template>
+          </Tooltip>
+          <span
+            v-else-if="service.port"
+            class="rounded border border-border px-1.5 py-px font-mono text-[10px] font-bold text-muted-foreground"
+            >:{{ service.port }}</span
+          >
+          <span
+            v-if="statusAside"
+            class="ml-auto font-mono text-[10px] text-muted-foreground whitespace-nowrap"
+            >{{ statusAside }}</span
+          >
         </div>
       </div>
+      <DropdownMenu>
+        <template #trigger>
+          <button
+            type="button"
+            class="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            title="更多操作"
+            aria-label="更多操作"
+          >
+            <MoreHorizontal class="size-4" />
+          </button>
+        </template>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem
+            v-if="canOpen"
+            @select="emit('open')"
+          >
+            <ExternalLink class="size-4" />
+            <span>浏览器打开</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            v-if="service.status === 'running'"
+            @select="emit('restart')"
+          >
+            <RefreshCw class="size-4" />
+            <span>重启</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            v-if="isExternalRunning"
+            @select="confirmStopExternal"
+          >
+            <PowerOff class="size-4" />
+            <span>结束外部进程</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem @select="emit('edit')">
+            <Pencil class="size-4" />
+            <span>编辑</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            class="text-destructive focus:text-destructive data-[highlighted]:text-destructive"
+            @select="confirmDelete"
+          >
+            <Trash2 class="size-4" />
+            <span>删除</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
 
-    <!-- 命令条（悬浮显命令+工作区） -->
-    <div class="cmd" :title="cmdTitle">{{ service.command }}</div>
+    <!-- 命令条 -->
+    <div
+      class="cursor-default truncate rounded-md border border-border bg-muted px-2.5 py-1.5 font-mono text-[10.5px] leading-relaxed text-muted-foreground"
+      :title="cmdTitle"
+    >
+      {{ service.command }}
+    </div>
 
-    <div v-if="commandLooksBackfilled" class="hint">
+    <Motion
+      v-if="commandLooksBackfilled"
+      :initial="{ opacity: 0, y: -2 }"
+      :animate="{ opacity: 1, y: 0 }"
+      :transition="springSnappy"
+      class="border-l-2 border-warning pl-2 text-[11px] leading-relaxed text-muted-foreground"
+    >
       这条命令像是从运行中进程回填的完整命令行，无法照此启动。点右侧
       ✎ 编辑，改成简短可执行命令（如 dsh web），工作区可留空。
-    </div>
-    <div v-else-if="isExternalRunning" class="hint">
+    </Motion>
+    <Motion
+      v-else-if="isExternalRunning"
+      :initial="{ opacity: 0, y: -2 }"
+      :animate="{ opacity: 1, y: 0 }"
+      :transition="springSnappy"
+      class="border-l-2 border-primary pl-2 text-[11px] leading-relaxed text-muted-foreground"
+    >
       端口由外部进程占用（非本台启动）。「重启接管」会结束它并用上面的命令拉起。
-    </div>
+    </Motion>
+
+    <!-- Sparkline -->
+    <Sparkline
+      :data="store.cpuHistory"
+      :tone="sparklineTone"
+      :height="36"
+      class="-mt-1"
+    />
 
     <!-- 操作：主按钮 + 图标副操作 -->
-    <div class="ops">
-      <button
+    <div class="mt-1 flex items-center gap-2">
+      <Button
         v-if="isExternalRunning"
-        class="btn-main primary"
+        size="sm"
         @click="onPrimary"
       >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+        <RotateCw class="size-3.5" />
         重启接管
-      </button>
-      <button
+      </Button>
+      <Button
         v-else-if="service.status === 'running'"
-        class="btn-main stop"
+        size="sm"
+        variant="outline"
+        class="text-destructive border-destructive/45 hover:bg-destructive hover:text-destructive-foreground hover:border-destructive"
         @click="onPrimary"
       >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        <Square class="size-3.5" />
         停止
-      </button>
-      <button
+      </Button>
+      <Button
         v-else-if="service.status === 'stopped' || service.status === 'failed'"
-        class="btn-main primary"
+        size="sm"
         @click="onPrimary"
       >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+        <Play class="size-3.5" />
         启动
-      </button>
-      <button v-else class="btn-main" disabled>{{ statusLabel }}</button>
+      </Button>
+      <Button
+        v-else
+        size="sm"
+        variant="outline"
+        disabled
+      >
+        {{ statusLabel }}
+      </Button>
 
-      <div class="sub">
-        <button
+      <div class="ml-auto flex items-center gap-1">
+        <Button
           v-if="canOpen"
-          class="ib"
-          :title="`在浏览器打开 http://127.0.0.1:${service.port}`"
+          variant="ghost"
+          size="icon"
+          title="在浏览器打开"
           @click="emit('open')"
         >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
-        </button>
-        <button
+          <ExternalLink class="size-4" />
+        </Button>
+        <Button
           v-if="service.status === 'running'"
-          class="ib"
+          variant="ghost"
+          size="icon"
           title="重启"
           @click="emit('restart')"
         >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
-        </button>
-        <button
+          <RefreshCw class="size-4" />
+        </Button>
+        <Button
           v-if="isExternalRunning"
-          class="ib danger"
+          variant="ghost"
+          size="icon"
+          class="text-destructive hover:text-destructive"
           title="结束外部进程"
           @click="confirmStopExternal"
         >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg>
-        </button>
-        <button class="ib" title="编辑" @click="emit('edit')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
-        </button>
-        <button class="ib danger" title="删除" @click="confirmDelete">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-        </button>
+          <PowerOff class="size-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          title="编辑"
+          @click="emit('edit')"
+        >
+          <Pencil class="size-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          class="text-destructive hover:text-destructive"
+          title="删除"
+          @click="confirmDelete"
+        >
+          <Trash2 class="size-4" />
+        </Button>
       </div>
     </div>
-  </div>
+  </Motion>
+
+  <!-- 危险操作确认弹窗 -->
+  <DialogRoot v-model:open="confirmOpen">
+    <DialogPortal>
+      <DialogOverlay />
+      <DialogContent class="max-w-[420px]">
+        <DialogHeader>
+          <DialogTitle>{{ confirmTitle }}</DialogTitle>
+          <DialogDescription class="whitespace-pre-line">
+            {{ confirmBody }}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="confirmKind = null">取消</Button>
+          <Button
+            :variant="confirmKind === 'delete' ? 'destructive' : 'default'"
+            @click="runConfirm"
+          >
+            {{ confirmActionLabel }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </DialogPortal>
+  </DialogRoot>
 </template>
-
-<style scoped>
-.svc {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 16px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: var(--shadow);
-  transition:
-    transform 0.15s cubic-bezier(0.22, 1, 0.36, 1),
-    box-shadow 0.15s,
-    border-color 0.15s;
-}
-.svc:hover {
-  transform: translateY(-2px);
-  border-color: color-mix(in srgb, var(--text) 20%, var(--border));
-  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.14);
-}
-.svc.is-running {
-  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
-}
-.svc.is-external {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-}
-.svc.is-failed {
-  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
-}
-
-/* —— 头部：图标块 + 名称/状态 —— */
-.head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-.app-icon {
-  width: 40px;
-  height: 40px;
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--tile, var(--accent)) 16%, var(--card));
-  color: var(--tile, var(--accent));
-  font-size: 17px;
-  font-weight: 700;
-}
-.meta {
-  flex: 1;
-  min-width: 0;
-}
-.name {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.status {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin-top: 4px;
-  font-size: 11px;
-  color: var(--muted);
-  min-height: 18px;
-}
-.sdot {
-  width: 8px;
-  height: 8px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--muted);
-}
-.sdot.running {
-  background: var(--success);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 20%, transparent);
-}
-.sdot.external {
-  background: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
-}
-.sdot.failed {
-  background: var(--danger);
-}
-.sdot.warn {
-  background: var(--warn);
-}
-.st-text.fail {
-  color: var(--danger);
-  font-weight: 700;
-}
-.st-port {
-  font-family: 'Geist Mono', Consolas, monospace;
-  font-size: 10px;
-  font-weight: 700;
-  padding: 1px 7px;
-  border-radius: 5px;
-  border: 1px solid color-mix(in srgb, var(--text) 20%, var(--border));
-  color: var(--muted);
-  background: transparent;
-}
-button.st-port.clickable {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  cursor: pointer;
-}
-button.st-port.clickable:hover {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-.st-off {
-  color: var(--warn);
-}
-.st-up {
-  margin-left: auto;
-  font-family: 'Geist Mono', Consolas, monospace;
-  font-size: 10px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-/* —— 命令条 —— */
-.cmd {
-  font-family: 'Geist Mono', Consolas, monospace;
-  font-size: 10.5px;
-  line-height: 1.55;
-  color: var(--muted);
-  background: var(--bg-soft);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 7px 10px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  cursor: default;
-}
-
-/* —— 提示 —— */
-.hint {
-  font-size: 11px;
-  line-height: 1.6;
-  color: var(--muted);
-  border-left: 2px solid var(--warn);
-  padding: 1px 0 1px 8px;
-}
-
-/* —— 操作行：主按钮 + 图标副操作 —— */
-.ops {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 2px;
-}
-.btn-main {
-  min-width: 92px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
-.btn-main svg {
-  width: 13px;
-  height: 13px;
-}
-.btn-main.stop {
-  background: transparent;
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
-  color: var(--danger);
-}
-.btn-main.stop:hover:not(:disabled) {
-  background: var(--danger);
-  border-color: var(--danger);
-  color: #fff;
-  filter: none;
-}
-.btn-main:disabled {
-  opacity: 0.5;
-}
-.sub {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-}
-.ib {
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--card);
-  color: var(--muted);
-  transition: all 0.13s ease;
-}
-.ib:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--text) 20%, var(--border));
-  color: var(--text);
-  background: var(--card);
-}
-.ib.danger {
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-}
-.ib.danger:hover:not(:disabled) {
-  background: var(--danger);
-  border-color: var(--danger);
-  color: #fff;
-}
-.ib svg {
-  width: 14px;
-  height: 14px;
-}
-</style>

@@ -1,11 +1,34 @@
 <script setup lang="ts">
+/**
+ * 添加 / 编辑订阅对话框
+ *  - shadcn Dialog 容器
+ *  - Provider / 凭证 / 配置字段（含 opencode 凭证复用）
+ *  - 业务逻辑零修改
+ */
 import { ref, computed, watch } from 'vue'
+import { AlertTriangle } from 'lucide-vue-next'
+import {
+  DialogRoot,
+  DialogPortal,
+  DialogOverlay,
+  DialogContent,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+  Button,
+  Input,
+  Label,
+  Select,
+  Badge
+} from '@/components/ui'
+import { cn } from '@/lib/utils'
 import type {
   ProviderMeta,
   ConfigField,
   Sub,
   DiscoveredCredential
-} from '../types/subscription'
+} from '@/types/subscription'
 
 const props = defineProps<{ editing?: Sub | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
@@ -16,15 +39,15 @@ const credential = ref('')
 const config = ref<Record<string, string>>({})
 const error = ref('')
 const saving = ref(false)
+const open = ref(true)
 
-// 编辑模式：预填
 watch(
   () => props.editing,
   (s) => {
     if (!s) return
     provider.value = s.provider
     displayName.value = s.displayName
-    credential.value = '' // 不回显凭证（安全）；留空表示不修改
+    credential.value = ''
     const cfg: Record<string, string> = {}
     for (const [k, v] of Object.entries(s.config ?? {})) {
       cfg[k] = v === null || v === undefined ? '' : String(v)
@@ -40,7 +63,7 @@ const meta = computed<ProviderMeta | undefined>(
 )
 
 const discovered = ref<DiscoveredCredential[]>([])
-const useDiscovered = ref<string>('') // 选中的 opencode authKey
+const useDiscovered = ref<string>('')
 
 void (async () => {
   try {
@@ -57,6 +80,21 @@ void (async () => {
     selectProvider(props.editing?.provider ?? metas.value[0]!.id)
   }
 })()
+
+const providerSelectItems = computed(() =>
+  metas.value.map((m) => ({
+    value: m.id,
+    label: m.builtin ? m.label : `${m.label} · 手动`
+  }))
+)
+
+function toggleDiscovered(authKey: string, providerId: string) {
+  useDiscovered.value = useDiscovered.value === authKey ? '' : authKey
+  if (useDiscovered.value) {
+    const pm = metas.value.find((x) => x.id === providerId)
+    if (pm) selectProvider(pm.id)
+  }
+}
 
 function selectProvider(id: string) {
   provider.value = id
@@ -83,6 +121,10 @@ function fieldsOf(m: ProviderMeta | undefined): ConfigField[] {
   return m?.configSchema ?? []
 }
 
+function configItems(f: ConfigField): { value: string; label: string }[] {
+  return (f.options ?? []).map((o) => ({ value: o, label: o }))
+}
+
 async function save() {
   error.value = ''
   const m = meta.value
@@ -94,7 +136,6 @@ async function save() {
     error.value = '名称必填'
     return
   }
-  // 必填校验；编辑时 credential 留空 = 保持不变；选了 opencode 发现的凭证则免填
   if (!useDiscovered.value && (!props.editing || credential.value)) {
     if (!credential.value.trim() && m.id !== 'generic') {
       error.value = '凭证必填（API key / token）'
@@ -136,185 +177,157 @@ async function save() {
       })
     }
     emit('saved')
+    open.value = false
   } catch (e) {
     error.value = String((e as Error).message ?? e)
   } finally {
     saving.value = false
   }
 }
+
+function close() {
+  open.value = false
+  emit('close')
+}
 </script>
 
 <template>
-  <div class="overlay" @click.self="emit('close')">
-    <div class="dialog">
-      <h2>{{ editing ? '编辑订阅' : '添加订阅' }}</h2>
+  <DialogRoot v-model:open="open">
+    <DialogPortal>
+      <DialogOverlay />
+      <DialogContent class="max-w-[540px]">
+        <DialogHeader>
+          <DialogTitle>{{ editing ? '编辑订阅' : '添加订阅' }}</DialogTitle>
+          <DialogDescription>
+            <template v-if="meta?.builtin">
+              内置适配器 · 主进程每 5 分钟自动拉取配额
+            </template>
+            <template v-else-if="meta">
+              通用类型 · 不调 API，由你手动维护「已用 / 总量 / 重置时间」
+            </template>
+            <template v-else>加载中…</template>
+          </DialogDescription>
+        </DialogHeader>
 
-      <div class="field">
-        <label>Provider</label>
-        <select :value="provider" :disabled="!!editing" @change="selectProvider(($event.target as HTMLSelectElement).value)">
-          <option v-for="m in metas" :key="m.id" :value="m.id">
-            {{ m.label }}{{ m.builtin ? '' : ' · 手动' }}
-          </option>
-        </select>
-        <span class="hint" v-if="meta?.builtin">
-          内置适配器 · 主进程每 5 分钟自动拉取配额
-        </span>
-        <span class="hint" v-else-if="meta">
-          通用类型 · 不调 API，由你手动维护「已用 / 总量 / 重置时间」
-        </span>
-      </div>
+        <form
+          class="flex max-h-[60vh] flex-col gap-4 overflow-y-auto pr-1"
+          @submit.prevent="save"
+        >
+          <!-- Provider -->
+          <div class="flex flex-col gap-1.5">
+            <Label>Provider</Label>
+            <Select
+              :model-value="provider"
+              :items="providerSelectItems"
+              :disabled="!!editing"
+              @update:model-value="selectProvider"
+            />
+          </div>
 
-      <div class="field">
-        <label>显示名</label>
-        <input v-model="displayName" placeholder="例如：Claude Max" />
-      </div>
+          <!-- 显示名 -->
+          <div class="flex flex-col gap-1.5">
+            <Label for="sub-name">显示名</Label>
+            <Input
+              id="sub-name"
+              v-model="displayName"
+              placeholder="例如：Claude Max"
+            />
+          </div>
 
-      <div v-if="!editing && discovered.length > 0" class="field">
-        <label>从 OpenCode 导入凭证</label>
-        <div class="disc-list">
-          <button
-            v-for="d in discovered"
-            :key="d.authKey"
-            type="button"
-            class="disc-item"
-            :class="{ selected: useDiscovered === d.authKey }"
-            @click="
-              useDiscovered = useDiscovered === d.authKey ? '' : d.authKey;
-              if (useDiscovered) { const pm = metas.find((x) => x.id === d.providerId); if (pm) selectProvider(pm.id); }
-            "
+          <!-- 凭证发现（仅新建） -->
+          <div
+            v-if="!editing && discovered.length > 0"
+            class="flex flex-col gap-1.5"
           >
-            <span>{{ providerLabel(d.providerId) }}</span>
-            <code>{{ d.masked }}</code>
-          </button>
-        </div>
-        <span class="hint">检测到 OpenCode 已登录的 Provider，点选即可复用其凭证（明文不经过界面）</span>
-      </div>
+            <Label>从 OpenCode 导入凭证</Label>
+            <div class="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+              <button
+                v-for="d in discovered"
+                :key="d.authKey"
+                type="button"
+                :class="
+                  cn(
+                    'flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-left text-xs transition-colors',
+                    'hover:border-primary',
+                    useDiscovered === d.authKey &&
+                      'border-primary bg-accent text-accent-foreground'
+                  )
+                "
+                @click="toggleDiscovered(d.authKey, d.providerId)"
+              >
+                <span>{{ providerLabel(d.providerId) }}</span>
+                <code class="rounded bg-background/60 px-1.5 py-0.5 font-mono text-[10.5px]">
+                  {{ d.masked }}
+                </code>
+              </button>
+            </div>
+            <p class="text-[11px] text-muted-foreground">
+              检测到 OpenCode 已登录的 Provider，点选即可复用其凭证（明文不经过界面）
+            </p>
+          </div>
 
-      <div v-if="!useDiscovered" class="field">
-        <label>{{ editing ? '凭证（留空 = 不修改）' : '凭证' }}</label>
-        <input
-          v-model="credential"
-          type="password"
-          :placeholder="editing ? '••••••••' : 'sk-...'"
-          autocomplete="off"
-        />
-        <span class="hint">仅保存在本机 SQLite；列表中只显示掩码</span>
-      </div>
+          <!-- 凭证 -->
+          <div v-if="!useDiscovered" class="flex flex-col gap-1.5">
+            <Label for="sub-cred">
+              {{ editing ? '凭证（留空 = 不修改）' : '凭证' }}
+            </Label>
+            <Input
+              id="sub-cred"
+              v-model="credential"
+              type="password"
+              :placeholder="editing ? '••••••••' : 'sk-...'"
+              autocomplete="off"
+            />
+            <p class="text-[11px] text-muted-foreground">
+              仅保存在本机 SQLite；列表中只显示掩码
+            </p>
+          </div>
 
-      <div v-for="f in fieldsOf(meta)" :key="f.key" class="field">
-        <label>{{ f.label }}<template v-if="f.required"> *</template></label>
-        <select v-if="f.type === 'select'" v-model="config[f.key]">
-          <option v-for="o in f.options ?? []" :key="o" :value="o">{{ o }}</option>
-        </select>
-        <input
-          v-else
-          v-model="config[f.key]"
-          :type="f.type === 'number' ? 'number' : 'text'"
-          :placeholder="f.placeholder"
-        />
-        <span class="hint" v-if="f.hint">{{ f.hint }}</span>
-      </div>
+          <!-- 动态配置字段 -->
+          <div
+            v-for="f in fieldsOf(meta)"
+            :key="f.key"
+            class="flex flex-col gap-1.5"
+          >
+            <Label :for="`cfg-${f.key}`">
+              {{ f.label }}<template v-if="f.required">
+                <span class="text-destructive"> *</span>
+              </template>
+            </Label>
+            <Select
+              v-if="f.type === 'select'"
+              v-model="config[f.key]"
+              :items="configItems(f)"
+            />
+            <Input
+              v-else
+              :id="`cfg-${f.key}`"
+              v-model="config[f.key]"
+              :type="f.type === 'number' ? 'number' : f.type === 'password' ? 'password' : 'text'"
+              :placeholder="f.placeholder"
+              autocomplete="off"
+            />
+            <p v-if="f.hint" class="text-[11px] text-muted-foreground">
+              {{ f.hint }}
+            </p>
+          </div>
 
-      <div v-if="error" class="err">{{ error }}</div>
+          <div
+            v-if="error"
+            class="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[12px] text-destructive"
+          >
+            <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
+            <span>{{ error }}</span>
+          </div>
+        </form>
 
-      <div class="row">
-        <button @click="emit('close')">取消</button>
-        <button class="primary" :disabled="saving" @click="save">
-          {{ saving ? '保存中…' : editing ? '保存修改' : '添加' }}
-        </button>
-      </div>
-    </div>
-  </div>
+        <DialogFooter>
+          <Button variant="outline" type="button" @click="close">取消</Button>
+          <Button type="button" :disabled="saving" @click="save">
+            {{ saving ? '保存中…' : editing ? '保存修改' : '添加' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </DialogPortal>
+  </DialogRoot>
 </template>
-
-<style scoped>
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-}
-.dialog {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  width: min(520px, calc(100vw - 40px));
-  max-height: 85vh;
-  overflow-y: auto;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
-}
-.dialog h2 {
-  margin: 0 0 14px;
-  font-size: 16px;
-}
-.row {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-  margin-top: 14px;
-}
-.disc-list {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
-}
-.disc-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg-soft);
-  font-size: 12px;
-  cursor: pointer;
-  text-align: left;
-}
-.disc-item:hover {
-  border-color: var(--accent);
-}
-.disc-item.selected {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--text);
-}
-.disc-item code {
-  font-size: 10.5px;
-  opacity: 0.75;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 12px;
-}
-.field label {
-  font-size: 11px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-}
-.hint {
-  font-size: 11px;
-  color: var(--muted);
-}
-.err {
-  padding: 8px 10px;
-  background: rgba(239, 68, 68, 0.1);
-  color: var(--danger);
-  font-size: 12px;
-  border-radius: 6px;
-  margin-bottom: 10px;
-}
-.row {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-  margin-top: 14px;
-}
-</style>
