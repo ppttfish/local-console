@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.2.2 (2026-08-27) — 订阅监控 Tab + 11 个 Provider 适配
+
+### 新增
+
+- **Token 用量页「订阅监控」Tab**（双 Tab 布局，原有图表零改动）
+  - 顶部 Tab 切换：「Token 用量」/「订阅监控」+ 数量徽标
+  - 订阅卡片：logo/品牌色 + 状态 tag（正常/未同步/异常）+ 多窗口明细
+  - 主进度条 = 最紧急窗口；每窗口独立行：标签/进度条/百分比/重置倒计时
+  - 卡片操作：刷新 / 编辑 / 删除；删除走二次确认弹窗
+- **6 个内置 Provider 适配器**（端点全部对齐 [OpenChamber](https://github.com/openchamber/openchamber) 源码实现）
+  - `zai`（z.ai Coding Plan 国际站 / 智谱海外）
+  - `zhipu`（智谱 bigmodel.cn 国内站）
+  - `minimax-io` / `minimax-cn`（MiniMax 编程计划，字段语义国际/国内站不同）
+  - `kimi`（Kimi for Coding / Moonshot）
+  - `openrouter`
+  - `opencode-go`
+  - `command-code`
+  - 共 11 个 Provider（含 generic / anthropic / openai）
+- **OpenCode 凭证发现 + 一键导入**
+  - 主进程读 `~/.local/share/opencode/auth.json`（OpenChamber 同款做法）
+  - 新增订阅时对话框「从 OpenCode 导入」列表显示已登录的 Provider（掩码）
+  - 点选即写入；**明文凭证由主进程自读，不经过 IPC/HTTP 往返**
+- **MCP 工具新增 3 个**
+  - `pws_list_subscriptions` / `pws_refresh_subscription` / `pws_list_subscription_providers`
+- **HTTP API 新增 7 条**：`/api/subscription/{list,get,create,update,delete,refresh,discover,providers}`
+- **IPC 通道新增 7 个**：`subscription:{list,get,create,update,delete,refresh,providers,discover}`
+
+### 改进
+
+- **订阅数据层**（`src/main/plugins/builtin/token-usage/subscriptions.ts`）
+  - 新表 `provider_subscription`：每行一个订阅，含凭证、配置、最新快照、错误
+  - `SubscriptionRefresher`：主进程后台 5 分钟轮询，并发 `Promise.all` 拉取
+  - 启动首次延迟 3s（错开 UsageScanner 启动峰）
+  - 失败写 `last_error`，下次 tick 再来；`running` flag 防重入
+- **QuotaSnapshot 扩展为多窗口模型**（`providers/types.ts`）
+  - 新增 `windows: QuotaWindow[]` 数组
+  - 单窗模型（generic）继续用 `used/limit/usedPct`
+  - 卡片主进度取最紧急窗口
+- **订阅卡片 UI 细节**
+  - 「刷新/编辑/删除」按钮同时有图标和文字标签
+  - 卡片在窄宽度下按钮自动换到下一行；标题副标签省略号截断
+- **HTTP / IPC 错误处理**：所有 401/403/超时/解析失败 → 卡片变 error 态 + 短消息显示
+
+### 已知问题 / 设计决定
+
+- **凭证 v1 暂未加密**，存本机 SQLite 明文；编辑对话框不回显
+  - v1 暂不接 `electron.safeStorage`（后续可以一行切换）
+- **Provider 端点按 OpenChamber 源码对齐**：若服务商响应 schema 变化，对应 adapter
+  把 raw 写进 `snapshot.extra`，UI 显示「无法解析（原始响应已捕获）」
+- **OpenChamber 是观测平台** vs 本地总台是**控制台**：本工具用同样端点但调度在本地、不上传数据
+
+---
+
 ## v0.2.1 (2026-08-26) — 自动升级首版
 
 ### 新增
