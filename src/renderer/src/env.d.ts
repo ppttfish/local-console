@@ -36,6 +36,7 @@ export interface LcpApi {
   usageSessions: (args: { filter: unknown; limit?: number }) => Promise<unknown>
   usageRescan: () => Promise<unknown>
   usageStatus: () => Promise<unknown>
+  usageRecap: () => Promise<unknown>
 
   // 订阅监控
   subList: () => Promise<unknown>

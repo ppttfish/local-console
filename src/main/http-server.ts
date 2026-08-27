@@ -14,6 +14,7 @@ import { EventBus } from './services/event-bus.js'
 import {
   ensureUsageSchema,
   querySummary,
+  queryRecap,
   queryTimeline,
   listDistinctModels,
   listDistinctAgents,
@@ -118,7 +119,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.end('renderer not built')
     return
   }
-  let p = pathname === '/' ? '/index.html' : pathname
+  const p = pathname === '/' ? '/index.html' : pathname
   // 防目录穿越
   const filePath = normalize(join(rendererDir, p))
   if (!filePath.startsWith(normalize(rendererDir))) {
@@ -282,6 +283,9 @@ async function handleApi(
     }
     if (pathname === '/api/usage/status' && req.method === 'GET') {
       return json(res, 200, r.usageScanner.getStats())
+    }
+    if (pathname === '/api/usage/recap' && req.method === 'GET') {
+      return json(res, 200, queryRecap())
     }
 
     // ===== 订阅监控 =====

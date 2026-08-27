@@ -63,6 +63,7 @@ export function installWebBridge(): void {
     usageSessions: (args) => post('/api/usage/sessions', args),
     usageRescan: () => post('/api/usage/rescan'),
     usageStatus: () => post('/api/usage/status'),
+    usageRecap: () => post('/api/usage/recap'),
 
     // 订阅监控
     subList: () => post('/api/subscription/list'),

@@ -47,6 +47,7 @@ const api = {
   usageSessions: (args: { filter: unknown; limit?: number }) =>
     invoke(IpcChannels.UsageSessions, args),
   usageStatus: () => invoke(IpcChannels.UsageStatus),
+  usageRecap: () => invoke(IpcChannels.UsageRecap),
 
   // 订阅监控
   subList: () => invoke(IpcChannels.SubList),

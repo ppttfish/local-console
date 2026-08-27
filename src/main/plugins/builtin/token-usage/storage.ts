@@ -368,4 +368,145 @@ export function queryTimeline(
     .all(where.params) as TimelinePoint[]
 }
 
+// ========== 回顾（Wrapped） ==========
+import type { UsageRecap } from '../../../../shared/types.js'
+
+export type { UsageRecap }
+
+const DAY_MS = 86_400_000
+
+function utcMsOfDay(day: string): number {
+  const [y, m, d] = day.split('-').map(Number)
+  return Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1)
+}
+
+export function queryRecap(): UsageRecap {
+  const summary = querySummary({})
+
+  const range = getDb()
+    .prepare('SELECT MIN(at) AS first_at, MAX(at) AS last_at FROM agent_usage')
+    .get() as { first_at: number | null; last_at: number | null }
+
+  const byModel = getDb()
+    .prepare(
+      `SELECT model,
+              SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+              COUNT(*) AS calls,
+              COALESCE(SUM(cost_usd), 0) AS cost,
+              COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+              COALESCE(SUM(cached_tokens), 0) AS cached,
+              COALESCE(SUM(input_tokens), 0) AS input
+       FROM agent_usage
+       GROUP BY model
+       ORDER BY tokens DESC`
+    )
+    .all() as Array<{
+    model: string
+    tokens: number
+    calls: number
+    cost: number
+    cache_read: number
+    cached: number
+    input: number
+  }>
+
+  const hourRows = getDb()
+    .prepare(
+      `SELECT CAST(strftime('%H', at/1000, 'unixepoch', '+8 hours') AS INTEGER) AS h,
+              COUNT(*) AS calls
+       FROM agent_usage
+       GROUP BY h`
+    )
+    .all() as Array<{ h: number; calls: number }>
+  const hour_histogram = new Array<number>(24).fill(0)
+  for (const r of hourRows) {
+    if (r.h >= 0 && r.h <= 23) hour_histogram[r.h] = r.calls
+  }
+
+  const dayRows = getDb()
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', at/1000, 'unixepoch', '+8 hours') AS date,
+              SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+              COALESCE(SUM(cost_usd), 0) AS cost,
+              COUNT(DISTINCT agent) AS agents
+       FROM agent_usage
+       GROUP BY date
+       ORDER BY date ASC`
+    )
+    .all() as Array<{ date: string; tokens: number; cost: number; agents: number }>
+
+  let bestStreak = 0
+  let run = 0
+  let prev = 0
+  for (const d of dayRows) {
+    const t = utcMsOfDay(d.date)
+    run = prev > 0 && t - prev === DAY_MS ? run + 1 : 1
+    if (run > bestStreak) bestStreak = run
+    prev = t
+  }
+  let currentStreak = 0
+  if (dayRows.length > 0) {
+    currentStreak = 1
+    for (let i = dayRows.length - 1; i > 0; i--) {
+      if (utcMsOfDay(dayRows[i]!.date) - utcMsOfDay(dayRows[i - 1]!.date) === DAY_MS) {
+        currentStreak++
+      } else {
+        break
+      }
+    }
+  }
+
+  let peakDay: UsageRecap['peak_day'] = null
+  for (const d of dayRows) {
+    if (!peakDay || d.tokens > peakDay.tokens) {
+      peakDay = { day: d.date, tokens: d.tokens, cost: d.cost }
+    }
+  }
+
+  const top = byModel[0] ?? null
+  const totalTokens = summary.total_tokens
+  const topModel: UsageRecap['top_model'] =
+    top && totalTokens > 0
+      ? {
+          model: top.model,
+          tokens: top.tokens,
+          calls: top.calls,
+          cost: top.cost,
+          cache_read: top.cache_read,
+          cache_hit_ratio:
+            top.input + top.cached > 0
+              ? Math.round((top.cached / (top.input + top.cached)) * 1000) / 10
+              : 0,
+          share: Math.round((top.tokens / totalTokens) * 1000) / 10
+        }
+      : null
+
+  return {
+    totals: {
+      total_tokens: summary.total_tokens,
+      input_tokens: summary.input_tokens,
+      output_tokens: summary.output_tokens,
+      cached_tokens: summary.cached_tokens,
+      cache_hit_ratio: summary.cache_hit_ratio,
+      cost_usd: summary.cost_usd,
+      calls: summary.calls
+    },
+    first_at: range.first_at,
+    last_at: range.last_at,
+    active_days: dayRows.length,
+    peak_day: peakDay,
+    top_model: topModel,
+    by_model: byModel.map((m) => ({
+      model: m.model,
+      tokens: m.tokens,
+      cost: m.cost,
+      calls: m.calls
+    })),
+    hour_histogram,
+    days: dayRows,
+    streak_days: currentStreak,
+    best_streak: bestStreak
+  }
+}
+
 export { calcCost, priceFor, loadPricing, type ModelPrice }

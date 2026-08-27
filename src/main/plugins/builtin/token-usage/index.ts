@@ -15,6 +15,7 @@ import { UsageScanner } from './scanner.js'
 import {
   ensureUsageSchema,
   querySummary,
+  queryRecap,
   listDistinctModels,
   listDistinctAgents,
   listSessions,
@@ -90,6 +91,13 @@ export const tokenUsagePlugin: Plugin = {
     )
 
     server.tool(
+      'pws_usage_recap',
+      '全时段用量回顾（Wrapped）：总 token/成本、首次与最近使用时间、活跃天数、高峰日、本命模型（占比+缓存命中率）、按小时作息分布、每日明细、连续使用天数（当前/最长）。用于年度回顾、成就徽章与作息分析。',
+      {},
+      async () => textJson(queryRecap())
+    )
+
+    server.tool(
       'pws_list_agents',
       '列出已发现的所有 agent 平台、模型维度、扫描状态',
       {},
@@ -152,6 +160,7 @@ function textJson(data: unknown) {
 export {
   scanner,
   subRefresher,
+  queryRecap,
   type ModelPrice,
   type CreateSubscriptionInput,
   // 给 IPC / HTTP 层用

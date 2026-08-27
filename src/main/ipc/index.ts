@@ -12,6 +12,7 @@ import { LogStreamer } from '../services/log-streamer.js'
 import {
   ensureUsageSchema,
   querySummary,
+  queryRecap,
   queryTimeline,
   listDistinctModels,
   listDistinctAgents,
@@ -170,6 +171,7 @@ export function registerIpcHandlers(
     if (!usageScanner) usageScanner = new UsageScanner()
     return usageScanner.getStats()
   })
+  ipcMain.handle(IpcChannels.UsageRecap, () => queryRecap())
 
   // ===== 订阅监控 =====
   ensureSubscriptionSchema()

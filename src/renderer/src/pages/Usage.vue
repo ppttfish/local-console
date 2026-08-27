@@ -15,9 +15,12 @@ import {
   watch,
   onBeforeUnmount
 } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { Motion } from 'motion-v'
 import { Plus, RefreshCw, RotateCw, Pencil, Trash2 } from 'lucide-vue-next'
 import AddSubscriptionDialog from '@/components/AddSubscriptionDialog.vue'
+import RecapPanel from '@/components/RecapPanel.vue'
+import { fmtToken, fmtTokenShort, fmtCost, fmtCny } from '@/lib/format'
 import {
   Card,
   CardContent,
@@ -168,8 +171,6 @@ const AGENT_COLOR: Record<string, string> = {
   unknown: '#94a3b8'
 }
 
-const CNY_RATE = 7.16
-
 type PresetRange = 'today' | '24h' | '7d' | '30d' | 'all'
 type Granularity = 'hour' | 'day' | 'month'
 
@@ -240,7 +241,21 @@ function primaryResetAt(s: Sub): number | null {
   return anyWithReset?.resetAt ?? null
 }
 
-const tab = ref<'usage' | 'subscriptions'>('usage')
+const route = useRoute()
+const router = useRouter()
+const tab = ref<'usage' | 'recap' | 'subscriptions'>(
+  route.query.tab === 'recap'
+    ? 'recap'
+    : route.query.tab === 'subscriptions'
+      ? 'subscriptions'
+      : 'usage'
+)
+// Tab 深链：#/usage?tab=recap —— web 镜像可直接分享定位
+watch(tab, (v) => {
+  void router.replace({
+    query: { ...route.query, tab: v === 'usage' ? undefined : v }
+  })
+})
 const subs = ref<Sub[]>([])
 const providerMetas = ref<ProviderMeta[]>([])
 const dialogOpen = ref(false)
@@ -484,31 +499,34 @@ function withThemeColors(baseOptions: ChartOptions): ChartOptions {
 
 const lineChartData = computed<ChartData<'line'>>(() => {
   const t = theme.value
-  return {
-    labels: timeline.value.map((p) => p.bucket),
-    datasets: [
-      {
-        label: 'Token 用量',
-        data: timeline.value.map((p) => p.tokens),
-        borderColor: t.primary,
-        backgroundColor: t.primary + '26',
-        fill: true,
-        tension: 0.3,
-        yAxisID: 'y'
-      },
-      {
-        label: '成本 (USD)',
-        data: timeline.value.map((p) => p.cost),
-        borderColor: t.warning,
-        backgroundColor: t.warning + '0d',
-        borderDash: [4, 4],
-        fill: false,
-        tension: 0.3,
-        yAxisID: 'y1'
-      }
-    ]
+  const datasets: ChartData<'line'>['datasets'] = [
+    {
+      label: 'Token 用量',
+      data: timeline.value.map((p) => p.tokens),
+      borderColor: t.primary,
+      backgroundColor: t.primary + '26',
+      fill: true,
+      tension: 0.3,
+      yAxisID: 'y'
+    }
+  ]
+  // 全 0 成本时不画成本线，避免 y1 轴出现 ±$1 的对称噪音
+  if ((summary.value?.cost_usd ?? 0) > 0) {
+    datasets.push({
+      label: '成本 (USD)',
+      data: timeline.value.map((p) => p.cost),
+      borderColor: t.warning,
+      backgroundColor: t.warning + '0d',
+      borderDash: [4, 4],
+      fill: false,
+      tension: 0.3,
+      yAxisID: 'y1'
+    })
   }
+  return { labels: timeline.value.map((p) => p.bucket), datasets }
 })
+
+const hasCostSeries = computed(() => (summary.value?.cost_usd ?? 0) > 0)
 
 const lineChartOptions = computed<ChartOptions<'line'>>(
   () =>
@@ -523,13 +541,17 @@ const lineChartOptions = computed<ChartOptions<'line'>>(
           title: { display: true, text: 'Token' },
           ticks: { callback: (v) => fmtTokenShort(num(v)) }
         },
-        y1: {
-          type: 'linear',
-          position: 'right',
-          title: { display: true, text: 'USD' },
-          grid: { drawOnChartArea: false },
-          ticks: { callback: (v) => '$' + num(v).toFixed(2) }
-        }
+        ...(hasCostSeries.value
+          ? {
+              y1: {
+                type: 'linear' as const,
+                position: 'right' as const,
+                title: { display: true, text: 'USD' },
+                grid: { drawOnChartArea: false },
+                ticks: { callback: (v) => '$' + num(v).toFixed(2) }
+              }
+            }
+          : {})
       },
       plugins: {
         legend: { position: 'top' },
@@ -655,36 +677,7 @@ onBeforeUnmount(() => {
 })
 
 // ===== utils（中国人习惯） =====
-
-function fmtToken(n: number): string {
-  if (n === 0) return '0'
-  const abs = Math.abs(n)
-  if (abs >= 1_000_000_000_000) return (n / 1_000_000_000_000).toFixed(2) + '万亿'
-  if (abs >= 100_000_000) return (n / 100_000_000).toFixed(2) + '亿'
-  if (abs >= 10_000) return (n / 10_000).toFixed(2) + '万'
-  if (abs >= 1_000) return (n / 1_000).toFixed(1) + '千'
-  return String(Math.round(n))
-}
-
-function fmtTokenShort(n: number): string {
-  const abs = Math.abs(n)
-  if (abs >= 100_000_000) return (n / 100_000_000).toFixed(1) + '亿'
-  if (abs >= 10_000) return (n / 10_000).toFixed(0) + '万'
-  if (abs >= 1_000) return (n / 1_000).toFixed(0) + 'k'
-  return String(Math.round(n))
-}
-
-function fmtCost(v: number): string {
-  if (v === 0) return '$0.00'
-  if (v >= 1000) return '$' + (v / 1000).toFixed(2) + 'k'
-  if (v >= 1) return '$' + v.toFixed(2)
-  return '$' + v.toFixed(4)
-}
-
-function fmtCny(v: number): string {
-  if (v === 0) return '免费'
-  return '约¥' + (v * CNY_RATE).toFixed(2)
-}
+// fmtToken / fmtTokenShort / fmtCost / fmtCny 已抽到 @/lib/format 共享
 
 function fmtTime(ts: number): string {
   if (!ts) return '—'
@@ -770,7 +763,7 @@ function quotaToneToToneClass(
           <b>{{ status?.dsh_sessions ?? 0 }}</b> 个 · 上次扫描
           {{ status?.last_scan_at ? relativeTime(status.last_scan_at) : '从未' }}
         </p>
-        <p v-else class="mt-1 text-sm text-muted-foreground">
+        <p v-else-if="tab === 'subscriptions'" class="mt-1 text-sm text-muted-foreground">
           监控已订阅的 AI 服务商配额 · 每 5 分钟自动刷新
         </p>
       </div>
@@ -782,7 +775,7 @@ function quotaToneToToneClass(
           </Button>
           <Button :disabled="loading" @click="rescan">重新扫描</Button>
         </template>
-        <template v-else>
+        <template v-else-if="tab === 'subscriptions'">
           <Button variant="outline" @click="refreshSubs">刷新列表</Button>
           <Button @click="openAddDialog">
             <Plus class="size-4" />
@@ -795,6 +788,7 @@ function quotaToneToToneClass(
     <Tabs v-model="tab" default-value="usage">
       <TabsList>
         <TabsTrigger value="usage">Token 用量</TabsTrigger>
+        <TabsTrigger value="recap">回顾</TabsTrigger>
         <TabsTrigger value="subscriptions">
           订阅监控
           <Badge v-if="subs.length" variant="default" class="ml-1 px-1.5 text-[10px]">
@@ -1151,6 +1145,10 @@ function quotaToneToToneClass(
             · <code>~/.dsh/sessions/</code> (DSH)
           </CardDescription>
         </Card>
+      </TabsContent>
+
+      <TabsContent value="recap" class="gap-4">
+        <RecapPanel />
       </TabsContent>
 
       <TabsContent value="subscriptions" class="gap-4">

@@ -2,6 +2,15 @@
 
 `token-usage` 是本地总台的内置插件，扫描本机 5 个 agent 的会话日志，把每次模型调用的 token 用量与 **USD 成本** 入库，提供多维聚合查询 + 可视化图表。
 
+## 回顾 Tab（Wrapped）v2.1
+
+Usage 页第三个 Tab（`#/usage?tab=recap` 可深链），全时段叙事视图：
+
+- **数据出口**：IPC `usage:recap` / HTTP `GET /api/usage/recap` / MCP `pws_usage_recap`，全部来自 `storage.ts` 的 `queryRecap()`，类型契约在 `@shared/types` 的 `UsageRecap`
+- **渲染**：`components/RecapPanel.vue`（Hero 四卡 / 本命模型环形 / 作息分布 / 12 周热力图）
+- **成就规则**：`renderer/src/lib/achievements.ts`（10 枚：初见之日 / 百万俱乐部 / 千万战队 / 氪金玩家 / 本命不渝 / 缓存大师 / 七日之约 / 全天候战士 / 夜行侠 / 多栖动物），纯聚合派生，无额外建表
+- **格式化**：`renderer/src/lib/format.ts`（fmtToken / fmtCost 等，Usage 页共用）
+
 ## 采集的 agent（按本机实际）
 
 | 平台 | 日志位置（Windows） | 解析的字段 | 备注 |

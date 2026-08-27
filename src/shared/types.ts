@@ -117,3 +117,51 @@ export interface PluginManifest {
   description: string
   enabled: boolean
 }
+
+// ===== token-usage 回顾（Wrapped）=====
+export interface UsageRecapTotals {
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  cache_hit_ratio: number
+  cost_usd: number
+  calls: number
+}
+
+export interface UsageRecapTopModel {
+  model: string
+  tokens: number
+  calls: number
+  cost: number
+  cache_read: number
+  cache_hit_ratio: number
+  /** 占全部 token 的百分比（0-100） */
+  share: number
+}
+
+export interface UsageRecapDay {
+  /** YYYY-MM-DD（UTC+8） */
+  date: string
+  tokens: number
+  cost: number
+  /** 当天用过的平台数 */
+  agents: number
+}
+
+export interface UsageRecap {
+  totals: UsageRecapTotals
+  first_at: number | null
+  last_at: number | null
+  active_days: number
+  peak_day: { day: string; tokens: number; cost: number } | null
+  top_model: UsageRecapTopModel | null
+  by_model: Array<{ model: string; tokens: number; cost: number; calls: number }>
+  /** 24 桶（UTC+8 小时）调用次数 */
+  hour_histogram: number[]
+  days: UsageRecapDay[]
+  /** 截至最近活跃日的连续天数 */
+  streak_days: number
+  /** 历史最长连续天数 */
+  best_streak: number
+}
