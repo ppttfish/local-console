@@ -1181,29 +1181,6 @@ code {
   color: #fff;
   flex-shrink: 0;
 }
-.sub-actions {
-  display: flex;
-  gap: 2px;
-}
-.sub-actions button {
-  background: transparent;
-  border: none;
-  color: var(--muted);
-  width: 26px;
-  height: 26px;
-  border-radius: 5px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-}
-.sub-actions button:hover {
-  background: var(--hover);
-  color: var(--text);
-}
-.sub-actions button.danger:hover {
-  color: var(--danger);
-}
 .sub-status-row {
   display: flex;
   align-items: center;
@@ -1308,19 +1285,55 @@ code {
 .win-fill.ok {
   background: var(--success);
 }
-.win-fill.warn {
-  background: var(--warn);
+.sub-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
 }
-.win-fill.danger {
-  background: var(--danger);
-}
-.win-pct {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
+.sub-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
   font-weight: 600;
 }
-.win-pct.ok {
-  color: var(--success);
+.sub-name > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+}
+.sub-name small {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sub-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  max-width: 100%;
+}
+.sub-actions button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-size: 11.5px;
+  white-space: nowrap;
 }
 .win-pct.warn {
   color: var(--warn);
