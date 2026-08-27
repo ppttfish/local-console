@@ -44,8 +44,17 @@ const api = {
   usageAgents: () => invoke(IpcChannels.UsageAgents),
   usageSessions: (args: { filter: unknown; limit?: number }) =>
     invoke(IpcChannels.UsageSessions, args),
-  usageRescan: () => invoke(IpcChannels.UsageRescan),
   usageStatus: () => invoke(IpcChannels.UsageStatus),
+
+  // 订阅监控
+  subList: () => invoke(IpcChannels.SubList),
+  subGet: (id: number) => invoke(IpcChannels.SubGet, id),
+  subCreate: (input: unknown) => invoke(IpcChannels.SubCreate, input),
+  subUpdate: (input: unknown) => invoke(IpcChannels.SubUpdate, input),
+  subDelete: (id: number) => invoke(IpcChannels.SubDelete, id),
+  subRefresh: (id: number) => invoke(IpcChannels.SubRefresh, id),
+  subProviders: () => invoke(IpcChannels.SubProviders),
+  subDiscover: () => invoke(IpcChannels.SubDiscover),
 
   // 自动升级
   checkUpdate: () => invoke('app:check-update') as Promise<{

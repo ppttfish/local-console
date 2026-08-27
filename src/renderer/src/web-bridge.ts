@@ -59,6 +59,18 @@ export function installWebBridge(): void {
     usageSessions: (args) => post('/api/usage/sessions', args),
     usageRescan: () => post('/api/usage/rescan'),
     usageStatus: () => post('/api/usage/status'),
+
+    // 订阅监控
+    subList: () => post('/api/subscription/list'),
+    subGet: (id: number) =>
+      post(`/api/subscription/get?id=${encodeURIComponent(String(id))}`),
+    subCreate: (input) => post('/api/subscription/create', input),
+    subUpdate: (input) => post('/api/subscription/update', input),
+    subDelete: (id) =>
+      post('/api/subscription/delete', { id }).then(() => ({ ok: true })),
+    subRefresh: (id) => post('/api/subscription/refresh', { id }),
+    subProviders: () => post('/api/subscription/providers'),
+    subDiscover: () => post('/api/subscription/discover'),
     onStateChanged: (_cb: (s: AppState) => void) => {
       // 简易轮询代替 IPC 推送
       return () => {

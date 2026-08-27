@@ -4,6 +4,7 @@
  *  - 凭证 v1 暂未加密（仅本机 SQLite；后续可接 electron.safeStorage）
  */
 import { getDb } from '../../../services/db.js'
+import { readOpencodeCredential } from './opencode-auth.js'
 import type { QuotaSnapshot } from './providers/types.js'
 
 export interface Subscription {
@@ -23,7 +24,13 @@ export interface Subscription {
 export interface CreateSubscriptionInput {
   provider: string
   displayName: string
+  /** 手动粘贴的凭证；与 opencodeKey 二选一 */
   credential: string
+  /**
+   * OpenCode auth.json 里的 key 名（如 zai-coding-plan）。
+   * 提供时主进程自行读取完整凭证 —— 明文 key 不经过 IPC/HTTP 往返。
+   */
+  opencodeKey?: string
   config?: Record<string, unknown>
   enabled?: boolean
 }
@@ -124,6 +131,10 @@ export function getSubscription(id: number): Subscription | null {
 export function createSubscription(input: CreateSubscriptionInput): Subscription {
   const now = Date.now()
   const cfg = JSON.stringify(input.config ?? {})
+  const credential =
+    input.opencodeKey && input.opencodeKey !== ''
+      ? (readOpencodeCredential(input.opencodeKey) ?? '-')
+      : input.credential
   const info = getDb()
     .prepare(
       `INSERT INTO provider_subscription (provider, display_name, credential, config, enabled, last_refresh_at, last_error, last_snapshot, created_at, updated_at)
@@ -132,7 +143,7 @@ export function createSubscription(input: CreateSubscriptionInput): Subscription
     .run(
       input.provider,
       input.displayName,
-      input.credential,
+      credential,
       cfg,
       input.enabled === false ? 0 : 1,
       now,

@@ -1,23 +1,32 @@
 /**
  * Provider 注册表 + UI 元信息序列化
- *  - providers：id → adapter
+ *  - providers：id → adapter（端点全部对齐 OpenChamber 实现）
  *  - listProviderMetas()：给前端展示
  */
 import type { ProviderAdapter } from './types.js'
 import generic from './generic.js'
 import anthropic from './anthropic.js'
 import openai from './openai.js'
-import MiniMax from './MiniMax.js'
+import { minimaxIo, minimaxCn } from './MiniMax.js'
 import kimi from './kimi.js'
-import zcode from './zcode.js'
+import zai from './zai.js'
+import zhipu from './zhipu.js'
+import openrouter from './openrouter.js'
+import opencodeGo from './opencodeGo.js'
+import commandCode from './commandCode.js'
 
 export const providers: Record<string, ProviderAdapter> = {
   generic,
   anthropic,
   openai,
-  MiniMax,
+  zai,
+  zhipu,
+  'minimax-io': minimaxIo,
+  'minimax-cn': minimaxCn,
   kimi,
-  zcode
+  openrouter,
+  'opencode-go': opencodeGo,
+  'command-code': commandCode
 }
 
 export interface ProviderMeta {
@@ -26,9 +35,7 @@ export interface ProviderMeta {
   builtin: boolean
   defaultConfig: Record<string, unknown>
   configSchema: ProviderAdapter['configSchema']
-  // 简单品牌色（用于卡片 logo 背景）
   color: string
-  // 简写字母（用于 logo 文字）
   short: string
 }
 
@@ -36,9 +43,14 @@ const META_EXTRAS: Record<string, { color: string; short: string }> = {
   generic: { color: '#64748b', short: 'G' },
   anthropic: { color: '#d97706', short: 'A' },
   openai: { color: '#10a37f', short: 'O' },
-  MiniMax: { color: '#6366f1', short: 'M' },
+  zai: { color: '#6366f1', short: 'Z' },
+  zhipu: { color: '#38bdf8', short: '智' },
+  'minimax-io': { color: '#f43f5e', short: 'M' },
+  'minimax-cn': { color: '#fb7185', short: 'M' },
   kimi: { color: '#1e293b', short: 'K' },
-  zcode: { color: '#0ea5e9', short: 'Z' }
+  openrouter: { color: '#8b5cf6', short: 'R' },
+  'opencode-go': { color: '#0ea5e9', short: 'G' },
+  'command-code': { color: '#22c55e', short: 'C' }
 }
 
 export function listProviderMetas(): ProviderMeta[] {

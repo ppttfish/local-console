@@ -21,6 +21,19 @@ import {
 } from './plugins/builtin/token-usage/storage.js'
 import { UsageScanner } from './plugins/builtin/token-usage/scanner.js'
 import { loadPricing } from './plugins/builtin/token-usage/pricing.js'
+import {
+  ensureSubscriptionSchema,
+  listSubscriptions,
+  getSubscription,
+  createSubscription,
+  updateSubscription,
+  deleteSubscription,
+  type CreateSubscriptionInput,
+  type UpdateSubscriptionInput
+} from './plugins/builtin/token-usage/subscriptions.js'
+import { SubscriptionRefresher } from './plugins/builtin/token-usage/refresh.js'
+import { listProviderMetas } from './plugins/builtin/token-usage/providers/index.js'
+import { discoverOpencodeCredentials } from './plugins/builtin/token-usage/opencode-auth.js'
 import { getDataDir, getLogDir } from './utils/paths.js'
 import { app } from 'electron'
 
@@ -29,6 +42,7 @@ interface Runtime {
   port: PortScanner
   log: LogStreamer
   usageScanner: UsageScanner
+  subRefresher: SubscriptionRefresher
 }
 
 let runtime: Runtime | null = null
@@ -44,8 +58,10 @@ export async function startHttpServer(opts: {
   rendererDir = opts.rendererDir
 
   // 初始化 db
+
   initDatabase(opts.userData)
   ensureUsageSchema()
+  ensureSubscriptionSchema()
   loadPricing()
 
   // 业务
@@ -55,12 +71,14 @@ export async function startHttpServer(opts: {
   const portScanner = new PortScanner(bus)
   const logStreamer = new LogStreamer(bus, logsDir)
   const usageScanner = new UsageScanner()
+  const subRefresher = new SubscriptionRefresher()
 
   await svc.start()
   await portScanner.start()
   await usageScanner.start()
+  subRefresher.start()
 
-  runtime = { svc, port: portScanner, log: logStreamer, usageScanner }
+  runtime = { svc, port: portScanner, log: logStreamer, usageScanner, subRefresher }
 
   const server = createServer((req, res) => handle(req, res))
   server.listen(port, '127.0.0.1', () => {
@@ -73,6 +91,7 @@ export async function startHttpServer(opts: {
     await svc.shutdown()
     await portScanner.stop()
     usageScanner.stop()
+    subRefresher.stop()
     server.close()
     closeDatabase()
   }
@@ -239,6 +258,38 @@ async function handleApi(
       return json(res, 200, r.usageScanner.getStats())
     }
 
+    // ===== 订阅监控 =====
+    if (pathname === '/api/subscription/list' && req.method === 'GET') {
+      return json(res, 200, listSubscriptions())
+    }
+    if (pathname === '/api/subscription/providers' && req.method === 'GET') {
+      return json(res, 200, listProviderMetas())
+    }
+    if (pathname === '/api/subscription/discover' && req.method === 'GET') {
+      return json(res, 200, discoverOpencodeCredentials())
+    }
+    if (pathname === '/api/subscription/get' && req.method === 'GET') {
+      const id = Number(_url.searchParams.get('id'))
+      return json(res, 200, getSubscription(id))
+    }
+    if (pathname === '/api/subscription/create' && req.method === 'POST') {
+      return json(res, 200, createSubscription(body as CreateSubscriptionInput))
+    }
+    if (pathname === '/api/subscription/update' && req.method === 'POST') {
+      const { id, ...patch } = body as UpdateSubscriptionInput
+      return json(res, 200, updateSubscription(id, patch))
+    }
+    if (pathname === '/api/subscription/delete' && req.method === 'POST') {
+      const { id } = body as { id: number }
+      deleteSubscription(id)
+      return json(res, 200, { ok: true })
+    }
+    if (pathname === '/api/subscription/refresh' && req.method === 'POST') {
+      const { id } = body as { id: number }
+      await r.subRefresher.refreshOne(id)
+      return json(res, 200, getSubscription(id))
+    }
+
     return json(res, 404, { ok: false, error: 'not found' })
   } catch (e) {
     return json(res, 500, { ok: false, error: String(e) })
@@ -247,7 +298,6 @@ async function handleApi(
 
 function json(res: ServerResponse, code: number, data: unknown): void {
   res.statusCode = code
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.end(JSON.stringify(data))
 }
 

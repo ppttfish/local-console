@@ -7,20 +7,36 @@
  */
 import type { Subscription } from '../subscriptions.js'
 
+export interface QuotaWindow {
+  /** 窗口标签：'5h' / 'weekly' / 'MCP Tools' 等 */
+  label: string
+  usedPct: number | null
+  resetAt: number | null
+  valueLabel?: string | null
+}
+
 export interface QuotaSnapshot {
-  used: number
-  limit: number
-  remaining: number
-  usedPct: number
+  /**
+   * 单窗模型（generic 等简单 provider 用）；
+   * 多窗 provider（z.ai / MiniMax / Kimi）用 windows 数组，
+   * 同时把"最紧急"的窗写进 usedPct 供进度条主显示。
+   */
+  used?: number
+  limit?: number
+  remaining?: number
+  usedPct?: number
   windowStart?: number
   windowEnd?: number
   currency?: string
+  planLabel?: string | null
+  windows?: QuotaWindow[]
   extra?: Record<string, unknown>
 }
 
 export type RefreshResult =
   | { ok: true; snapshot: QuotaSnapshot }
   | { ok: false; error: string }
+
 
 export type ConfigFieldType = 'text' | 'number' | 'select' | 'password'
 
