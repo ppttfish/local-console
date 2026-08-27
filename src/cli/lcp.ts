@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * lcp —— 本地总台的命令行客户端。
+ * lcp —— 小福鱼的命令行客户端。
  * 让 agent 不走 MCP 也能直接调。
  */
 import { join } from 'node:path'
@@ -161,7 +161,7 @@ function die(msg: string): never {
 }
 
 function printHelp(): void {
-  console.log(`lcp —— 本地总台命令行客户端
+  console.log(`lcp —— 小福鱼命令行客户端
 
 用法：
   lcp list                          列出所有服务

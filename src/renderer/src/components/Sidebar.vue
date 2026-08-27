@@ -25,7 +25,7 @@ const total = computed(() => store.services.length)
     <div class="brand">
       <div class="logo">⚡</div>
       <div class="title">
-        <div class="name">本地总台</div>
+        <div class="name">小福鱼</div>
         <div class="ver">v{{ store.appInfo?.version ?? '0.2.0' }}</div>
       </div>
     </div>

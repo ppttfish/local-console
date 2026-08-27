@@ -26,6 +26,14 @@ if (!gotLock) {
   app.on('second-instance', () => showMainWindow())
 }
 
+// 统一各入口数据目录：Electron 打包版默认 userData 是 %APPDATA%\<productName>，
+// 而 http-standalone / CLI 用 %LOCALAPPDATA%\local-console（见 http-standalone.ts resolveUserData）。
+// 不对齐会导致安装版打开后服务配置与用量统计全空。必须在 ready 前设置。
+app.setPath(
+  'userData',
+  join(process.env['LOCALAPPDATA'] || app.getPath('appData'), 'local-console')
+)
+
 const isDev = !app.isPackaged
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -208,7 +216,7 @@ function buildTray(): void {
         }
       }
     ])
-    tray.setToolTip('本地总台')
+    tray.setToolTip('小福鱼')
     tray.setContextMenu(menu)
     tray.on('double-click', () => showMainWindow())
     slog('tray created')

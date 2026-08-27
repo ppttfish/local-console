@@ -98,7 +98,7 @@ onMounted(loadStatus)
 
     <div class="card">
       <h3>MCP 集成</h3>
-      <p class="muted">本地总台已内置 MCP server，agent 可通过 stdio 直接调用以下工具：</p>
+      <p class="muted">小福鱼已内置 MCP server，agent 可通过 stdio 直接调用以下工具：</p>
       <ul class="mcp-list">
         <li><code>pws_list_services</code> — 列出所有服务</li>
         <li><code>pws_start_service</code> / <code>pws_stop_service</code> / <code>pws_restart_service</code></li>

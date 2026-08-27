@@ -160,7 +160,7 @@ class Updater {
       minimizable: false,
       maximizable: false,
       fullscreenable: false,
-      title: '本地总台 — 发现新版本',
+      title: '小福鱼 — 发现新版本',
       autoHideMenuBar: true,
       webPreferences: {
         nodeIntegration: false,
