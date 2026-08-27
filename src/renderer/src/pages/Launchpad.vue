@@ -3,9 +3,11 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useAppStore } from '../stores/app'
 import ServiceCard from '../components/ServiceCard.vue'
 import AddServiceDialog from '../components/AddServiceDialog.vue'
+import type { ServiceState } from '@shared/types'
 
 const store = useAppStore()
 const showAdd = ref(false)
+const editingSvc = ref<ServiceState | null>(null)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(() => {
@@ -18,6 +20,7 @@ onUnmounted(() => {
 
 function onAdded() {
   showAdd.value = false
+  editingSvc.value = null
   store.refresh()
 }
 </script>
@@ -43,6 +46,9 @@ function onAdded() {
         @start="store.startService(svc.id)"
         @stop="store.stopService(svc.id)"
         @restart="store.restartService(svc.id)"
+        @stop-external="store.stopExternalService(svc.id)"
+        @restart-external="store.restartExternalService(svc.id)"
+        @edit="editingSvc = svc"
         @delete="store.deleteService(svc.id)"
       />
       <div v-if="store.services.length === 0" class="empty card">
@@ -53,8 +59,9 @@ function onAdded() {
     </div>
 
     <AddServiceDialog
-      v-if="showAdd"
-      @close="showAdd = false"
+      v-if="showAdd || editingSvc"
+      :editing="editingSvc"
+      @close="showAdd = false; editingSvc = null"
       @added="onAdded"
     />
   </div>

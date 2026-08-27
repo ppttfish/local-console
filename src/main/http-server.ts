@@ -75,6 +75,8 @@ export async function startHttpServer(opts: {
 
   await svc.start()
   await portScanner.start()
+  // 让 ServiceState 携带真实端口占用信息（外部接管条目的状态展示依赖它）
+  svc.setPortProvider(() => portScanner.snapshot())
   await usageScanner.start()
   subRefresher.start()
 
@@ -200,6 +202,15 @@ async function handleApi(
     if (pathname === '/api/service/list' && req.method === 'GET') {
       return json(res, 200, r.svc.list())
     }
+    if (pathname === '/api/service/get') {
+      const id = _url.searchParams.get('id') ?? ''
+      return json(res, 200, r.svc.get(id))
+    }
+    if (pathname === '/api/service/clear-logs' && req.method === 'POST') {
+      const { id } = body as { id: string }
+      r.log.clear(id)
+      return json(res, 200, { ok: true })
+    }
     if (pathname.startsWith('/api/service/') && req.method === 'POST') {
       const parts = pathname.split('/')
       const id = parts[3]!
@@ -208,8 +219,16 @@ async function handleApi(
       if (action === 'stop') return json(res, 200, await r.svc.stop(id, 'ui'))
       if (action === 'restart') return json(res, 200, await r.svc.restart(id, 'ui'))
     }
+    if (pathname === '/api/service/stop-external' && req.method === 'POST') {
+      const { id } = body as { id: string }
+      return json(res, 200, await r.svc.stopExternal(id, 'ui'))
+    }
     if (pathname === '/api/service/create' && req.method === 'POST') {
       return json(res, 200, r.svc.create(body as Parameters<typeof r.svc.create>[0]))
+    }
+    if (pathname === '/api/service/update' && req.method === 'POST') {
+      const { id, ...patch } = body as { id: string } & Record<string, unknown>
+      return json(res, 200, r.svc.update(id, patch))
     }
     if (pathname === '/api/service/delete' && req.method === 'POST') {
       const { id } = body as { id: string }

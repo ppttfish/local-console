@@ -26,11 +26,13 @@ import {
 import { EventBus } from './event-bus.js'
 import { LogStreamer } from './log-streamer.js'
 import { attachToSessionJob } from '../utils/proc-tree.js'
+import { pidAlive } from './proc-info.js'
 import type {
   ServiceState,
   ServiceStatus,
   TriggerSource,
-  ProjectDetection
+  ProjectDetection,
+  PortSnapshot
 } from '@shared/types'
 
 export interface ServiceManagerPaths {
@@ -46,6 +48,8 @@ interface RunningProc {
   runId: number
   logPath: string
   trigger: TriggerSource
+  /** 用户主动停止中：退出码非 0 也不算 failed（Windows taskkill 强杀退出码是 1） */
+  stopRequested?: boolean
 }
 
 const LOG_MAX_BYTES = 2 * 1024 * 1024
@@ -60,11 +64,18 @@ export class ServiceManager {
   private bus: EventBus
   private logStreamer: LogStreamer
   private paths: ServiceManagerPaths
+  /** 端口快照提供者（由运行时注入 PortScanner.snapshot），用于合并 listening 信息 */
+  private portProvider: (() => PortSnapshot[]) | null = null
 
   constructor(bus: EventBus, paths: ServiceManagerPaths) {
     this.bus = bus
     this.paths = paths
     this.logStreamer = new LogStreamer(bus, paths.logsDir)
+  }
+
+  /** 在 PortScanner 就绪后注入，供 toState 合并端口占用信息 */
+  setPortProvider(provider: () => PortSnapshot[]): void {
+    this.portProvider = provider
   }
 
   async start(): Promise<void> {
@@ -145,12 +156,19 @@ export class ServiceManager {
     if (!existsSync(s.cwd)) {
       return { ok: false, error: `工作目录不存在: ${s.cwd}` }
     }
-
     if (!existsSync(this.paths.logsDir)) {
       mkdirSync(this.paths.logsDir, { recursive: true })
     }
     const logPath = join(this.paths.logsDir, `${id}.log`)
     writeFileSync(logPath, `--- ${new Date().toISOString()} start ---\n`)
+    const commandIssue = diagnoseCommand(s.command)
+    if (commandIssue) {
+      return {
+        ok: false,
+        error: `启动命令无效: ${commandIssue}。请编辑该条目后填写可执行命令。`
+      }
+    }
+
 
     this.setStatus(id, 'starting')
     this.bus.emit_event({
@@ -220,7 +238,9 @@ export class ServiceManager {
       updateRunEnd(runId, exitCode)
       this.procs.delete(id)
       const finalStatus: ServiceStatus =
-        code === 0 || signal === 'SIGTERM' ? 'stopped' : 'failed'
+        code === 0 || signal === 'SIGTERM' || proc.stopRequested
+          ? 'stopped'
+          : 'failed'
       this.setStatus(id, finalStatus)
       this.bus.emit_event({
         type: 'service:status',
@@ -271,6 +291,7 @@ export class ServiceManager {
       return { ok: true }
     }
     this.setStatus(id, 'stopping')
+    proc.stopRequested = true
     const child = proc.child
     const pid = proc.pid
 
@@ -351,15 +372,74 @@ export class ServiceManager {
 
   private toState(s: ServiceRow): ServiceState {
     const proc = this.procs.get(s.id)
+    let listening = false
+    let portPid: number | null = null
+    let portProcessName: string | null = null
+    if (s.port && this.portProvider) {
+      const hit = this.portProvider().find((p) => p.port === s.port)
+      if (hit) {
+        listening = true
+        portPid = hit.pid
+        // 本台托管的进程由 pid 字段表达，外部占用才带进程名
+        if (!proc || proc.pid !== hit.pid) {
+          portProcessName = hit.process_name
+        }
+      }
+    }
     return {
       ...s,
       status: this.statuses.get(s.id) ?? 'stopped',
       pid: proc?.pid ?? null,
       uptime_sec: proc ? Math.floor((Date.now() - proc.startedAt) / 1000) : 0,
-      listening: false,
-      port_occupied_pid: null,
+      listening,
+      port_occupied_pid: portPid,
+      port_process_name: portProcessName,
       last_exit_code: null
     }
+  }
+
+  /**
+   * 结束占用该服务端口的外部进程（外部接管条目的「停止」）。
+   * 只允许杀「当前正监听该端口」的 PID，不能当任意进程杀手用；
+   * 若监听者本就是本台托管的子进程，转走常规 stop 流程。
+   */
+  async stopExternal(
+    id: string,
+    _trigger: TriggerSource = 'ui'
+  ): Promise<{ ok: boolean; pid?: number; error?: string }> {
+    void _trigger
+    const s = getService(id)
+    if (!s) return { ok: false, error: '服务不存在' }
+    if (!s.port) return { ok: false, error: '该条目未配置端口，无法定位外部进程' }
+    if (this.procs.has(id)) {
+      const r = await this.stop(id, 'ui')
+      return { ...r, ok: r.ok }
+    }
+    const hit = this.portProvider?.().find((p) => p.port === s.port)
+    if (!hit) {
+      return { ok: false, error: `端口 ${s.port} 当前没有监听进程` }
+    }
+    const pid = hit.pid
+    // netstat 缓存最长 2 秒，二次确认 PID 仍存活，防止误杀到复用 PID 的新进程
+    if (!pidAlive(pid)) {
+      return { ok: false, error: `进程 ${pid} 已退出（端口数据尚未刷新）` }
+    }
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { shell: false })
+      } else {
+        process.kill(pid, 'SIGKILL')
+      }
+    } catch (e) {
+      return { ok: false, error: String(e) }
+    }
+    // 等进程真正退出（最多 3 秒），给随后的「启动」一个干净端口
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      if (!pidAlive(pid)) return { ok: true, pid }
+      await new Promise<void>((r) => setTimeout(r, 300))
+    }
+    return { ok: true, pid }
   }
 
   // ========== 项目识别 ==========
@@ -454,4 +534,22 @@ export class ServiceManager {
     if (cmd.includes('uvicorn') || cmd.includes('fastapi')) return 8000
     return null
   }
+}
+// 预检 command 是否能直接 exec。返回 null 表示 OK；否则返回用户可读的错误说明。
+function diagnoseCommand(command: string): string | null {
+  if (!command || !command.trim()) return '启动命令为空'
+  // .pnpm 虚拟 store 路径基本都不能直接执行，常见于从运行中进程回填的
+  // command（store 路径可能出现在参数位置，所以要查整条命令）
+  if (command.includes('.pnpm') && command.includes('@')) {
+    return '命令包含 pnpm 虚拟 store 路径（通常是从运行中进程回填的完整命令行），无法照此启动；请改成简短的可执行命令（如 dsh web），工作区也换成固定目录'
+  }
+  const first = command.trim().split(/\s+/)[0] ?? ''
+  const unquoted = first.replace(/^["']|["']$/g, '')
+  // 绝对路径：检查文件是否存在
+  if (/^[A-Za-z]:[\\/]/.test(unquoted) || unquoted.startsWith('\\\\')) {
+    return existsSync(unquoted) ? null : `可执行文件不存在: ${unquoted}`
+  }
+  // 相对路径：交由 shell resolve（PATH 或 cwd 相对），这里只做存在性 sanity check
+  // —— 不存在的 PATH 工具会被 shell 报 not found，留给 spawn 自然失败
+  return null
 }

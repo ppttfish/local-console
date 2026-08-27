@@ -9,6 +9,12 @@ import type {
   PortSnapshot
 } from '@shared/types'
 
+export interface Toast {
+  id: number
+  kind: 'error' | 'success'
+  text: string
+}
+
 export const useAppStore = defineStore('app', () => {
   const services = ref<ServiceState[]>([])
   const ports = ref<PortSnapshot[]>([])
@@ -18,6 +24,23 @@ export const useAppStore = defineStore('app', () => {
   const capturedAt = ref(0)
   const ready = ref(false)
   const theme = ref<'light' | 'dark' | 'auto'>('auto')
+
+  // 轻量通知：服务操作失败必须可见，否则按钮像"没反应"
+  const toasts = ref<Toast[]>([])
+  let toastSeq = 1
+  function notify(kind: Toast['kind'], text: string): void {
+    const id = toastSeq++
+    toasts.value.push({ id, kind, text })
+    setTimeout(() => {
+      toasts.value = toasts.value.filter((t) => t.id !== id)
+    }, 6000)
+  }
+  function reportResult(r: unknown): void {
+    const res = r as { ok?: boolean; error?: string } | null
+    if (res && typeof res === 'object' && res.ok === false && res.error) {
+      notify('error', res.error)
+    }
+  }
   const appInfo = ref<{
     name: string
     version: string
@@ -58,13 +81,39 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function startService(id: string): Promise<unknown> {
-    return window.lcp.startService(id)
+    const r = await window.lcp.startService(id)
+    reportResult(r)
+    return r
   }
   async function stopService(id: string): Promise<unknown> {
-    return window.lcp.stopService(id)
+    const r = await window.lcp.stopService(id)
+    reportResult(r)
+    return r
   }
   async function restartService(id: string): Promise<unknown> {
-    return window.lcp.restartService(id)
+    const r = await window.lcp.restartService(id)
+    reportResult(r)
+    return r
+  }
+  async function stopExternalService(id: string): Promise<unknown> {
+    const r = await window.lcp.stopExternalService(id)
+    reportResult(r)
+    return r
+  }
+  /** 外部进程「重启」：结束占用端口的进程 → 等端口释放 → 用本台命令接管拉起 */
+  async function restartExternalService(id: string): Promise<unknown> {
+    const r = (await window.lcp.stopExternalService(id)) as {
+      ok?: boolean
+      error?: string
+    }
+    if (r && r.ok === false) return r
+    for (let i = 0; i < 12; i++) {
+      await refresh()
+      const svc = services.value.find((s) => s.id === id)
+      if (!svc || !svc.listening) break
+      await new Promise((res) => setTimeout(res, 500))
+    }
+    return startService(id)
   }
   async function createService(input: unknown): Promise<unknown> {
     return window.lcp.createService(input)
@@ -73,7 +122,9 @@ export const useAppStore = defineStore('app', () => {
     return window.lcp.updateService(input)
   }
   async function deleteService(id: string): Promise<unknown> {
-    return window.lcp.deleteService(id)
+    const r = await window.lcp.deleteService(id)
+    reportResult(r)
+    return r
   }
   async function reorderServices(ids: string[]): Promise<unknown> {
     return window.lcp.reorderServices(ids)
@@ -110,6 +161,8 @@ export const useAppStore = defineStore('app', () => {
     ready,
     theme,
     appInfo,
+    toasts,
+    notify,
     runningServices,
     stoppedServices,
     unmanagedPorts,
@@ -119,6 +172,8 @@ export const useAppStore = defineStore('app', () => {
     startService,
     stopService,
     restartService,
+    stopExternalService,
+    restartExternalService,
     createService,
     updateService,
     deleteService,

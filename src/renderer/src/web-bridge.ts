@@ -36,9 +36,11 @@ export function installWebBridge(): void {
     updateService: (input) => post('/api/service/update', input),
     deleteService: (id) =>
       post('/api/service/delete', { id }).then(() => ({ ok: true })),
-    startService: (id) => post(`/api/service/${id}/start`),
-    stopService: (id) => post(`/api/service/${id}/stop`),
-    restartService: (id) => post(`/api/service/${id}/restart`),
+    // post() 无 body 时退化为 GET，而控制类路由只认 POST，必须显式传空 body
+    startService: (id) => post(`/api/service/${id}/start`, {}),
+    stopService: (id) => post(`/api/service/${id}/stop`, {}),
+    restartService: (id) => post(`/api/service/${id}/restart`, {}),
+    stopExternalService: (id) => post('/api/service/stop-external', { id }),
     reorderServices: (ids) => post('/api/service/reorder', { ids }),
     getServiceLogs: (id, tail = 300) =>
       post('/api/service/logs', { id, tail }),

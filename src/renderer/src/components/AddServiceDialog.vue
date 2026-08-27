@@ -1,10 +1,18 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 
 import { useAppStore } from '../stores/app'
-import type { ProjectDetection, ProjectCandidate, PortSnapshot } from '@shared/types'
+import type {
+  ProjectDetection,
+  ProjectCandidate,
+  PortSnapshot,
+  ServiceState
+} from '@shared/types'
 
-const props = defineProps<{ fromPort?: PortSnapshot | null }>()
+const props = defineProps<{
+  fromPort?: PortSnapshot | null
+  editing?: ServiceState | null
+}>()
 const emit = defineEmits<{ close: []; added: [] }>()
 const store = useAppStore()
 
@@ -27,12 +35,28 @@ function applyFromPort(p: PortSnapshot): void {
 }
 
 watch(
-  () => props.fromPort,
-  (p) => {
-    if (p) applyFromPort(p)
+  () => [props.fromPort, props.editing] as const,
+  ([p, ed]) => {
+    if (ed) {
+      name.value = ed.name
+      kind.value = ed.kind
+      cwd.value = ed.cwd
+      command.value = ed.command
+      port.value = ed.port
+    } else if (p) {
+      applyFromPort(p)
+    }
   },
   { immediate: true }
 )
+
+/** 回填的进程命令行（临时目录 / pnpm store）无法直接启动，保存前提醒 */
+const commandLooksBackfilled = computed(() => {
+  const c = command.value.trim()
+  if (!c) return false
+  const first = c.split(/\s+/)[0] ?? ''
+  return /^["']/.test(first) || /(^|\s)"?[A-Za-z]:[\\/][^"\s]*\.pnpm\\/.test(c)
+})
 
 async function pickFolder() {
   const r = (await store.pickFolder()) as { ok: boolean; path?: string }
@@ -66,13 +90,18 @@ async function save() {
   saving.value = true
   error.value = ''
   try {
-    await store.createService({
+    const payload = {
       name: name.value,
       kind: kind.value,
       cwd: cwd.value,
       command: command.value,
       port: port.value
-    })
+    }
+    if (props.editing) {
+      await store.updateService({ id: props.editing.id, ...payload })
+    } else {
+      await store.createService(payload)
+    }
     emit('added')
   } catch (e) {
     error.value = String(e)
@@ -86,7 +115,13 @@ async function save() {
   <div class="mask" @click.self="emit('close')">
     <div class="dialog card">
       <header>
-        <h2>{{ props.fromPort ? `接管端口 :${props.fromPort.port}` : '添加服务' }}</h2>
+        <h2>{{
+          props.editing
+            ? '编辑服务'
+            : props.fromPort
+              ? `接管端口 :${props.fromPort.port}`
+              : '添加服务'
+        }}</h2>
         <button class="close" @click="emit('close')">×</button>
       </header>
 
@@ -131,6 +166,11 @@ async function save() {
           启动命令 *
           <input v-model="command" placeholder="npm run dev" />
         </label>
+        <div v-if="commandLooksBackfilled" class="error">
+          该命令像是从运行中进程回填的完整命令行（含临时目录或 pnpm store
+          路径），无法照此启动。请改成简短的可执行命令（如
+          <code>dsh web</code>），工作区也建议换成固定目录。
+        </div>
 
         <label>
           端口（可选）

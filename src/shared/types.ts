@@ -24,8 +24,11 @@ export interface ServiceState extends Service {
   status: ServiceStatus
   pid: number | null
   uptime_sec: number
+  /** 该服务配置的端口当前是否有进程在监听（含外部进程） */
   listening: boolean
   port_occupied_pid: number | null
+  /** 端口监听进程名；监听者是本台托管进程时为 null */
+  port_process_name?: string | null
   last_exit_code: number | null
 }
 

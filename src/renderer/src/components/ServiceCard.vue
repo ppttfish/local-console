@@ -7,10 +7,22 @@ const emit = defineEmits<{
   start: []
   stop: []
   restart: []
+  stopExternal: []
+  restartExternal: []
+  edit: []
   delete: []
 }>()
 
+/** 端口被外部进程占用（非本台托管）：真实的"外部接管运行中" */
+const isExternalRunning = computed(
+  () =>
+    props.service.pid === null &&
+    props.service.listening &&
+    props.service.port_occupied_pid !== null
+)
+
 const statusLabel = computed(() => {
+  if (isExternalRunning.value) return '外部运行中'
   const map: Record<typeof props.service.status, string> = {
     running: '运行中',
     stopped: '已停止',
@@ -20,14 +32,22 @@ const statusLabel = computed(() => {
   }
   return map[props.service.status]
 })
-
-// 从端口接管的条目：本控制台没有 ServiceManager 实例在跑它，
-// 但它的端口仍被外部进程占着。状态如实显示 stopped/failed，并给个提示。
-const isAdoptedExternal = computed(
-  () =>
-    (props.service.status === 'stopped' || props.service.status === 'failed') &&
-    props.service.pid === null
+const tagClass = computed(() =>
+  isExternalRunning.value ? 'running' : props.service.status
 )
+
+const externalDesc = computed(() => {
+  if (!isExternalRunning.value) return ''
+  const name = props.service.port_process_name || '未知进程'
+  return `${name}（PID ${props.service.port_occupied_pid}）`
+})
+
+/** 接管时回填的进程命令行（引号开头的绝对路径 / pnpm store 路径），通常无法直接启动 */
+const commandLooksBackfilled = computed(() => {
+  const c = props.service.command || ''
+  const first = c.trim().split(/\s+/)[0] ?? ''
+  return /^["']/.test(first) || c.includes('.pnpm')
+})
 
 const uptimeText = computed(() => {
   if (props.service.status !== 'running') return ''
@@ -38,6 +58,30 @@ const uptimeText = computed(() => {
   const m = Math.floor((s % 3600) / 60)
   return `${h} 时 ${m} 分`
 })
+
+function confirmStopExternal() {
+  if (
+    confirm(
+      `结束占用端口 :${props.service.port} 的外部进程？\n${externalDesc.value}\n（这会终止该进程，之后可点「启动」由本台接管）`
+    )
+  ) {
+    emit('stopExternal')
+  }
+}
+
+function onRestart() {
+  if (isExternalRunning.value) {
+    if (
+      confirm(
+        `重启 = 结束外部进程 ${externalDesc.value}，\n然后用本台命令重新拉起「${props.service.name}」。继续？`
+      )
+    ) {
+      emit('restartExternal')
+    }
+    return
+  }
+  emit('restart')
+}
 
 function confirmDelete() {
   if (confirm(`确认删除「${props.service.name}」？\n（不会影响外部已在运行的进程）`)) {
@@ -52,7 +96,7 @@ function confirmDelete() {
       <div class="name" :style="{ color: service.color || undefined }">
         {{ service.name }}
       </div>
-      <span class="tag" :class="service.status">{{ statusLabel }}</span>
+      <span class="tag" :class="tagClass">{{ statusLabel }}</span>
     </div>
 
     <div class="meta">
@@ -72,16 +116,30 @@ function confirmDelete() {
       <div class="row" v-if="service.status === 'running' && service.pid">
         <span class="muted">PID {{ service.pid }} · 已运行 {{ uptimeText }}</span>
       </div>
+      <div class="row" v-else-if="isExternalRunning">
+        <span class="muted">外部进程 {{ externalDesc }}</span>
+      </div>
     </div>
 
-    <div v-if="isAdoptedExternal" class="hint">
-      此条目从外部端口接管，本控制台未运行它。点「启动」会用上面的命令
-      在「工作区」里拉起一个新进程。
+    <div v-if="commandLooksBackfilled" class="hint">
+      这条命令像是从运行中进程回填的完整命令行，无法照此启动。
+      点「编辑」改成简短的可执行命令（如 <code>dsh web</code>），
+      工作区换成固定目录后即可托管启动。
+    </div>
+    <div v-if="isExternalRunning" class="hint">
+      端口正由外部进程占用（非本控制台启动）。可「结束进程」释放端口，
+      或「重启」结束后用上面的命令接管。
     </div>
 
     <div class="ops">
       <button
-        v-if="service.status === 'stopped' || service.status === 'failed'"
+        v-if="isExternalRunning"
+        @click="confirmStopExternal"
+      >
+        结束进程
+      </button>
+      <button
+        v-else-if="service.status === 'stopped' || service.status === 'failed'"
         class="primary"
         @click="emit('start')"
       >
@@ -101,19 +159,20 @@ function confirmDelete() {
       </button>
 
       <button
-        :disabled="service.status !== 'running'"
+        :disabled="service.status !== 'running' && !isExternalRunning"
         :title="
-          service.status === 'running'
+          service.status === 'running' || isExternalRunning
             ? '先停止再启动'
             : '请先启动，再使用重启'
         "
-        @click="emit('restart')"
+        @click="onRestart"
       >
-        重启
+        {{ isExternalRunning ? '重启接管' : '重启' }}
       </button>
 
       <span class="spacer" />
 
+      <button @click="emit('edit')">编辑</button>
       <button class="danger" @click="confirmDelete">删除</button>
     </div>
   </div>

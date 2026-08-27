@@ -11,6 +11,7 @@ export const IpcChannels = {
   ServiceStart: 'service:start',
   ServiceStop: 'service:stop',
   ServiceRestart: 'service:restart',
+  ServiceStopExternal: 'service:stopExternal',
   ServiceReorder: 'service:reorder',
   ServiceLogs: 'service:logs',
   ServiceClearLogs: 'service:clearLogs',

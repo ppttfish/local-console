@@ -16,6 +16,7 @@ export interface LcpApi {
   startService: (id: string) => Promise<unknown>
   stopService: (id: string) => Promise<unknown>
   restartService: (id: string) => Promise<unknown>
+  stopExternalService: (id: string) => Promise<unknown>
   reorderServices: (ids: string[]) => Promise<unknown>
   getServiceLogs: (id: string, tail?: number) => Promise<unknown>
   clearServiceLogs: (id: string) => Promise<unknown>

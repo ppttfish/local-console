@@ -17,6 +17,7 @@ const api = {
   startService: (id: string) => invoke(IpcChannels.ServiceStart, id),
   stopService: (id: string) => invoke(IpcChannels.ServiceStop, id),
   restartService: (id: string) => invoke(IpcChannels.ServiceRestart, id),
+  stopExternalService: (id: string) => invoke(IpcChannels.ServiceStopExternal, id),
   reorderServices: (ids: string[]) => invoke(IpcChannels.ServiceReorder, ids),
   getServiceLogs: (id: string, tail = 300) =>
     invoke(IpcChannels.ServiceLogs, { id, tail }),

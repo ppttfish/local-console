@@ -67,6 +67,9 @@ export function registerIpcHandlers(
     svc.reorder(ids)
     return { ok: true }
   })
+  ipcMain.handle(IpcChannels.ServiceStopExternal, (_e, id: string) =>
+    svc.stopExternal(id, 'ui')
+  )
 
   // ===== Logs =====
   ipcMain.handle(
@@ -96,6 +99,7 @@ export function registerIpcHandlers(
   })
 
   // ===== State =====
+  svc.setPortProvider(() => port.snapshot())
   ipcMain.handle(IpcChannels.StateGet, (): AppState => {
     const services = svc.list() as ServiceState[]
     const ports = port.snapshot() as PortSnapshot[]
