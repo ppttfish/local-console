@@ -4,7 +4,7 @@
 import { getDb } from '../../../services/db.js'
 import { calcCost, priceFor, loadPricing, type ModelPrice } from './pricing.js'
 
-export type Platform = 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'unknown'
+export type Platform = 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh' | 'unknown'
 
 export interface UsageRow {
   agent: Platform

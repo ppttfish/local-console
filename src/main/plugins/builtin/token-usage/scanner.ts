@@ -2,12 +2,13 @@
  * 文件发现 + 增量扫描 v2
  *  - omp / zcode / codex / claude 走 jsonl 增量
  *  - opencode 走 SQLite 直查（db 文件 mtime 做 cursor key）
+ *  - dsh 走 zstd 压缩 jsonl（无法按行增量，文件指纹变了全删全写）
  */
 import { readFileSync, statSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { EventEmitter } from 'node:events'
-import { parserForFile, sessionIdFromFile, readOpenCodeDb } from './parsers.js'
+import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSession } from './parsers.js'
 import {
   ensureUsageSchema,
   insertUsageBatch,
@@ -27,6 +28,12 @@ export interface ScannerStats {
   by_agent: Record<Platform, number>
   errors: number
   opencode_messages: number
+  dsh_sessions: number
+  /**
+   * opencode.db 的实际写入者：OpenChamber 与原生 OpenCode 共用
+   * ~/.local/share/opencode，按本机特征判断该口径该显示哪个名字
+   */
+  opencode_flavor: 'openchamber' | 'opencode'
 }
 
 interface DiscoveredFile {
@@ -39,6 +46,8 @@ export class UsageScanner extends EventEmitter {
   private timer: ReturnType<typeof setInterval> | undefined
   private stats: ScannerStats = freshStats()
   private opencodeLastMtime: { path: string; mtime: number; count: number } | null = null
+  /** dsh 所有会话文件的 (path|size|mtime) 指纹；变化才全量重建 */
+  private dshFingerprint: string | null = null
 
   start(): void {
     ensureUsageSchema()
@@ -57,8 +66,12 @@ export class UsageScanner extends EventEmitter {
 
   async rescan(): Promise<ScannerStats> {
     resetAllCursors()
+    // jsonl 类 agent 靠 cursor 增量去重，cursor 重置后若不先清旧行，
+    // 全文件重扫会与旧数据叠加导致用量翻倍；全删重建最简单可靠
+    getDb().prepare('DELETE FROM agent_usage').run()
     this.stats = freshStats()
     this.opencodeLastMtime = null
+    this.dshFingerprint = null
     await this.scanAll()
     return this.stats
   }
@@ -81,6 +94,12 @@ export class UsageScanner extends EventEmitter {
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 opencode.db 失败:', e)
+      }
+      try {
+        totalNew += this.scanDsh()
+      } catch (e) {
+        this.stats.errors++
+        console.warn('[token-usage] 扫 dsh sessions 失败:', e)
       }
     } catch (e) {
       this.stats.errors++
@@ -172,6 +191,46 @@ export class UsageScanner extends EventEmitter {
     return usageRows.length
   }
 
+  /** dsh：~/.dsh/sessions 下的 session.jsonl.zstd，指纹变化才全删全写 */
+  private scanDsh(): number {
+    const root = join(homedir(), '.dsh', 'sessions')
+    if (!existsSync(root)) return 0
+    const files: Array<{ path: string; sessionId: string }> = []
+    walkJsonl(
+      root,
+      (p) => {
+        files.push({ path: p, sessionId: sessionIdFromFile('dsh', p) })
+      },
+      0,
+      /\.jsonl\.zstd$/
+    )
+    if (files.length === 0) return 0
+    // 指纹 = 每个文件的 size+mtime；zstd 流无法按行增量，只能整体重建
+    const parts: string[] = []
+    for (const f of files) {
+      const st = statSync(f.path)
+      parts.push(`${f.path}:${st.size}:${Math.floor(st.mtimeMs)}`)
+    }
+    const fingerprint = parts.sort().join('|')
+    if (this.dshFingerprint === fingerprint) return 0
+
+    getDb().prepare('DELETE FROM agent_usage WHERE agent = ?').run('dsh')
+    const all: UsageRow[] = []
+    for (const f of files) {
+      try {
+        all.push(...parseDshSession(f.path, f.sessionId))
+      } catch (e) {
+        this.stats.errors++
+        console.warn(`[token-usage] 解析 dsh 会话 ${f.path} 失败:`, e)
+      }
+    }
+    if (all.length > 0) insertUsageBatch(all)
+    this.dshFingerprint = fingerprint
+    this.stats.by_agent['dsh'] = (this.stats.by_agent['dsh'] ?? 0) + all.length
+    this.stats.dsh_sessions = files.length
+    return all.length
+  }
+
   private discoverJsonl(): DiscoveredFile[] {
     const out: DiscoveredFile[] = []
     const home = homedir()
@@ -235,7 +294,8 @@ export class UsageScanner extends EventEmitter {
 function walkJsonl(
   dir: string,
   onFile: (path: string) => void,
-  depth = 0
+  depth = 0,
+  match: RegExp = /\.jsonl$/
 ): void {
   if (depth > 8) return
   let entries: string[]
@@ -254,8 +314,8 @@ function walkJsonl(
       continue
     }
     if (st.isDirectory()) {
-      walkJsonl(full, onFile, depth + 1)
-    } else if (st.isFile() && /\.jsonl$/.test(name) && !name.endsWith('.bak')) {
+      walkJsonl(full, onFile, depth + 1, match)
+    } else if (st.isFile() && match.test(name) && !name.endsWith('.bak')) {
       onFile(full)
     }
   }
@@ -272,9 +332,37 @@ function freshStats(): ScannerStats {
       opencode: 0,
       codex: 0,
       claude: 0,
+      dsh: 0,
       unknown: 0
     },
     errors: 0,
-    opencode_messages: 0
+    opencode_messages: 0,
+    dsh_sessions: 0,
+    opencode_flavor: detectOpenCodeFlavor()
   }
+}
+
+/**
+ * 判断 ~/.local/share/opencode 的写入者是 OpenChamber 还是原生 OpenCode。
+ * 两者共用同一数据目录无法按数据区分，只能按本机安装特征：
+ * OpenChamber 的配置目录（含 managed-opencode 等）是最强信号，
+ * 备份文件名是次级信号；都没有则当作原生 OpenCode。
+ */
+function detectOpenCodeFlavor(): 'openchamber' | 'opencode' {
+  const home = homedir()
+  try {
+    if (statSync(join(home, '.config', 'openchamber')).isDirectory()) {
+      return 'openchamber'
+    }
+  } catch {
+    // 不存在，继续
+  }
+  try {
+    if (existsSync(join(home, '.local', 'share', 'opencode', 'auth.json.openchamber.backup'))) {
+      return 'openchamber'
+    }
+  } catch {
+    // ignore
+  }
+  return 'opencode'
 }

@@ -82,22 +82,35 @@ interface Status {
   last_scan_at: number
   by_agent: Record<string, number>
   opencode_messages: number
+  dsh_sessions: number
+  /** opencode.db 的实际写入者：OpenChamber 与原生 OpenCode 共用数据目录，按本机安装特征判断 */
+  opencode_flavor: 'openchamber' | 'opencode'
 }
 
-const AGENT_LABEL: Record<string, string> = {
-  omp: 'OMP (OpenChamber)',
+const AGENT_LABEL_STATIC: Record<string, string> = {
+  omp: 'OMP',
   zcode: 'ZCode',
-  opencode: 'OpenCode',
   codex: 'Codex',
   claude: 'Claude',
+  dsh: 'DSH (DeepSeek)',
   unknown: '未知'
 }
+/** opencode 口径显示名随本机探测结果切换（OpenChamber 复用 opencode 数据目录） */
+const agentLabels = computed<Record<string, string>>(() => ({
+  ...AGENT_LABEL_STATIC,
+  opencode:
+    status.value?.opencode_flavor === 'openchamber' ? 'OpenChamber' : 'OpenCode'
+}))
+const opencodeLabel = computed(
+  () => agentLabels.value['opencode'] ?? 'OpenCode'
+)
 const AGENT_COLOR: Record<string, string> = {
   omp: '#0ea5e9',
   zcode: '#10b981',
   opencode: '#f59e0b',
   codex: '#8b5cf6',
   claude: '#ef4444',
+  dsh: '#14b8a6',
   unknown: '#94a3b8'
 }
 
@@ -107,7 +120,7 @@ const CNY_RATE = 7.16
 type PresetRange = 'today' | '24h' | '7d' | '30d' | 'all'
 type Granularity = 'hour' | 'day' | 'month'
 
-const agent = ref<'all' | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude'>(
+const agent = ref<'all' | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh'>(
   'all'
 )
 const model = ref<string>('')
@@ -458,7 +471,7 @@ const lineChartOptions: ChartOptions<'line'> = {
 const agentDoughnut = computed<ChartData<'doughnut'>>(() => {
   const rows = summary.value?.by_agent ?? []
   return {
-    labels: rows.map((r) => AGENT_LABEL[r.agent] ?? r.agent),
+    labels: rows.map((r) => agentLabels.value[r.agent] ?? r.agent),
     datasets: [
       {
         data: rows.map((r) => r.cost),
@@ -468,6 +481,15 @@ const agentDoughnut = computed<ChartData<'doughnut'>>(() => {
     ]
   }
 })
+
+// ===== 平台卡片 tab：用量排行（默认）/ 成本占比 =====
+const platformTab = ref<'rank' | 'cost'>('rank')
+const rankRows = computed(() =>
+  [...(summary.value?.by_agent ?? [])].sort((a, b) => b.tokens - a.tokens)
+)
+const rankMaxTokens = computed(() =>
+  Math.max(1, ...rankRows.value.map((r) => r.tokens))
+)
 
 const agentDoughnutOptions: ChartOptions<'doughnut'> = {
   responsive: true,
@@ -603,7 +625,8 @@ const granularityLabel = computed(() =>
         <h1>Agent Token 用量</h1>
         <p class="muted" v-if="tab === 'usage'">
           扫描 <b>{{ status?.files_scanned ?? 0 }}</b> 个文件 ·
-          opencode 消息 <b>{{ status?.opencode_messages ?? 0 }}</b> 条 ·
+          {{ opencodeLabel }} 消息 <b>{{ status?.opencode_messages ?? 0 }}</b> 条 ·
+          DSH 会话 <b>{{ status?.dsh_sessions ?? 0 }}</b> 个 ·
           上次扫描 {{ status?.last_scan_at ? relativeTime(status.last_scan_at) : '从未' }}
         </p>
         <p class="muted" v-else>
@@ -777,9 +800,10 @@ const granularityLabel = computed(() =>
           <button :class="{ active: agent === 'all' }" @click="agent = 'all'">全部</button>
           <button :class="{ active: agent === 'omp' }" @click="agent = 'omp'">OMP</button>
           <button :class="{ active: agent === 'zcode' }" @click="agent = 'zcode'">ZCode</button>
-          <button :class="{ active: agent === 'opencode' }" @click="agent = 'opencode'">OpenCode</button>
+          <button :class="{ active: agent === 'opencode' }" @click="agent = 'opencode'">{{ opencodeLabel }}</button>
           <button :class="{ active: agent === 'codex' }" @click="agent = 'codex'">Codex</button>
           <button :class="{ active: agent === 'claude' }" @click="agent = 'claude'">Claude</button>
+          <button :class="{ active: agent === 'dsh' }" @click="agent = 'dsh'">DSH</button>
         </div>
       </div>
       <div class="filter">
@@ -850,10 +874,35 @@ const granularityLabel = computed(() =>
 
     <div class="row-2" v-if="summary">
       <div class="card">
-        <h3>成本占比 · 按平台</h3>
-        <div class="chart-wrap small">
+        <div class="card-head">
+          <h3>{{ platformTab === 'rank' ? '用量排行 · 按平台' : '成本占比 · 按平台' }}</h3>
+          <div class="seg seg-mini">
+            <button :class="{ active: platformTab === 'rank' }" @click="platformTab = 'rank'">用量排行</button>
+            <button :class="{ active: platformTab === 'cost' }" @click="platformTab = 'cost'">成本占比</button>
+          </div>
+        </div>
+        <div class="chart-wrap small" v-if="platformTab === 'cost'">
           <Doughnut :data="agentDoughnut" :options="agentDoughnutOptions" />
         </div>
+        <div class="rank-list" v-else-if="rankRows.length">
+          <div class="rank-item" v-for="(r, i) in rankRows" :key="r.agent">
+            <span class="rank-no">{{ i + 1 }}</span>
+            <span class="dot" :style="{ background: AGENT_COLOR[r.agent] || '#888' }" />
+            <span class="rank-name">{{ agentLabels[r.agent] ?? r.agent }}</span>
+            <div class="rank-bar">
+              <div
+                class="rank-bar-fill"
+                :style="{
+                  width: Math.max(2, (r.tokens / rankMaxTokens) * 100) + '%',
+                  background: AGENT_COLOR[r.agent] || '#94a3b8'
+                }"
+              />
+            </div>
+            <span class="rank-val">{{ fmtToken(r.tokens) }}</span>
+            <span class="rank-cost">{{ fmtCost(r.cost) }}</span>
+          </div>
+        </div>
+        <p v-else class="muted center">暂无数据</p>
       </div>
       <div class="card">
         <h3>Token 分布 · 按模型 TOP 10</h3>
@@ -880,7 +929,7 @@ const granularityLabel = computed(() =>
             <tr v-for="r in summary.by_agent" :key="r.agent">
               <td>
                 <span class="dot" :style="{ background: AGENT_COLOR[r.agent] || '#888' }" />
-                {{ AGENT_LABEL[r.agent] ?? r.agent }}
+                {{ agentLabels[r.agent] ?? r.agent }}
               </td>
               <td class="num">{{ fmtToken(r.tokens) }}</td>
               <td class="num">{{ r.calls.toLocaleString() }}</td>
@@ -942,7 +991,7 @@ const granularityLabel = computed(() =>
             <td><code>{{ s.session_id.slice(0, 22) }}</code></td>
             <td>
               <span class="dot" :style="{ background: AGENT_COLOR[s.agent] || '#888' }" />
-              {{ AGENT_LABEL[s.agent] ?? s.agent }}
+              {{ agentLabels[s.agent] ?? s.agent }}
             </td>
             <td><code>{{ s.model || '—' }}</code></td>
             <td class="num">{{ s.calls.toLocaleString() }}</td>
@@ -959,11 +1008,12 @@ const granularityLabel = computed(() =>
       <h3>暂无数据</h3>
       <p class="muted">
         本工具会扫描以下目录的会话日志：<br>
-        · <code>~/.omp/agent/sessions/</code> (OpenChamber)<br>
+        · <code>~/.omp/agent/sessions/</code> (OMP)<br>
         · <code>~/.zcode/cli/rollout/</code><br>
         · <code>~/.codex/sessions/</code><br>
         · <code>~/.claude/projects/</code><br>
-        · <code>~/.local/share/opencode/opencode.db</code> (SQLite)
+        · <code>~/.local/share/opencode/opencode.db</code> (OpenCode / OpenChamber)<br>
+        · <code>~/.dsh/sessions/</code> (DSH)
       </p>
     </div>
     </template>
@@ -1098,6 +1148,65 @@ const granularityLabel = computed(() =>
 }
 .chart-wrap.small {
   height: 240px;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.card-head h3 {
+  margin: 0;
+}
+.seg-mini button {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.rank-list {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  height: 240px;
+}
+.rank-item {
+  display: grid;
+  grid-template-columns: 18px 10px minmax(72px, auto) 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.rank-no {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.rank-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rank-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.rank-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+}
+.rank-val {
+  font-variant-numeric: tabular-nums;
+  min-width: 44px;
+  text-align: right;
+}
+.rank-cost {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+  text-align: right;
 }
 .row-2 {
   display: grid;

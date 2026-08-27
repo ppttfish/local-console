@@ -3,8 +3,9 @@
  *  每个 parser 返回 UsageRow | null
  */
 import { existsSync, statSync, readFileSync, readdirSync } from 'node:fs'
-import { join, basename } from 'node:path'
+import { join, basename, dirname } from 'node:path'
 import Database from 'better-sqlite3'
+import { decompress as zstdDecompress } from 'fzstd'
 import type { Platform, UsageRow } from './storage.js'
 import { calcCost } from './pricing.js'
 
@@ -213,6 +214,72 @@ function parseClaudeLine(line: string, ctx: ParseContext): UsageRow | null {
 }
 
 // ============================================================
+// dsh (DeepSeek Harness)  ~/.dsh/sessions/**/session-<uuid>/session.jsonl.zstd
+// 整文件 zstd 压缩，解压后按行：
+//   {type:'session', id}                          → 会话 id
+//   {type:'request/context', data:{model}}        → 当前 model
+//   {type:'assistant/chunk', data:{chunk:{type:'usage', usage:{inputTokens,outputTokens,cacheReadTokens}}}}
+// usage 跨行依赖当前 model，必须整文件解析（不能按行独立喂）
+// ============================================================
+export function parseDshSession(filePath: string, fallbackSessionId: string): UsageRow[] {
+  if (!existsSync(filePath)) return []
+  let raw: Uint8Array
+  try {
+    raw = zstdDecompress(readFileSync(filePath))
+  } catch {
+    return [] // 损坏的压缩流直接跳过，下次 mtime 变了会重试
+  }
+  const rows: UsageRow[] = []
+  let sessionId = fallbackSessionId
+  let model = 'unknown'
+  for (const line of new TextDecoder().decode(raw).split('\n')) {
+    if (!line) continue
+    let ev: unknown
+    try {
+      ev = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!ev || typeof ev !== 'object') continue
+    const e = ev as Record<string, unknown>
+    const data = (e['data'] ?? {}) as Record<string, unknown>
+    const t = e['type']
+    if (t === 'session') {
+      sessionId = strOr(data['id'] as string | undefined, sessionId)
+    } else if (t === 'request/context') {
+      model = strOr(data['model'] as string | undefined, model)
+    } else if (t === 'request/header') {
+      const cfg = data['header'] as Record<string, unknown> | undefined
+      const m = (cfg?.['config'] as Record<string, unknown> | undefined)?.['model']
+      model = strOr(m as string | undefined, model)
+    } else if (t === 'assistant/chunk') {
+      const chunk = data['chunk'] as Record<string, unknown> | undefined
+      if (!chunk || chunk['type'] !== 'usage') continue
+      const usage = chunk['usage'] as Record<string, unknown> | undefined
+      if (!usage) continue
+      const input = numOr(usage['inputTokens'], 0)
+      const output = numOr(usage['outputTokens'], 0)
+      const cacheRead = numOr(usage['cacheReadTokens'], 0)
+      if (input + output + cacheRead === 0) continue
+      rows.push({
+        agent: 'dsh',
+        model,
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: cacheRead,
+        cache_read_tokens: cacheRead,
+        cache_write_tokens: 0,
+        cost_usd: calcCost(model, input, output, cacheRead, 0),
+        at: numOr(e['time'], Date.now()),
+        session_id: sessionId,
+        meta: null
+      })
+    }
+  }
+  return rows
+}
+
+// ============================================================
 // utils
 // ============================================================
 function numOr(v: unknown, fallback: number): number {
@@ -344,6 +411,9 @@ export function sessionIdFromFile(agent: Platform, filePath: string): string {
       const parts = base.split('_')
       return parts[parts.length - 1] ?? base
     }
+    case 'dsh':
+      // session-<uuid>/session.jsonl.zstd —— 会话 id 在目录名上
+      return basename(dirname(filePath))
     case 'codex':
     case 'claude':
       return base

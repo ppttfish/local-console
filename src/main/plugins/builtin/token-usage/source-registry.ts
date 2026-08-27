@@ -19,7 +19,7 @@ export interface Source {
   /** 简短描述 */
   description: string
   /** 类型 */
-  type: 'jsonl' | 'sqlite'
+  type: 'jsonl' | 'sqlite' | 'zstd-jsonl'
   /** 子路径（相对 home），目录存在才算"渠道存在" */
   homeSubpath: string
   /** 路径 glob（相对上面目录），支持 ** 通配多级 */
@@ -61,13 +61,22 @@ interface OMPUsageShape {
 export const SOURCES: Source[] = [
   {
     agent: 'omp',
-    displayName: 'OMP (OpenChamber)',
-    description: 'OpenChamber 客户端',
+    displayName: 'OMP',
+    description: 'OMP 客户端（独立 CLI，非 OpenChamber）',
     type: 'jsonl',
     homeSubpath: '.omp',
     pathGlob: 'agent/sessions/**/*.jsonl',
     filePattern: /\.jsonl$/,
     parser: 'omp'
+  },
+  {
+    agent: 'dsh',
+    displayName: 'DSH (DeepSeek)',
+    description: 'DeepSeek Harness CLI（@deepseek-ai/dsh，zstd 压缩会话）',
+    type: 'zstd-jsonl',
+    homeSubpath: '.dsh',
+    pathGlob: 'sessions/**/*.jsonl.zstd',
+    filePattern: /\.jsonl\.zstd$/
   },
   {
     agent: 'zcode',
@@ -102,7 +111,7 @@ export const SOURCES: Source[] = [
   {
     agent: 'opencode',
     displayName: 'OpenCode',
-    description: 'OpenCode CLI',
+    description: 'OpenCode CLI（OpenChamber 等衍生客户端共用此数据目录，本机实际写入者见 status.opencode_flavor）',
     type: 'sqlite',
     homeSubpath: '.local/share/opencode',
     pathGlob: '',
