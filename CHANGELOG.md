@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.4 (2026-08-27) — 用量统计 DSH 接入 + 平台口径修正 + Mac 支持
+
+### 新增
+
+- **用量统计接入 DSH（DeepSeek Harness）**
+  - 扫描 `~/.dsh/sessions/**/session-*/session.jsonl.zstd`（zstd 压缩会话，fzstd 纯 JS 解压，不引入原生依赖）
+  - usage 取自 `assistant/chunk` 行（inputTokens/outputTokens/cacheReadTokens），模型名跟随 `request/context`
+  - zstd 流无法按行增量：以全目录文件指纹（size+mtime）变化触发整库重建
+  - 平台筛选条新增 DSH 入口；状态栏显示已扫描会话数
+- **平台卡片「用量排行」Tab**：默认视图改为按 Token 横条排行（名次/平台色占比条/Token/成本），可切回原「成本占比」环图
+- **Mac 安装包**：新增 dmg + zip（x64 / arm64 双架构，未签名——首启需右键打开放行）；发布流程升级为 Windows/macOS 双 CI，推 tag 自动出双平台产物
+- **服务卡片一键访问**：端口条目支持直接在系统浏览器打开对应 web 应用（openUrl 仅限本机 http/https）
+- 应用图标更新
+
+### 修复
+
+- **平台口径纠偏**：`~/.local/share/opencode/opencode.db` 的实际写入者按本机特征自动探测（存在 OpenChamber 配置目录则显示「OpenChamber」，否则「OpenCode」），其他机器各自准确；OMP 不再误标为 "OMP (OpenChamber)"——它是与 OpenChamber 无关的独立客户端
+- **重新扫描双计 bug**：rescan 先清空用量表再全量重建（旧逻辑重置游标后纯 INSERT 叠加，会把 jsonl 类数据翻倍）；历史点过「重新扫描」造成的翻倍数据、以及 Claude 历史缓存字段全 0 的脏数据，升级后点一次「重新扫描」即自动修复
+
 ## v0.2.3 (2026-08-27) — 启动台外部接管 + 订阅卡片重构 + 网页端控制修复
 
 ### 修复

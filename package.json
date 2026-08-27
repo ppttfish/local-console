@@ -1,7 +1,7 @@
 {
   "name": "local-console",
   "productName": "本地总台",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "本地服务与批处理任务的统一管理面板；MCP-first，agent 原生可调用。订阅监控：AI 服务商配额一屏掌控。",
   "main": "out/main/index.js",
   "type": "module",
@@ -53,6 +53,7 @@
     "@modelcontextprotocol/sdk": "^1.0.4",
     "better-sqlite3": "^11.1.2",
     "chart.js": "^4.5.1",
+    "fzstd": "^0.1.1",
     "pinia": "^2.2.0",
     "vue": "^3.4.38",
     "vue-chartjs": "^5.3.4",
@@ -76,6 +77,10 @@
       {
         "from": "out/renderer",
         "to": "renderer"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
       }
     ],
     "win": {
@@ -97,6 +102,21 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "artifactName": "local-console-${version}-setup.${ext}"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64", "arm64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["x64", "arm64"]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "artifactName": "local-console-${version}-${arch}.${ext}",
+      "identity": null
     },
     "asar": true,
     "compression": "maximum",

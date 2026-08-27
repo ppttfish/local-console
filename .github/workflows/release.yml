@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build & Release
+    name: Build & Release (Windows)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -53,4 +53,47 @@ jobs:
             dist/*.blockmap
           fail_on_unmatched_files: false
           generate_release_notes: true
+          draft: false
+
+  release-mac:
+    name: Build & Release (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+        continue-on-error: true
+
+      - name: Build (electron-vite)
+        run: npm run build
+
+      # identity 为 null（package.json build.mac），跳过 Apple 签名出未签名包；
+      # zip + latest-mac.yml 是 electron-updater 在 darwin 上自动更新的配套产物。
+      # better-sqlite3 由 electron-builder 在 runner 上按 darwin 自动重编，无需额外步骤
+      - name: Dist (dmg + zip)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --mac --publish always
+
+      - name: Upload artifacts (fallback)
+        if: always()
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/latest-mac.yml
+            dist/*.dmg
+            dist/*.zip
+            dist/*.blockmap
+          fail_on_unmatched_files: false
           draft: false
