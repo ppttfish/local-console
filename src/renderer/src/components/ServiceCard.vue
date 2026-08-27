@@ -385,8 +385,9 @@ const statusDotClass = computed(() => {
       端口由外部进程占用（非本台启动）。「重启接管」会结束它并用上面的命令拉起。
     </Motion>
 
-    <!-- Sparkline -->
+    <!-- Sparkline（仅运行中/外部接管时显示，停止态画零值平线像 bug） -->
     <Sparkline
+      v-if="service.status === 'running' || isExternalRunning"
       :data="store.cpuHistory"
       :tone="sparklineTone"
       :height="36"
