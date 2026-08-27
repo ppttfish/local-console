@@ -31,6 +31,7 @@ import {
 import { SubscriptionRefresher } from '../plugins/builtin/token-usage/refresh.js'
 import { listProviderMetas } from '../plugins/builtin/token-usage/providers/index.js'
 import { discoverOpencodeCredentials } from '../plugins/builtin/token-usage/opencode-auth.js'
+import { openLocalUrl } from '../utils/open-external.js'
 import type { AppState, PortSnapshot, ServiceState } from '@shared/types'
 let usageScanner: UsageScanner | null = null
 const subRefresher = new SubscriptionRefresher()
@@ -128,6 +129,9 @@ export function registerIpcHandlers(
     void shell.openPath(getLogDir())
     return { ok: true }
   })
+  ipcMain.handle(IpcChannels.AppOpenUrl, (_e, url: string) =>
+    openLocalUrl(url)
+  )
   ipcMain.handle(IpcChannels.AppOpenDataDir, () => {
     void shell.openPath(app.getPath('userData'))
     return { ok: true }

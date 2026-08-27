@@ -52,6 +52,8 @@ export function installWebBridge(): void {
     scanPorts: () => post('/api/port/scan'),
     getAppInfo: () => post('/api/app/info'),
     openLogDir: () => post('/api/app/open-log-dir'),
+    // web 模式直接开新窗口，不必经服务端
+    openUrl: (url) => { window.open(url, '_blank'); return Promise.resolve({ ok: true }) },
     openDataDir: () => post('/api/app/open-data-dir'),
     quit: () => post('/api/app/quit'),
     usageSummary: (filter) => post('/api/usage/summary', filter),

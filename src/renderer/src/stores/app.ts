@@ -96,6 +96,16 @@ export const useAppStore = defineStore('app', () => {
     reportResult(r)
     return r
   }
+  /** 在系统浏览器打开该服务的本机端口地址（web 应用一键访问） */
+  async function openServiceInBrowser(svc: ServiceState): Promise<unknown> {
+    if (!svc.port) {
+      notify('error', '该条目未配置端口，无法打开')
+      return { ok: false, error: '该条目未配置端口' }
+    }
+    const r = await window.lcp.openUrl(`http://127.0.0.1:${svc.port}`)
+    reportResult(r)
+    return r
+  }
   async function stopExternalService(id: string): Promise<unknown> {
     const r = await window.lcp.stopExternalService(id)
     reportResult(r)
@@ -175,6 +185,7 @@ export const useAppStore = defineStore('app', () => {
     restartService,
     stopExternalService,
     restartExternalService,
+    openServiceInBrowser,
     createService,
     updateService,
     deleteService,

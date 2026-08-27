@@ -35,6 +35,7 @@ import { SubscriptionRefresher } from './plugins/builtin/token-usage/refresh.js'
 import { listProviderMetas } from './plugins/builtin/token-usage/providers/index.js'
 import { discoverOpencodeCredentials } from './plugins/builtin/token-usage/opencode-auth.js'
 import { getDataDir, getLogDir } from './utils/paths.js'
+import { openLocalUrl } from './utils/open-external.js'
 import { app } from 'electron'
 import { homedir } from 'node:os'
 
@@ -177,6 +178,10 @@ async function handleApi(
     const body = await readJsonBody(req)
     const r = runtime
 
+    if (pathname === '/api/app/open-url' && req.method === 'POST') {
+      const { url } = body as { url: string }
+      return json(res, 200, await openLocalUrl(url))
+    }
     if (pathname === '/api/app/info' && req.method === 'GET') {
       return json(res, 200, {
         name: app.getName(),

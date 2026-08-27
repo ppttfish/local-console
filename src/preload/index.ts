@@ -34,6 +34,7 @@ const api = {
   // 系统
   getAppInfo: () => invoke(IpcChannels.AppGetInfo),
   openLogDir: () => invoke(IpcChannels.AppOpenLogDir),
+  openUrl: (url: string) => invoke(IpcChannels.AppOpenUrl, url),
   openDataDir: () => invoke(IpcChannels.AppOpenDataDir),
   quit: () => invoke(IpcChannels.AppQuit),
 

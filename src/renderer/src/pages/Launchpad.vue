@@ -48,6 +48,7 @@ function onAdded() {
         @restart="store.restartService(svc.id)"
         @stop-external="store.stopExternalService(svc.id)"
         @restart-external="store.restartExternalService(svc.id)"
+        @open="store.openServiceInBrowser(svc)"
         @edit="editingSvc = svc"
         @delete="store.deleteService(svc.id)"
       />

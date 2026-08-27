@@ -26,6 +26,7 @@ export interface LcpApi {
   scanPorts: () => Promise<unknown>
   getAppInfo: () => Promise<unknown>
   openLogDir: () => Promise<unknown>
+  openUrl: (url: string) => Promise<unknown>
   openDataDir: () => Promise<unknown>
   quit: () => Promise<unknown>
   usageSummary: (filter: unknown) => Promise<unknown>

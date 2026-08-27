@@ -31,6 +31,7 @@ export const IpcChannels = {
   // 系统
   AppQuit: 'app:quit',
   AppOpenLogDir: 'app:openLogDir',
+  AppOpenUrl: 'app:openUrl',
   AppOpenDataDir: 'app:openDataDir',
   AppGetInfo: 'app:getInfo',
 
