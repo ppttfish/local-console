@@ -93,6 +93,11 @@
     "portable": {
       "artifactName": "local-console-${version}-portable.${ext}"
     },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "local-console-${version}-setup.${ext}"
+    },
     "asar": true,
     "compression": "maximum",
     "publish": {
