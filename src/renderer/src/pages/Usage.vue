@@ -110,28 +110,20 @@ const agent = ref<'all' | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude'>(
   'all'
 )
 const model = ref<string>('')
+const models = ref<string[]>([])
 const granularity = ref<Granularity>('hour')
 const presetRange = ref<PresetRange>('today')
 
 const summary = ref<Summary | null>(null)
 const timeline = ref<TimelinePoint[]>([])
 const sessions = ref<Session[]>([])
-const models = ref<string[]>([])
 const status = ref<Status | null>(null)
 const loading = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
-const tab = ref<'usage' | 'subscriptions'>('usage')
-const subs = ref<Sub[]>([])
-const providerMetas = ref<ProviderMeta[]>([])
-const dialogOpen = ref(false)
-const editingSub = ref<Sub | null>(null)
-const refreshingIds = ref<Set<number>>(new Set())
-
 function providerMetaOf(id: string): ProviderMeta | undefined {
   return providerMetas.value.find((p) => p.id === id)
 }
-
 function subStatus(s: Sub): 'active' | 'stale' | 'error' {
   if (s.lastError) return 'error'
   if (!s.lastRefreshAt) return 'stale'
@@ -170,6 +162,14 @@ function primaryResetAt(s: Sub): number | null {
   const firstWithReset = (snap.windows ?? []).find((w) => w.resetAt)
   return firstWithReset?.resetAt ?? null
 }
+
+const tab = ref<'usage' | 'subscriptions'>('usage')
+const subs = ref<Sub[]>([])
+const providerMetas = ref<ProviderMeta[]>([])
+const dialogOpen = ref(false)
+const editingSub = ref<Sub | null>(null)
+const refreshingIds = ref<Set<number>>(new Set())
+const confirmDelete = ref<Sub | null>(null)
 
 /** 已用/总量文案（仅单窗模型有） */
 function usedLabel(s: Sub): string | null {
@@ -219,8 +219,15 @@ async function onSubSaved() {
   await refreshSubs()
 }
 
-async function removeSub(s: Sub) {
-  await window.lcp.subDelete(s.id)
+function askDelete(s: Sub) {
+  confirmDelete.value = s
+}
+
+async function confirmDeleteNow() {
+  if (!confirmDelete.value) return
+  const id = confirmDelete.value.id
+  confirmDelete.value = null
+  await window.lcp.subDelete(id)
   await refreshSubs()
 }
 
@@ -588,14 +595,22 @@ const granularityLabel = computed(() =>
               </span>
             </div>
             <div class="sub-actions">
-              <button title="立即刷新" @click="refreshOneSub(s)">
+              <button
+                class="act"
+                :disabled="refreshingIds.has(s.id)"
+                :title="refreshingIds.has(s.id) ? '刷新中…' : '立即刷新'"
+                @click="refreshOneSub(s)"
+              >
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+                <span>{{ refreshingIds.has(s.id) ? '刷新中' : '刷新' }}</span>
               </button>
-              <button title="编辑" @click="openEditDialog(s)">
+              <button class="act" title="编辑" @click="openEditDialog(s)">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+                <span>编辑</span>
               </button>
-              <button class="danger" title="删除" @click="removeSub(s)">
+              <button class="act danger" title="删除" @click="askDelete(s)">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                <span>删除</span>
               </button>
             </div>
           </div>
@@ -882,6 +897,23 @@ const granularityLabel = computed(() =>
       @close="dialogOpen = false"
       @saved="onSubSaved"
     />
+
+    <!-- 删除确认 -->
+    <div v-if="confirmDelete" class="confirm-overlay" @click.self="confirmDelete = null">
+      <div class="confirm-dialog">
+        <h3>删除订阅？</h3>
+        <p class="muted" style="margin: 0 0 6px">
+          {{ confirmDelete.displayName }}
+        </p>
+        <p class="muted" style="margin: 0; font-size: 12px">
+          删除后不会影响你在 Provider 的登录态，仅清除本机监控记录。
+        </p>
+        <div class="confirm-row">
+          <button @click="confirmDelete = null">取消</button>
+          <button class="danger" @click="confirmDeleteNow">确认删除</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1312,6 +1344,62 @@ code {
     transparent 12px
   );
 }
+.sub-actions .danger:hover {
+  color: var(--danger);
+}
+.sub-actions .act {
+  width: auto;
+  height: 26px;
+  padding: 0 9px;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.sub-actions .act:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.sub-actions .act svg {
+  width: 12px;
+  height: 12px;
+}
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 110;
+}
+.confirm-dialog {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  min-width: 360px;
+  max-width: 460px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+}
+.confirm-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+.confirm-row {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+button.danger {
+  background: var(--danger);
+  color: #fff;
+  border: 1px solid var(--danger);
+}
+button.danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+  background: var(--danger);
+}
 .sub-meta {
   display: flex;
   justify-content: space-between;
@@ -1326,6 +1414,5 @@ code {
   color: var(--danger);
   font-size: 11px;
   border-radius: 4px;
-  word-break: break-all;
 }
 </style>
