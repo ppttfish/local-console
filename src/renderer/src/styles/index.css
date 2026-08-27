@@ -105,6 +105,11 @@ button.primary {
   border-color: var(--accent);
 }
 button.primary:hover:not(:disabled) {
+  /* 通用 hover 会把背景改成浅色 --hover，必须显式压回主色，
+     否则亮色主题下白字配浅灰底不可读 */
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
   filter: brightness(1.1);
 }
 button.danger {
