@@ -1,5 +1,9 @@
 # 本地总台（local-console）
 
+<p align="center">
+  <img src="docs/poster.png" alt="小福鱼工作台" width="480" />
+</p>
+
 一站式管理本机的开发服务、批处理任务、agent token 用量。
 
 桌面端是 **Electron 桌面应用**，同时提供 `http://127.0.0.1:9600` 的 web 镜像——浏览器和桌面窗口**共享同一份数据**。
