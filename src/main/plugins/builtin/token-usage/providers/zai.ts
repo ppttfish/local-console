@@ -83,8 +83,14 @@ const adapter: ProviderAdapter = {
         windows.push({
           label: 'MCP Tools',
           usedPct: typeof mcp.percentage === 'number' ? mcp.percentage : null,
+          // TIME_LIMIT 与上面窗口同源，秒级时间戳同样需要换算成毫秒，
+          // 否则倒计时会按 1970 年计算而出错
           resetAt:
-            typeof mcp.nextResetTime === 'number' ? mcp.nextResetTime : null
+            typeof mcp.nextResetTime === 'number'
+              ? mcp.nextResetTime < 1e12
+                ? mcp.nextResetTime * 1000
+                : mcp.nextResetTime
+              : null
         })
       }
       if (windows.length === 0) {

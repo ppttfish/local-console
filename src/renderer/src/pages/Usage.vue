@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import AddSubscriptionDialog from '../components/AddSubscriptionDialog.vue'
 import type {
   QuotaSnapshot,
+  QuotaWindow,
   Sub,
   ConfigField,
   ProviderMeta
@@ -130,6 +131,16 @@ function subStatus(s: Sub): 'active' | 'stale' | 'error' {
   return Date.now() - s.lastRefreshAt <= 10 * 60 * 1000 ? 'active' : 'stale'
 }
 
+/** 状态文案明确指向"数据同步"，与配额余量区分开 */
+const SUB_STATUS_TEXT: Record<'active' | 'stale' | 'error', string> = {
+  active: '同步正常',
+  stale: '未更新',
+  error: '获取失败'
+}
+function subStatusText(s: Sub): string {
+  return SUB_STATUS_TEXT[subStatus(s)]
+}
+
 function quotaTone(pct: number | null | undefined): 'ok' | 'warn' | 'danger' {
   const p = pct ?? 0
   if (p >= 90) return 'danger'
@@ -137,30 +148,38 @@ function quotaTone(pct: number | null | undefined): 'ok' | 'warn' | 'danger' {
   return 'ok'
 }
 
-/** 卡片主进度：单窗用 usedPct；多窗取最紧急（最大）的非空窗口 */
+/**
+ * 主展示窗口：用量最高的非空窗口。
+ * 大百分比与重置倒计时都以它为口径；明细列表里用「最高」标签标出，
+ * 避免用户看不出右上角百分比指的是哪个窗口。
+ */
+function primaryWindow(s: Sub): QuotaWindow | null {
+  let best: QuotaWindow | null = null
+  for (const w of s.lastSnapshot?.windows ?? []) {
+    if (typeof w.usedPct !== 'number') continue
+    if (!best || (w.usedPct as number) > (best.usedPct as number)) best = w
+  }
+  return best
+}
+
+/** 卡片主百分比：多窗取主窗口；无窗口（generic 等）退回整体 usedPct */
 function primaryPct(s: Sub): number | null {
   const snap = s.lastSnapshot
   if (!snap) return null
-  const fromWindows = (snap.windows ?? [])
-    .map((w) => w.usedPct)
-    .filter((v): v is number => typeof v === 'number')
-  if (fromWindows.length > 0) {
-    // 有 error 态的窗口（如超限）优先显示
-    return Math.max(...fromWindows)
-  }
+  const pw = primaryWindow(s)
+  if (pw) return pw.usedPct
   return typeof snap.usedPct === 'number' ? snap.usedPct : null
 }
 
-/** 主进度对应的重置时间 */
+/** 主百分比对应的重置时间：主窗口 → 整体 windowEnd → 任一有值的窗口 */
 function primaryResetAt(s: Sub): number | null {
   const snap = s.lastSnapshot
   if (!snap) return null
-  const pct = primaryPct(s)
-  const hit = (snap.windows ?? []).find((w) => w.usedPct === pct)
-  if (hit?.resetAt) return hit.resetAt
+  const pw = primaryWindow(s)
+  if (pw?.resetAt) return pw.resetAt
   if (snap.windowEnd) return snap.windowEnd
-  const firstWithReset = (snap.windows ?? []).find((w) => w.resetAt)
-  return firstWithReset?.resetAt ?? null
+  const anyWithReset = (snap.windows ?? []).find((w) => w.resetAt)
+  return anyWithReset?.resetAt ?? null
 }
 
 const tab = ref<'usage' | 'subscriptions'>('usage')
@@ -171,24 +190,64 @@ const editingSub = ref<Sub | null>(null)
 const refreshingIds = ref<Set<number>>(new Set())
 const confirmDelete = ref<Sub | null>(null)
 
-/** 已用/总量文案（仅单窗模型有） */
-function usedLabel(s: Sub): string | null {
+/** 配额区块是否有可展示的数据（多窗、单窗或整体百分比均可） */
+function hasQuotaData(s: Sub): boolean {
   const snap = s.lastSnapshot
-  if (!snap || typeof snap.used !== 'number') return null
-  const lim = typeof snap.limit === 'number' ? snap.limit : null
-  return lim ? `${fmtToken(snap.used)} / ${fmtToken(lim)}` : fmtToken(snap.used)
+  if (!snap) return false
+  return (snap.windows?.length ?? 0) > 0 || typeof snap.usedPct === 'number'
 }
 
-/** 剩余时间 → "2h 15m 后" / "3 天后" */
-function fmtCountdown(ts: number): string {
+/** 主区块标题：说明大百分比的口径，避免"不知道 97% 指什么" */
+function primaryTitle(s: Sub): string {
+  const wins = s.lastSnapshot?.windows ?? []
+  if (wins.length === 0) return '总体额度'
+  if (wins.length === 1) return `${wins[0].label} 窗口`
+  const pw = primaryWindow(s)
+  return pw ? `${pw.label} 窗口 · 用量最高` : '各窗口用量'
+}
+
+function pctText(p: number | null): string {
+  return p === null ? '—' : p.toFixed(1) + '%'
+}
+
+/** 进度条宽度；小占比给最小可见宽度，避免只剩一个看不见的点 */
+function barWidth(pct: number | null | undefined, minPx = 0): string {
+  if (typeof pct !== 'number' || pct <= 0) return '0%'
+  return Math.min(100, Math.max(minPx, pct)) + '%'
+}
+
+/** 主区块副行左侧：优先"已用/总量"，其次套餐名（多窗模型） */
+function quotaSublineLeft(s: Sub): string | null {
+  const snap = s.lastSnapshot
+  if (!snap) return null
+  if (typeof snap.used === 'number') {
+    const lim = typeof snap.limit === 'number' ? snap.limit : null
+    return lim
+      ? `已用 ${fmtToken(snap.used)} / ${fmtToken(lim)}`
+      : `已用 ${fmtToken(snap.used)}`
+  }
+  if (snap.planLabel) return `套餐 ${snap.planLabel}`
+  return null
+}
+
+/** 紧凑时长：2小时28分 / 45分钟 / 3天8小时 */
+function fmtDur(ms: number): string {
+  const totalMin = Math.floor(Math.abs(ms) / 60000)
+  const d = Math.floor(totalMin / 1440)
+  const h = Math.floor((totalMin % 1440) / 60)
+  const m = totalMin % 60
+  if (d > 0) return h > 0 ? `${d}天${h}小时` : `${d}天`
+  if (h > 0) return m > 0 ? `${h}小时${m}分` : `${h}小时`
+  return `${Math.max(1, m)}分钟`
+}
+
+/** 重置倒计时：统一带"后重置"，已过期显示"即将重置"（等下次刷新纠正） */
+function fmtResetIn(ts: number | null | undefined): string {
+  if (!ts) return ''
   const diff = ts - Date.now()
-  if (!Number.isFinite(diff)) return '—'
-  if (diff <= 0) return '已过期'
-  const m = Math.floor(diff / 60000)
-  if (m < 60) return `${m} 分钟后`
-  const h = Math.floor(m / 60)
-  if (h < 48) return `${h} 小时 ${m % 60} 分后`
-  return `${Math.floor(h / 24)} 天后`
+  if (!Number.isFinite(diff)) return ''
+  if (diff <= 0) return '即将重置'
+  return `${fmtDur(diff)}后重置`
 }
 
 async function refreshSubs() {
@@ -232,6 +291,7 @@ async function confirmDeleteNow() {
 }
 
 async function refreshOneSub(s: Sub) {
+  if (!s.enabled) return
   refreshingIds.value.add(s.id)
   try {
     await window.lcp.subRefresh(s.id)
@@ -583,25 +643,40 @@ const granularityLabel = computed(() =>
 
       <div v-else class="sub-grid">
         <div v-for="s in subs" :key="s.id" class="sub-card">
+          <!-- 头部：logo + 名称/状态 + 轻量操作 -->
           <div class="sub-head">
-            <div class="sub-name">
-              <span
-                class="sub-logo"
-                :style="{ background: providerMetaOf(s.provider)?.color || '#64748b' }"
-              >{{ providerMetaOf(s.provider)?.short || '?' }}</span>
-              <span>
-                {{ s.displayName }}
-                <small class="muted">{{ providerMetaOf(s.provider)?.label || s.provider }}</small>
-              </span>
+            <span
+              class="sub-logo"
+              :style="{ background: providerMetaOf(s.provider)?.color || '#64748b' }"
+            >{{ providerMetaOf(s.provider)?.short || '?' }}</span>
+            <div class="sub-title">
+              <div class="sub-name" :title="s.displayName">{{ s.displayName }}</div>
+              <div class="sub-subtitle">
+                <span
+                  class="status-dot"
+                  :class="[subStatus(s), { refreshing: refreshingIds.has(s.id) }]"
+                />
+                <span>{{ refreshingIds.has(s.id) ? '刷新中…' : subStatusText(s) }}</span>
+                <template v-if="providerMetaOf(s.provider)">
+                  <span>·</span>
+                  <span
+                    class="provider-label"
+                    :title="providerMetaOf(s.provider)?.label"
+                  >{{ providerMetaOf(s.provider)?.label }}</span>
+                </template>
+              </div>
             </div>
             <div class="sub-actions">
               <button
                 class="act"
                 :disabled="refreshingIds.has(s.id)"
-                :title="refreshingIds.has(s.id) ? '刷新中…' : '立即刷新'"
+                title="立即刷新"
                 @click="refreshOneSub(s)"
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+                <svg
+                  :class="{ spinning: refreshingIds.has(s.id) }"
+                  width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"
+                ><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
                 <span>{{ refreshingIds.has(s.id) ? '刷新中' : '刷新' }}</span>
               </button>
               <button class="act" title="编辑" @click="openEditDialog(s)">
@@ -615,77 +690,79 @@ const granularityLabel = computed(() =>
             </div>
           </div>
 
-          <div class="sub-status-row">
-            <span class="sub-status-tag" :class="subStatus(s)">
-              {{ subStatus(s) === 'active' ? '正常' : subStatus(s) === 'stale' ? '未同步' : '异常' }}
-            </span>
-            <span
-              v-if="refreshingIds.has(s.id)"
-              class="muted"
-              style="font-size: 11px"
-            >刷新中…</span>
-          </div>
-
-          <template v-if="s.lastSnapshot && (primaryPct(s) !== null || (s.lastSnapshot.windows?.length ?? 0) > 0)">
-            <div class="sub-numbers">
-              <div class="sub-used">
-                <template v-if="usedLabel(s)">已用 <strong>{{ usedLabel(s)?.split(' / ')[0] }}</strong> / {{ usedLabel(s)?.split(' / ')[1] }}</template>
-                <template v-else-if="s.lastSnapshot.planLabel">套餐 {{ s.lastSnapshot.planLabel }}</template>
-                <template v-else>配额</template>
+          <template v-if="s.lastSnapshot && hasQuotaData(s)">
+            <!-- 主配额：明确口径（哪个窗口）+ 重置时间 -->
+            <div class="quota-main">
+              <div class="quota-top-row">
+                <span class="quota-title">{{ primaryTitle(s) }}</span>
+                <span v-if="primaryResetAt(s)" class="quota-reset">{{ fmtResetIn(primaryResetAt(s)) }}</span>
               </div>
               <div class="big-pct" :class="quotaTone(primaryPct(s))">
-                {{ primaryPct(s) === null ? '—' : primaryPct(s)!.toFixed(1) + '%' }}
+                {{ pctText(primaryPct(s)) }}
+              </div>
+              <div class="quota-bar">
+                <div
+                  class="quota-fill"
+                  :class="quotaTone(primaryPct(s))"
+                  :style="{ width: barWidth(primaryPct(s)) }"
+                />
+              </div>
+              <div
+                v-if="quotaSublineLeft(s) || typeof s.lastSnapshot.remaining === 'number'"
+                class="quota-subline"
+              >
+                <span>{{ quotaSublineLeft(s) ?? '' }}</span>
+                <span
+                  v-if="typeof s.lastSnapshot.remaining === 'number'"
+                  class="quota-remaining"
+                >剩余 {{ fmtToken(s.lastSnapshot.remaining) }}</span>
               </div>
             </div>
 
-            <!-- 主进度条：最紧急窗口 -->
-            <div class="quota-bar">
+            <!-- 多窗口明细（单窗已在主区展示，不再重复） -->
+            <div v-if="(s.lastSnapshot.windows?.length ?? 0) >= 2" class="win-list">
+              <div class="win-caption">各窗口明细</div>
               <div
-                class="quota-fill"
-                :class="quotaTone(primaryPct(s))"
-                :style="{ width: Math.min(100, primaryPct(s) ?? 0) + '%' }"
-              />
-            </div>
-
-            <!-- 多窗明细 -->
-            <div
-              v-for="w in s.lastSnapshot.windows ?? []"
-              :key="w.label"
-              class="win-row"
-            >
-              <span class="win-label">{{ w.label }}</span>
-              <span class="win-bar">
-                <span
-                  class="win-fill"
-                  :class="quotaTone(w.usedPct)"
-                  :style="{ width: Math.min(100, w.usedPct ?? 0) + '%' }"
-                />
-              </span>
-              <span class="win-pct" :class="quotaTone(w.usedPct)">
-                {{ w.usedPct === null ? '—' : Math.round(w.usedPct) + '%' }}
-              </span>
-              <span class="win-reset">{{ w.resetAt ? fmtCountdown(w.resetAt) : '' }}</span>
-            </div>
-
-            <div class="sub-meta">
-              <span v-if="typeof s.lastSnapshot.remaining === 'number'">
-                剩余 {{ fmtToken(s.lastSnapshot.remaining) }}
-              </span>
-              <span v-else-if="primaryResetAt(s)">
-                最近重置 {{ fmtCountdown(primaryResetAt(s)!) }}
-              </span>
-              <span v-else></span>
+                v-for="w in s.lastSnapshot.windows"
+                :key="w.label"
+                class="win-row"
+                :class="{ 'is-primary': w === primaryWindow(s) }"
+              >
+                <span class="win-label">
+                  {{ w.label }}
+                  <span v-if="w === primaryWindow(s)" class="win-max">最高</span>
+                </span>
+                <span class="win-bar">
+                  <span
+                    class="win-fill"
+                    :class="quotaTone(w.usedPct)"
+                    :style="{ width: barWidth(w.usedPct, 3) }"
+                  />
+                </span>
+                <span class="win-pct" :class="quotaTone(w.usedPct)">
+                  {{ w.usedPct === null ? '—' : Math.round(w.usedPct) + '%' }}
+                </span>
+                <span class="win-reset">{{ fmtResetIn(w.resetAt) }}</span>
+              </div>
             </div>
           </template>
 
-          <div v-else class="quota-bar" style="margin-top: 8px">
-            <div class="quota-fill unknown" />
+          <div v-else class="quota-main">
+            <div class="quota-top-row">
+              <span class="quota-title">配额状态未知</span>
+            </div>
+            <div class="big-pct unknown">—</div>
+            <div class="quota-bar">
+              <div class="quota-fill unknown" />
+            </div>
+            <div class="quota-subline">暂无数据 · 点击「刷新」按钮立即获取</div>
           </div>
 
           <div v-if="s.lastError" class="sub-error">{{ s.lastError }}</div>
-          <div class="sub-meta" style="margin-top: 8px">
+
+          <div class="sub-foot">
             <span>上次刷新 {{ s.lastRefreshAt ? relativeTime(s.lastRefreshAt) : '从未' }}</span>
-            <span v-if="!s.enabled" class="warn">已停用</span>
+            <span v-if="!s.enabled" class="off">已停用</span>
           </div>
         </div>
       </div>
@@ -1131,242 +1208,129 @@ code {
   font-size: 10px;
   text-align: center;
 }
+/* ===== 订阅卡片 ===== */
 .sub-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 14px;
 }
 .sub-card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px;
-  position: relative;
+  border-radius: 12px;
+  padding: 16px;
   box-shadow: var(--shadow);
   transition:
     transform 0.15s,
     box-shadow 0.15s;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .sub-card:hover {
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
 }
+
+/* —— 头部 —— */
 .sub-head {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-.sub-name {
-  display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 14px;
-  font-weight: 600;
-}
-.sub-name small {
-  display: block;
-  font-size: 11px;
-  font-weight: 400;
+  gap: 10px;
 }
 .sub-logo {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
   color: #fff;
   flex-shrink: 0;
 }
-.sub-status-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-.sub-status-tag {
-  font-size: 10.5px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  font-weight: 500;
-}
-.sub-status-tag.active {
-  background: rgba(16, 185, 129, 0.12);
-  color: var(--success);
-}
-.sub-status-tag.stale {
-  background: rgba(245, 158, 11, 0.12);
-  color: var(--warn);
-}
-.sub-status-tag.error {
-  background: rgba(239, 68, 68, 0.12);
-  color: var(--danger);
-}
-.sub-numbers {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  margin: 6px 0 8px;
-}
-.sub-used {
-  font-size: 12px;
-  color: var(--muted);
-}
-.sub-used strong {
-  color: var(--text);
-  font-size: 14px;
-  font-variant-numeric: tabular-nums;
-}
-.big-pct {
-  font-size: 22px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.5px;
-}
-.big-pct.ok,
-.quota-fill.ok {
-  color: var(--success);
-}
-.big-pct.warn,
-.quota-fill.warn {
-  color: var(--warn);
-}
-.big-pct.danger,
-.quota-fill.danger {
-  color: var(--danger);
-}
-.quota-bar {
-  height: 8px;
-  background: var(--bg-soft);
-  border-radius: 4px;
-  overflow: hidden;
-  position: relative;
-}
-.quota-fill {
-  height: 100%;
-  border-radius: 4px;
-  transition: width 0.3s;
-}
-.quota-fill.ok {
-  background: linear-gradient(90deg, var(--success), #34d399);
-}
-.quota-fill.warn {
-  background: linear-gradient(90deg, var(--warn), #fbbf24);
-}
-.win-row {
-  display: grid;
-  grid-template-columns: 84px 1fr 42px auto;
-  align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-  font-size: 11px;
-}
-.win-label {
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.win-bar {
-  display: block;
-  height: 5px;
-  background: var(--bg-soft);
-  border-radius: 3px;
-  overflow: hidden;
-}
-.win-fill {
-  display: block;
-  height: 100%;
-  border-radius: 3px;
-}
-.win-fill.ok {
-  background: var(--success);
-}
-.sub-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.sub-name {
+.sub-title {
   flex: 1 1 auto;
   min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
+}
+.sub-name {
+  font-size: 13.5px;
   font-weight: 600;
-}
-.sub-name > span:last-child {
-  min-width: 0;
-  overflow: hidden;
-}
-.sub-name small {
-  display: block;
-  font-size: 11px;
-  font-weight: 400;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.sub-subtitle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 0;
+}
+/* 状态短语不折行；宽度不够时只让 Provider 名截断 */
+.sub-subtitle > span {
+  white-space: nowrap;
+}
+.sub-subtitle .provider-label {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.active {
+  background: var(--success);
+}
+.status-dot.stale {
+  background: var(--warn);
+}
+.status-dot.error {
+  background: var(--danger);
+}
+.status-dot.refreshing {
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+@keyframes dot-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* —— 操作按钮：统一幽灵风格，删除仅在悬停时变红 —— */
 .sub-actions {
   display: flex;
   flex: 0 0 auto;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 4px;
-  max-width: 100%;
+  gap: 2px;
 }
-.sub-actions button {
+.sub-actions .act {
   background: transparent;
-  border: 1px solid transparent;
+  border-color: transparent;
   color: var(--muted);
-  height: 24px;
+  height: 26px;
   padding: 0 8px;
-  border-radius: 5px;
+  border-radius: 6px;
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  cursor: pointer;
-  font-size: 11.5px;
-  white-space: nowrap;
-}
-.win-pct.warn {
-  color: var(--warn);
-}
-.win-pct.danger {
-  color: var(--danger);
-}
-.win-reset {
-  color: var(--muted);
-  font-size: 10.5px;
-  min-width: 64px;
-  text-align: right;
-}
-.quota-fill.unknown {
-  width: 100%;
-  background: repeating-linear-gradient(
-    45deg,
-    var(--accent-soft),
-    var(--accent-soft) 6px,
-    transparent 6px,
-    transparent 12px
-  );
-}
-.sub-actions .danger:hover {
-  color: var(--danger);
-}
-.sub-actions .act {
-  width: auto;
-  height: 26px;
-  padding: 0 9px;
-  gap: 4px;
   font-size: 11.5px;
   font-weight: 500;
+  white-space: nowrap;
+}
+.sub-actions .act:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: transparent;
+  color: var(--text);
+}
+.sub-actions .act.danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--danger);
 }
 .sub-actions .act:disabled {
   opacity: 0.55;
@@ -1375,6 +1339,204 @@ code {
 .sub-actions .act svg {
   width: 12px;
   height: 12px;
+}
+.sub-actions .act svg.spinning {
+  animation: act-spin 0.9s linear infinite;
+}
+@keyframes act-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* —— 主配额区 —— */
+.quota-top-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.quota-title {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.quota-reset {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.big-pct {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.2;
+  margin: 2px 0 8px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.5px;
+}
+.big-pct.ok {
+  color: var(--success);
+}
+.big-pct.warn {
+  color: var(--warn);
+}
+.big-pct.danger {
+  color: var(--danger);
+}
+.big-pct.unknown {
+  color: var(--muted);
+  opacity: 0.5;
+}
+.quota-bar {
+  height: 9px;
+  background: var(--panel);
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: hidden;
+}
+.quota-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s;
+}
+.quota-fill.ok {
+  background: linear-gradient(90deg, var(--success), #34d399);
+}
+.quota-fill.warn {
+  background: linear-gradient(90deg, var(--warn), #fbbf24);
+}
+.quota-fill.danger {
+  background: linear-gradient(90deg, var(--danger), #f87171);
+}
+.quota-fill.unknown {
+  width: 100%;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--border),
+    var(--border) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+}
+.quota-subline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.quota-remaining {
+  color: var(--success);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* —— 多窗口明细：轨道必须可见，主窗口行有「最高」标记 —— */
+.win-list {
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.win-caption {
+  font-size: 10.5px;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+}
+.win-row {
+  display: grid;
+  grid-template-columns: minmax(64px, auto) 1fr 44px auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+}
+.win-label {
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.win-row.is-primary .win-label {
+  color: var(--text);
+  font-weight: 600;
+}
+.win-max {
+  font-size: 9.5px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.win-bar {
+  display: block;
+  height: 6px;
+  background: var(--panel);
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: hidden;
+}
+.win-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s;
+}
+.win-fill.ok {
+  background: var(--success);
+}
+.win-fill.warn {
+  background: var(--warn);
+}
+.win-fill.danger {
+  background: var(--danger);
+}
+.win-pct {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--muted);
+}
+.win-pct.ok {
+  color: var(--success);
+}
+.win-pct.warn {
+  color: var(--warn);
+}
+.win-pct.danger {
+  color: var(--danger);
+}
+.win-reset {
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* —— 底部信息：贴底对齐，多卡片高度不一时仍整齐 —— */
+.sub-foot {
+  margin-top: auto;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.sub-foot .off {
+  color: var(--warn);
+  flex-shrink: 0;
 }
 .confirm-overlay {
   position: fixed;
@@ -1413,19 +1575,11 @@ button.danger:hover:not(:disabled) {
   filter: brightness(1.08);
   background: var(--danger);
 }
-.sub-meta {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 10px;
-  font-size: 11px;
-  color: var(--muted);
-}
 .sub-error {
-  margin-top: 6px;
-  padding: 6px 8px;
+  padding: 7px 9px;
   background: rgba(239, 68, 68, 0.08);
   color: var(--danger);
-  font-size: 11px;
-  border-radius: 4px;
+  font-size: 11.5px;
+  border-radius: 6px;
 }
 </style>
