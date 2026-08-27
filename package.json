@@ -1,8 +1,8 @@
 {
   "name": "local-console",
   "productName": "本地总台",
-  "version": "0.2.1",
-  "description": "本地服务与批处理任务的统一管理面板；MCP-first，agent 原生可调用。",
+  "version": "0.2.2",
+  "description": "本地服务与批处理任务的统一管理面板；MCP-first，agent 原生可调用。订阅监控：AI 服务商配额一屏掌控。",
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
