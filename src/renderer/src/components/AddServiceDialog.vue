@@ -83,9 +83,18 @@ function applyCandidate(c: ProjectCandidate) {
 }
 
 async function save() {
-  if (!name.value || !cwd.value || !command.value) {
-    error.value = '名称、工作区、命令均为必填'
+  if (!name.value || !command.value) {
+    error.value = '名称、命令均为必填'
     return
+  }
+  // 全局命令（如 dsh web）不依赖项目目录：留空时落到用户主目录
+  if (!cwd.value.trim()) {
+    const home = store.appInfo?.homeDir
+    if (!home) {
+      error.value = '请填写工作区文件夹（暂无法获取默认目录）'
+      return
+    }
+    cwd.value = home
   }
   saving.value = true
   error.value = ''
@@ -140,9 +149,12 @@ async function save() {
         </label>
 
         <label>
-          工作区文件夹 *
+          工作区文件夹
           <div class="row">
-            <input v-model="cwd" placeholder="F:\opc\opc-dashboard" />
+            <input
+              v-model="cwd"
+              placeholder="项目目录；全局命令（如 dsh web）可留空，默认用户主目录"
+            />
             <button @click="pickFolder">浏览…</button>
             <button @click="detect" :disabled="!cwd">识别</button>
           </div>

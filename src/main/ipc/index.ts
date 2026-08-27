@@ -2,6 +2,7 @@
  * IPC handlers 总入口
  */
 import { ipcMain, dialog, shell, type BrowserWindow, app } from 'electron'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getLogDir } from '../utils/paths.js'
 import { IpcChannels } from '../../shared/ipc-channels.js'
@@ -120,7 +121,8 @@ export function registerIpcHandlers(
     name: app.getName(),
     version: app.getVersion(),
     dataDir: app.getPath('userData'),
-    logDir: getLogDir()
+    logDir: getLogDir(),
+    homeDir: homedir()
   }))
   ipcMain.handle(IpcChannels.AppOpenLogDir, () => {
     void shell.openPath(getLogDir())

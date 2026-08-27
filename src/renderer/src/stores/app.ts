@@ -46,6 +46,7 @@ export const useAppStore = defineStore('app', () => {
     version: string
     dataDir: string
     logDir: string
+    homeDir?: string
   } | null>(null)
 
   const runningServices = computed(() =>

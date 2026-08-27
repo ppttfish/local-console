@@ -36,6 +36,7 @@ import { listProviderMetas } from './plugins/builtin/token-usage/providers/index
 import { discoverOpencodeCredentials } from './plugins/builtin/token-usage/opencode-auth.js'
 import { getDataDir, getLogDir } from './utils/paths.js'
 import { app } from 'electron'
+import { homedir } from 'node:os'
 
 interface Runtime {
   svc: ServiceManager
@@ -181,7 +182,8 @@ async function handleApi(
         name: app.getName(),
         version: app.getVersion(),
         dataDir: getDataDir(),
-        logDir: getLogDir()
+        logDir: getLogDir(),
+        homeDir: homedir()
       })
     }
     if (pathname === '/api/state' && req.method === 'GET') {
