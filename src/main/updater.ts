@@ -59,6 +59,25 @@ function escapeHtml(s: string): string {
   )
 }
 
+/** GitHub generate_release_notes 产出的是 HTML，剥成可读纯文本再转义展示 */
+function notesToText(rel: string): string {
+  return rel
+    .replace(
+      /<a\s+[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi,
+      (_m, href: string, text: string) => `${text.replace(/<[^>]+>/g, '')} (${href})`
+    )
+    .replace(/<li>/gi, '• ')
+    .replace(/<\/(?:p|div|li|h\d)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 class Updater {
   private promptWindow: BrowserWindow | null = null
   private downloading = false
@@ -163,8 +182,10 @@ class Updater {
       title: '小福鱼 — 发现新版本',
       autoHideMenuBar: true,
       webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
+        // data:URL 下 preload 不可靠，内联脚本需要 require('electron') 发 IPC，
+        // 只能开 nodeIntegration；HTML 由主进程自建、notes 已转义，无注入面
+        nodeIntegration: true,
+        contextIsolation: false,
         preload: join(__dirname, '../preload/index.cjs')
       }
     })
@@ -180,7 +201,7 @@ class Updater {
     const cur = app.getVersion()
     const rel = info.releaseNotes
       ? typeof info.releaseNotes === 'string'
-        ? info.releaseNotes
+        ? notesToText(info.releaseNotes)
         : info.releaseNotes.map((n) => n.note).join('\n\n')
       : ''
     const safeRel = escapeHtml(rel)
