@@ -31,21 +31,8 @@ onUnmounted(() => {
     <div class="grid h-screen grid-cols-[220px_1fr] overflow-hidden bg-background text-foreground">
       <Sidebar />
       <main class="h-screen overflow-auto">
-        <RouterView v-slot="{ Component, route }">
-          <AnimatePresence mode="wait">
-            <Motion
-              :key="route.fullPath"
-              as="div"
-              :initial="{ opacity: 0, y: 6 }"
-              :animate="{ opacity: 1, y: 0 }"
-              :exit="{ opacity: 0, y: -4 }"
-              :transition="springSnappy"
-              class="min-h-full"
-            >
-              <component :is="Component" />
-            </Motion>
-          </AnimatePresence>
-        </RouterView>
+        <!-- 路由瞬时切换：包裹动画会拖慢切换且 query 变化会触发整页重挂，刻意不加 -->
+        <RouterView />
       </main>
     </div>
 

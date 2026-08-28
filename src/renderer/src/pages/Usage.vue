@@ -797,7 +797,7 @@ function quotaToneToToneClass(
         </TabsTrigger>
       </TabsList>
 
-      <TabsContent value="usage" class="gap-4">
+      <TabsContent value="usage" class="flex flex-col gap-4">
         <!-- 筛选条 -->
         <Card class="p-4">
           <div class="flex flex-wrap items-end gap-x-5 gap-y-3">
@@ -1147,11 +1147,11 @@ function quotaToneToToneClass(
         </Card>
       </TabsContent>
 
-      <TabsContent value="recap" class="gap-4">
+      <TabsContent value="recap" class="flex flex-col gap-4">
         <RecapPanel />
       </TabsContent>
 
-      <TabsContent value="subscriptions" class="gap-4">
+      <TabsContent value="subscriptions" class="flex flex-col gap-4">
         <Card v-if="subs.length === 0" class="p-8 text-center">
           <CardTitle>还没有添加 Provider</CardTitle>
           <CardDescription class="mt-2">
