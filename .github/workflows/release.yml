@@ -34,17 +34,18 @@ jobs:
       - name: Build (electron-vite)
         run: npm run build
 
-      # 只打 portable —— 避开 winCodeSign nsis bug
-      - name: Dist (portable)
+      # nsis 给安装版自动升级（latest.yml 指向 setup.exe）；portable 给绿色版用户。
+      # winCodeSign 符号链接 bug 仅存在于本机非管理员 shell，runner 上一直正常。
+      # 注意：CLI 目标参数会覆盖 package.json 的 win.target，两处需保持一致
+      - name: Dist (nsis + portable)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win portable --x64 --publish always
+        run: npx electron-builder --win nsis portable --x64 --publish always
 
-      # electron-builder 跑 publish always 会自动把 latest.yml + portable.exe 上传到 release
-      # 但只在该 release 已存在时；所以我们用 softprops/action-gh-release 兜底上传
-
+      # electron-builder 跑 publish always 会自动把 latest.yml + 安装包上传到 release
+      # 兜底仅在 tag 构建时有意义（dispatch 触发时 github.ref 是分支，softprops 拿不到 tag）
       - name: Upload artifacts (fallback)
-        if: always()
+        if: always() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -87,7 +88,7 @@ jobs:
         run: npx electron-builder --mac --publish always
 
       - name: Upload artifacts (fallback)
-        if: always()
+        if: always() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
