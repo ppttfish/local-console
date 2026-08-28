@@ -11,7 +11,6 @@ import {
   Sun,
   Moon,
   Monitor,
-  Fish
 } from 'lucide-vue-next'
 import { useAppStore } from '@/stores/app'
 import { useTheme } from '@/composables/useTheme'
@@ -52,10 +51,8 @@ const isActive = (name: string) => route.name === name
   >
     <!-- 品牌 -->
     <div class="flex items-center gap-2.5 px-4 pt-5 pb-2">
-      <div
-        class="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary"
-      >
-        <Fish class="size-5" />
+      <div class="flex size-9 items-center justify-center text-[26px] leading-none">
+        🐟
       </div>
       <div class="leading-tight">
         <div class="text-[15px] font-semibold tracking-tight">小福鱼</div>
