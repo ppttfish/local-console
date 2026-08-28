@@ -8,7 +8,6 @@
  *  - 增强：日志更新时新行轻量高亮（新行不重新播整段，仅末尾追加段）
  */
 import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue'
-import { Motion, AnimatePresence } from 'motion-v'
 import { Trash2, RefreshCw, ArrowDown, ScrollText } from 'lucide-vue-next'
 import { useAppStore } from '@/stores/app'
 import {
@@ -26,7 +25,6 @@ import {
   DialogDescription,
   DialogFooter
 } from '@/components/ui'
-import { springSnappy } from '@/lib/motion'
 import { cn } from '@/lib/utils'
 
 const store = useAppStore()
@@ -53,25 +51,43 @@ onMounted(() => {
   pollTimer = setInterval(refresh, 2000)
 })
 
+// 打开页面时服务列表可能还在异步加载（bootstrap 未完成），
+// 等它到位后自动选中第一个，避免每次都要手动点
+watch(
+  () => store.services.length,
+  (n) => {
+    if (n > 0 && !selectedId.value) selectedId.value = store.services[0]!.id
+  }
+)
+
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
 })
 
 watch(selectedId, () => refresh())
 
+// 请求序号：轮询 / 切服务 / 切行数 / 手动刷新都会并发触发 refresh，
+// 只让最后一次发出的请求写回数据，防止慢响应把旧服务的日志盖到新服务名下
+let reqSeq = 0
 async function refresh() {
+  const seq = ++reqSeq
   if (!selectedId.value) {
     lines.value = []
     lastLineCount = 0
     return
   }
-  const r = (await store.getLogs(selectedId.value, tail.value)) as { text: string }
-  const newLines = r.text ? r.text.split('\n') : []
-  lines.value = newLines
-  lastLineCount = newLines.length
-  if (autoScroll.value) {
-    await nextTick()
-    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+  try {
+    const r = (await store.getLogs(selectedId.value, tail.value)) as { text: string }
+    if (seq !== reqSeq) return
+    const newLines = r.text ? r.text.split('\n') : []
+    lines.value = newLines
+    lastLineCount = newLines.length
+    if (autoScroll.value) {
+      await nextTick()
+      if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+    }
+  } catch {
+    // 读日志失败（如服务刚被删除）：跳过本轮，下个轮询周期自动重试，不弹打扰性提示
   }
 }
 
@@ -194,27 +210,19 @@ function scrollToBottom() {
           </Button>
         </div>
 
-        <!-- 日志流 -->
+        <!-- 日志流：纯 div 渲染。逐行 Motion 在 1000 行时开销过大（每行一个动画组件实例），
+             新行动效改为 CSS 动画只挂最后 3 行，key 用 idx 按位置复用、class 不变时不重播 -->
         <div
           ref="logEl"
           class="flex-1 overflow-auto bg-muted/40 p-4 font-mono text-[12px] leading-[1.6] whitespace-pre-wrap break-all"
         >
-          <AnimatePresence>
-            <Motion
-              v-for="(line, idx) in lines"
-              :key="idx"
-              as="div"
-              :initial="
-                idx >= lines.length - 3
-                  ? { opacity: 0, x: -4 }
-                  : false
-              "
-              :animate="{ opacity: 1, x: 0 }"
-              :transition="springSnappy"
-            >
-              {{ line }}
-            </Motion>
-          </AnimatePresence>
+          <div
+            v-for="(line, idx) in lines"
+            :key="idx"
+            :class="idx >= lines.length - 3 && 'log-line-enter'"
+          >
+            {{ line }}
+          </div>
         </div>
 
         <!-- 底部状态条 -->
@@ -271,3 +279,20 @@ function scrollToBottom() {
     </DialogPortal>
   </DialogRoot>
 </template>
+
+<style scoped>
+/* 新日志行入场：只对通过 log-line-enter 标记的最后几行生效，无 JS 组件开销 */
+.log-line-enter {
+  animation: log-line-in 0.2s ease-out;
+}
+@keyframes log-line-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+</style>

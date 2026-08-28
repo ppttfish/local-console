@@ -177,7 +177,7 @@ type Granularity = 'hour' | 'day' | 'month'
 const agent = ref<'all' | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh'>(
   'all'
 )
-const model = ref<string>('')
+const model = ref<string>('all')
 const models = ref<string[]>([])
 const granularity = ref<Granularity>('hour')
 const presetRange = ref<PresetRange>('today')
@@ -411,12 +411,16 @@ watch(presetRange, (v) => {
 
 const filter = computed(() => ({
   agent: agent.value,
-  model: model.value || undefined,
+  model: model.value === 'all' ? undefined : model.value || undefined,
   from: from.value,
   to: undefined
 }))
 
+// 请求序号：筛选 / 粒度 / 轮询 / rescan 会并发触发 refresh，
+// 只让最后一次发出的请求写回数据，防止快速切换筛选时旧响应覆盖新数据
+let reqSeq = 0
 async function refresh() {
+  const seq = ++reqSeq
   loading.value = true
   try {
     const [s, t, ss, m, st] = await Promise.all([
@@ -429,13 +433,15 @@ async function refresh() {
       window.lcp.usageModels(),
       window.lcp.usageStatus()
     ])
+    if (seq !== reqSeq) return
     summary.value = s as Summary
     timeline.value = (t as { timeline: TimelinePoint[] }).timeline ?? (t as TimelinePoint[])
     sessions.value = ss as Session[]
     models.value = m as string[]
     status.value = st as Status
   } finally {
-    loading.value = false
+    // 过期响应不关 loading：此时更新的那次请求还在飞行中，由它负责收尾
+    if (seq === reqSeq) loading.value = false
   }
 }
 
@@ -462,7 +468,8 @@ onUnmounted(() => {
   stopThemeWatch?.()
 })
 
-watch(filter, refresh, { deep: true })
+// filter 是 computed，每次依赖变化返回新对象，引用比较即可感知变化，无需 deep
+watch(filter, refresh)
 watch(granularity, refresh)
 
 // ===== Charts =====
@@ -472,11 +479,10 @@ function num(v: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
-// 主题实例
+// 主题实例：theme 被 withThemeColors 的各 computed options 引用，
+// 主题切换时 options 重算，由 vue-chartjs 内部 watcher 驱动图表换色
 const theme = ref<ChartTheme>(getChartTheme())
 let stopThemeWatch: (() => void) | null = null
-// vue-chartjs 推出来的 Chart 类型 union 太大；用最小 duck-type 集合即可
-const chartRefs = ref<Array<{ update(mode?: string): void }>>([])
 
 function withThemeColors(baseOptions: ChartOptions): ChartOptions {
   const t = theme.value
@@ -659,17 +665,10 @@ const modelBarOptions = computed<ChartOptions<'bar'>>(
     }) as ChartOptions<'bar'>
 )
 
-function registerChart(c: unknown) {
-  if (c && typeof (c as { update?: unknown }).update === 'function') {
-    chartRefs.value.push(c as { update(mode?: string): void })
-  }
-}
-
 // 启动主题监听
 onMounted(() => {
   stopThemeWatch = watchTheme(() => {
     theme.value = getChartTheme()
-    for (const c of chartRefs.value) c.update('none')
   })
 })
 onBeforeUnmount(() => {
@@ -736,7 +735,8 @@ const granularityOptions = computed(() => [
 ])
 
 const modelOptions = computed(() => [
-  { value: '', label: '全部模型' },
+  // SelectItem 不允许空字符串 value（会被当作"清空选择"），用 'all' 哨兵表示全部
+  { value: 'all', label: '全部模型' },
   ...models.value.map((m) => ({ value: m, label: m }))
 ])
 
@@ -878,7 +878,6 @@ function quotaToneToToneClass(
             <Line
               :data="lineChartData"
               :options="lineChartOptions"
-              @vue:mounted="(c: unknown) => registerChart(c)"
             />
           </div>
         </Card>
@@ -917,7 +916,6 @@ function quotaToneToToneClass(
               <Doughnut
                 :data="agentDoughnut"
                 :options="agentDoughnutOptions"
-                @vue:mounted="(c: unknown) => registerChart(c)"
               />
             </div>
             <div v-else-if="rankRows.length" class="flex h-60 flex-col justify-center gap-2.5">
@@ -959,7 +957,6 @@ function quotaToneToToneClass(
               <Bar
                 :data="modelBar"
                 :options="modelBarOptions"
-                @vue:mounted="(c: unknown) => registerChart(c)"
               />
             </div>
           </Card>
