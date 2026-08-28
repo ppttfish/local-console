@@ -7,6 +7,7 @@ import {
   Activity,
   Coins,
   ScrollText,
+  Gift,
   Settings as SettingsIcon,
   Sun,
   Moon,
@@ -33,6 +34,7 @@ const items: NavItem[] = [
   { name: 'monitor', label: '服务监控', icon: Activity },
   { name: 'usage', label: 'Token 用量', icon: Coins },
   { name: 'logs', label: '日志中心', icon: ScrollText },
+  { name: 'deals', label: '薅羊毛', icon: Gift },
   { name: 'settings', label: '设置', icon: SettingsIcon }
 ]
 

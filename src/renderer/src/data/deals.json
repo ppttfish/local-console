@@ -1,0 +1,29 @@
+{
+  "updatedAt": "2026-08-28",
+  "items": [
+    {
+      "id": "glm-coding-trial-card",
+      "title": "GLM Coding Plan 7 天体验卡",
+      "tags": ["国内直连", "限量领取"],
+      "description": "为让新朋友 0 成本上手体验 GLM-5.3-Flash，官方发放 GLM Coding Plan 7 天体验卡：从未订阅过套餐的用户可领取，接下来一周每天限量 10,000 张；同时所有套餐用户账号内的体验卡数量已重置，欢迎分享给更多朋友。",
+      "url": "https://bigmodel.cn/activity/trial-card/PU9MTWG0PM",
+      "urlLabel": "领取体验卡",
+      "startsAt": "2026-08-28",
+      "endsAt": "2026-09-04",
+      "pinned": true
+    },
+    {
+      "id": "gmi-cloud-minimax",
+      "title": "MiniMax × GMI Cloud 免费试用",
+      "tags": ["海外", "限时免费"],
+      "description": "8 月 24 日至 9 月 6 日，MiniMax 模型免费试用 14 天，还可参加 Build Challenge。注册账号并创建 API Key 即可调用，OpenAI 兼容接口，可直接接入常用客户端与工具。",
+      "url": "https://console.gmicloud.ai/",
+      "urlLabel": "注册 / 控制台",
+      "apiBase": "https://api.gmi-serving.com/v1/",
+      "model": "MiniMaxAI/MiniMax-M3",
+      "startsAt": "2026-08-24",
+      "endsAt": "2026-09-06",
+      "pinned": true
+    }
+  ]
+}
