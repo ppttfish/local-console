@@ -28,3 +28,7 @@ logs/*.log
 *.dmg
 *.AppImage
 *.snap
+# 本地工作区
+.workbuddy/
+electron.vite.config.*.mjs
+scripts/_ref-*.py
