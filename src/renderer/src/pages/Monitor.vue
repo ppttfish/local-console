@@ -1,12 +1,12 @@
 <script setup lang="ts">
 /**
  * 服务监控
- *  - 顶部 KPI 卡（总CPU/内存/未纳管端口/运行中）
+ *  - 顶部 KPI 卡（运行中/未纳管端口/托管进程内存）
  *  - 端口占用表（shadcn Table + 行内「加入看板」动作）
- *  - 保留时间戳 + 2s 轮询刷新
+ *  - 状态变化由主进程推送，轮询只作兜底
  */
 import { computed, ref } from 'vue'
-import { Server, Plug, Cpu, MemoryStick, Plus } from 'lucide-vue-next'
+import { Server, Plug, MemoryStick, Plus } from 'lucide-vue-next'
 import { useAppStore } from '@/stores/app'
 import type { PortSnapshot } from '@shared/types'
 import {
@@ -53,8 +53,7 @@ function onAdded() {
       <div>
         <h1 class="text-2xl font-semibold tracking-tight">服务监控</h1>
         <p class="mt-1 text-sm text-muted-foreground">
-          每 2 秒自动刷新 · 总 CPU {{ store.totalCpu.toFixed(1) }}% ·
-          内存 {{ store.totalMem.toFixed(1) }}%
+          状态变化即时推送 · 托管进程内存 {{ store.totalMemMb }} MB
         </p>
       </div>
     </header>
@@ -76,18 +75,15 @@ function onAdded() {
         sub="可一键加入看板"
       />
       <KpiCard
-        label="总 CPU"
-        :value="`${store.totalCpu.toFixed(1)}%`"
-        :icon="Cpu"
-        icon-tone="primary"
-        sub="所有托管服务"
-      />
-      <KpiCard
-        label="总内存"
-        :value="`${store.totalMem.toFixed(1)}%`"
+        label="托管进程内存"
+        :value="store.totalMemMb > 0 ? `${store.totalMemMb} MB` : '—'"
         :icon="MemoryStick"
         icon-tone="primary"
-        sub="所有托管服务"
+        :sub="
+          store.runningServices.length > 0
+            ? `${store.runningServices.length} 个运行中进程`
+            : '没有运行中的进程'
+        "
       />
     </div>
 

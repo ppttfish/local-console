@@ -1,7 +1,7 @@
 /**
  * token-usage 数据层 v2 —— 支持 cost_usd + cache 读/写分桶
  */
-import { getDb } from '../../../services/db.js'
+import { getDb, prepare } from '../../../services/db.js'
 import { calcCost, priceFor, loadPricing, type ModelPrice } from './pricing.js'
 
 export type Platform = 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh' | 'unknown'
@@ -18,6 +18,13 @@ export interface UsageRow {
   at: number
   session_id: string
   meta: string | null
+  /**
+   * 产生这一行的源文件绝对路径。
+   * 文件被压缩/重写时它是「全删全写」唯一干净的删除边界 —— session_id 可能被
+   * 行内字段覆盖（zcode 的 sessionId），只按 session_id 删会漏行。
+   * 升级前写入的老行此列为 NULL，删除时有一层 agent+session_id 兜底。
+   */
+  source_file: string
 }
 
 const SCHEMA = `
@@ -33,19 +40,26 @@ CREATE TABLE IF NOT EXISTS agent_usage (
   cost_usd REAL NOT NULL DEFAULT 0,
   at INTEGER NOT NULL,
   session_id TEXT,
-  meta TEXT
+  meta TEXT,
+  source_file TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_usage_at ON agent_usage(at);
 CREATE INDEX IF NOT EXISTS idx_usage_agent ON agent_usage(agent);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON agent_usage(model);
 CREATE INDEX IF NOT EXISTS idx_usage_agent_at ON agent_usage(agent, at);
 CREATE INDEX IF NOT EXISTS idx_usage_session ON agent_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_session_at ON agent_usage(session_id, at);
+-- 注意：idx_usage_source 不能写在这里。
+-- 老库的 agent_usage 还没有 source_file 列，CREATE INDEX 会在迁移 addCol 之前执行
+-- 而直接报 "no such column: source_file"，导致整个插件加载失败。
+-- 它放在 ensureUsageSchema 的迁移段（addCol 之后）里创建。
 
 CREATE TABLE IF NOT EXISTS agent_file_cursor (
   file_path TEXT PRIMARY KEY,
   file_size INTEGER NOT NULL,
   file_mtime INTEGER NOT NULL,
-  lines_seen INTEGER NOT NULL DEFAULT 0
+  lines_seen INTEGER NOT NULL DEFAULT 0,
+  head_hash TEXT
 );
 `
 
@@ -63,13 +77,27 @@ export function ensureUsageSchema(): void {
   addCol('cache_read_tokens', 'INTEGER NOT NULL DEFAULT 0')
   addCol('cache_write_tokens', 'INTEGER NOT NULL DEFAULT 0')
   addCol('cost_usd', 'REAL NOT NULL DEFAULT 0')
+  addCol('source_file', 'TEXT')
+
+  const cursorCols = db
+    .prepare('PRAGMA table_info(agent_file_cursor)')
+    .all() as Array<{ name: string }>
+  if (!new Set(cursorCols.map((c) => c.name)).has('head_hash')) {
+    db.exec('ALTER TABLE agent_file_cursor ADD COLUMN head_hash TEXT')
+  }
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_usage_session_at ON agent_usage(session_id, at)'
+  )
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_usage_source ON agent_usage(source_file)'
+  )
 }
 
 export function insertUsageBatch(rows: UsageRow[]): number {
   if (rows.length === 0) return 0
-  const stmt = getDb().prepare(
-    `INSERT INTO agent_usage (agent, model, input_tokens, output_tokens, cached_tokens, cache_read_tokens, cache_write_tokens, cost_usd, at, session_id, meta)
-     VALUES (@agent, @model, @input_tokens, @output_tokens, @cached_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd, @at, @session_id, @meta)`
+  const stmt = prepare(
+    `INSERT INTO agent_usage (agent, model, input_tokens, output_tokens, cached_tokens, cache_read_tokens, cache_write_tokens, cost_usd, at, session_id, meta, source_file)
+     VALUES (@agent, @model, @input_tokens, @output_tokens, @cached_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd, @at, @session_id, @meta, @source_file)`
   )
   const tx = getDb().transaction((items: UsageRow[]) => {
     for (const r of items) stmt.run(r)
@@ -78,17 +106,56 @@ export function insertUsageBatch(rows: UsageRow[]): number {
   return rows.length
 }
 
+/**
+ * 删除某个源文件贡献过的全部用量行。
+ * 文件被重写（压缩 / 重排 / 截断）后必须整文件重建，重建前不清干净就会叠加翻倍。
+ * 老数据的 source_file 为 NULL，用 agent + session_id 兜底回收。
+ */
+export function deleteUsageBySourceFile(
+  filePath: string,
+  agent: Platform,
+  sessionId: string
+): number {
+  const r = prepare(
+      `DELETE FROM agent_usage
+       WHERE source_file = @file
+          OR (source_file IS NULL AND agent = @agent AND session_id = @sessionId)`
+    )
+    .run({ file: filePath, agent, sessionId })
+  return r.changes
+}
+
+/** 某个 agent 当前最早一条的时间戳；没有数据返回 0（表示从头扫） */
+export function minAtForAgent(agent: Platform): number {
+  const r = prepare('SELECT MIN(at) AS m FROM agent_usage WHERE agent = ?')
+    .get(agent) as { m: number | null }
+  return r.m ?? 0
+}
+
+/**
+ * source_file 为空的历史行数：> 0 说明还有只能靠 agent+session_id 兜底回收的老数据。
+ * 只判 IS NULL —— 再并一个 `OR source_file = ''` 会让这条每 30 秒跑一次的统计退化成全表扫。
+ */
+export function countLegacyRows(): number {
+  const r = prepare(
+      'SELECT COUNT(*) AS n FROM agent_usage WHERE source_file IS NULL'
+    )
+    .get() as { n: number }
+  return r.n ?? 0
+}
+
 // ========== Cursor ==========
 interface CursorRow {
   file_path: string
   file_size: number
   file_mtime: number
   lines_seen: number
+  /** 已入库前缀的指纹；NULL 表示老游标，尚未纳入重写检测 */
+  head_hash: string | null
 }
 
 export function getCursor(filePath: string): CursorRow | null {
-  const r = getDb()
-    .prepare('SELECT * FROM agent_file_cursor WHERE file_path = ?')
+  const r = prepare('SELECT * FROM agent_file_cursor WHERE file_path = ?')
     .get(filePath) as CursorRow | undefined
   return r ?? null
 }
@@ -97,28 +164,28 @@ export function upsertCursor(
   filePath: string,
   size: number,
   mtime: number,
-  linesSeen: number
+  linesSeen: number,
+  headHash: string
 ): void {
-  getDb()
-    .prepare(
-      `INSERT INTO agent_file_cursor (file_path, file_size, file_mtime, lines_seen)
-       VALUES (?, ?, ?, ?)
+  prepare(
+      `INSERT INTO agent_file_cursor (file_path, file_size, file_mtime, lines_seen, head_hash)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(file_path) DO UPDATE SET
          file_size = excluded.file_size,
          file_mtime = excluded.file_mtime,
-         lines_seen = excluded.lines_seen`
+         lines_seen = excluded.lines_seen,
+         head_hash = excluded.head_hash`
     )
-    .run(filePath, size, mtime, linesSeen)
+    .run(filePath, size, mtime, linesSeen, headHash)
 }
 
 export function resetCursor(filePath: string): void {
-  getDb()
-    .prepare('DELETE FROM agent_file_cursor WHERE file_path = ?')
+  prepare('DELETE FROM agent_file_cursor WHERE file_path = ?')
     .run(filePath)
 }
 
 export function resetAllCursors(): void {
-  getDb().prepare('DELETE FROM agent_file_cursor').run()
+  prepare('DELETE FROM agent_file_cursor').run()
 }
 
 export function dropUsageTable(): void {
@@ -165,6 +232,10 @@ function buildWhere(filter: UsageFilter): WhereClause {
 
 // ========== 聚合 ==========
 export interface UsageSummary {
+  /**
+   * 总 token 数 = fresh 输入 + 缓存命中 + 输出（与 ccusage totalTokens = input+cacheRead+cacheWrite+output 一致）。
+   * 所有源均按 fresh 存储（input_tokens 为非缓存 fresh，已扣减 cached），因此需显式 + cached。
+   */
   total_tokens: number
   input_tokens: number
   output_tokens: number
@@ -188,8 +259,7 @@ export interface UsageSummary {
 
 export function querySummary(filter: UsageFilter): UsageSummary {
   const where = buildWhere(filter)
-  const totals = getDb()
-    .prepare(
+  const totals = prepare(
       `SELECT
          COALESCE(SUM(input_tokens), 0) AS inp,
          COALESCE(SUM(output_tokens), 0) AS out,
@@ -210,8 +280,7 @@ export function querySummary(filter: UsageFilter): UsageSummary {
     calls: number
   }
 
-  const byAgent = getDb()
-    .prepare(
+  const byAgent = prepare(
       `SELECT agent,
               SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
               COUNT(*) AS calls,
@@ -222,8 +291,7 @@ export function querySummary(filter: UsageFilter): UsageSummary {
     )
     .all(where.params) as Array<{ agent: string; tokens: number; calls: number; cost: number }>
 
-  const byModel = getDb()
-    .prepare(
+  const byModel = prepare(
       `SELECT model,
               SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
               COUNT(*) AS calls,
@@ -244,8 +312,7 @@ export function querySummary(filter: UsageFilter): UsageSummary {
     cache_write: number
   }>
 
-  const byDay = getDb()
-    .prepare(
+  const byDay = prepare(
       `SELECT
          strftime('%Y-%m-%d', at/1000, 'unixepoch', '+8 hours') AS day,
          SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
@@ -263,6 +330,7 @@ export function querySummary(filter: UsageFilter): UsageSummary {
     inp + cached > 0 ? Math.round((cached / (inp + cached)) * 1000) / 10 : 0
 
   return {
+    // 统一 fresh 存储：total = fresh + cached + output（与 ccusage totalTokens = input+cacheCreate+cacheRead+output 一致）
     total_tokens: inp + (totals.out ?? 0) + cached,
     input_tokens: inp,
     output_tokens: totals.out ?? 0,
@@ -280,16 +348,14 @@ export function querySummary(filter: UsageFilter): UsageSummary {
 
 export function listDistinctModels(): string[] {
   return (
-    getDb()
-      .prepare('SELECT DISTINCT model FROM agent_usage ORDER BY model ASC')
+    prepare('SELECT DISTINCT model FROM agent_usage ORDER BY model ASC')
       .all() as Array<{ model: string }>
   ).map((r) => r.model)
 }
 
 export function listDistinctAgents(): Platform[] {
   return (
-    getDb()
-      .prepare('SELECT DISTINCT agent FROM agent_usage ORDER BY agent ASC')
+    prepare('SELECT DISTINCT agent FROM agent_usage ORDER BY agent ASC')
       .all() as Array<{ agent: Platform }>
   ).map((r) => r.agent)
 }
@@ -307,8 +373,7 @@ export interface SessionDetail {
 
 export function listSessions(filter: UsageFilter, limit = 200): SessionDetail[] {
   const where = buildWhere(filter)
-  return getDb()
-    .prepare(
+  return prepare(
       `SELECT
          session_id,
          agent,
@@ -350,8 +415,7 @@ export function queryTimeline(
       : granularity === 'month'
         ? '%Y-%m'
         : '%Y-%m-%d'
-  return getDb()
-    .prepare(
+  return prepare(
       `SELECT
          strftime('${fmt}', at/1000, 'unixepoch', '+8 hours') AS bucket,
          SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
@@ -383,12 +447,10 @@ function utcMsOfDay(day: string): number {
 export function queryRecap(): UsageRecap {
   const summary = querySummary({})
 
-  const range = getDb()
-    .prepare('SELECT MIN(at) AS first_at, MAX(at) AS last_at FROM agent_usage')
+  const range = prepare('SELECT MIN(at) AS first_at, MAX(at) AS last_at FROM agent_usage')
     .get() as { first_at: number | null; last_at: number | null }
 
-  const byModel = getDb()
-    .prepare(
+  const byModel = prepare(
       `SELECT model,
               SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
               COUNT(*) AS calls,
@@ -410,8 +472,7 @@ export function queryRecap(): UsageRecap {
     input: number
   }>
 
-  const hourRows = getDb()
-    .prepare(
+  const hourRows = prepare(
       `SELECT CAST(strftime('%H', at/1000, 'unixepoch', '+8 hours') AS INTEGER) AS h,
               COUNT(*) AS calls
        FROM agent_usage
@@ -423,8 +484,7 @@ export function queryRecap(): UsageRecap {
     if (r.h >= 0 && r.h <= 23) hour_histogram[r.h] = r.calls
   }
 
-  const dayRows = getDb()
-    .prepare(
+  const dayRows = prepare(
       `SELECT strftime('%Y-%m-%d', at/1000, 'unixepoch', '+8 hours') AS date,
               SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
               COALESCE(SUM(cost_usd), 0) AS cost,

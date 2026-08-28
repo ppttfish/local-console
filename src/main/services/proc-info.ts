@@ -28,8 +28,6 @@ export interface ProcInfo {
   username: string | null
 }
 
-const ALIVE_BATCH_RE = /"(\d+)"\s+\S+/g
-
 let selfUsername: string | null = null
 function getSelfUsername(): string {
   if (selfUsername !== null) return selfUsername
@@ -128,6 +126,69 @@ function deriveCwdFromExe(exe: string): string | null {
   const i = Math.max(exe.lastIndexOf('\\'), exe.lastIndexOf('/'))
   if (i <= 0) return null
   return exe.slice(0, i)
+}
+
+// ===== 进程内存 =====
+
+const MEM_TTL_MS = 5000
+let memCache: { at: number; map: Map<number, number> } | null = null
+
+/**
+ * 批量取进程物理内存（MB）。
+ *
+ * 一次 wmic 拿全部目标 PID，结果缓存 5 秒 —— 状态轮询是 2 秒一次，
+ * 不缓存的话每轮都要 spawn 一个 wmic。
+ */
+export function pidMemoryMb(pids: number[]): Map<number, number> {
+  const out = new Map<number, number>()
+  const unique = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))]
+  if (unique.length === 0) return out
+
+  if (memCache && Date.now() - memCache.at < MEM_TTL_MS) {
+    for (const p of unique) {
+      const v = memCache.map.get(p)
+      if (v !== undefined) out.set(p, v)
+    }
+    return out
+  }
+
+  const whereClause = unique.map((p) => `ProcessId=${p}`).join(' or ')
+  const r = spawnSync(
+    'wmic',
+    [
+      'process',
+      'where',
+      whereClause,
+      'get',
+      'ProcessId,WorkingSetSize',
+      '/format:csv'
+    ],
+    { windowsHide: true, shell: false, timeout: 10_000, encoding: 'utf8' }
+  )
+
+  const map = new Map<number, number>()
+  if (!r.error && typeof r.stdout === 'string') {
+    const lines = r.stdout.split(/\r?\n/).filter((l) => l.trim().length > 0)
+    if (lines.length >= 2) {
+      const header = lines[0]!.split(',')
+      const iPid = header.indexOf('ProcessId')
+      const iWs = header.indexOf('WorkingSetSize')
+      for (let i = 1; i < lines.length; i++) {
+        const cells = lines[i]!.split(',')
+        const pid = parseInt(cells[iPid] ?? '', 10)
+        const ws = parseInt(cells[iWs] ?? '', 10)
+        if (Number.isFinite(pid) && Number.isFinite(ws) && ws > 0) {
+          map.set(pid, Math.round((ws / 1024 / 1024) * 10) / 10)
+        }
+      }
+    }
+  }
+  memCache = { at: Date.now(), map }
+  for (const p of unique) {
+    const v = map.get(p)
+    if (v !== undefined) out.set(p, v)
+  }
+  return out
 }
 
 /** 检查两个路径是否指向同一个真实路径。失败时返回 false（不抛）。 */

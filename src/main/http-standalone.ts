@@ -1,7 +1,7 @@
 /**
  * Standalone HTTP server（无 GUI / 无 Electron）
- * 启动方式：node out/main/http-standalone.js
- *   或 ELECTRON_RUN_AS_NODE=1 electron out/main/http-standalone.js
+ * 启动方式：node out/main/http-standalone.cjs
+ *   或 ELECTRON_RUN_AS_NODE=1 electron out/main/http-standalone.cjs
  */
 import { join, resolve } from 'node:path'
 import { existsSync, mkdirSync } from 'node:fs'
@@ -24,9 +24,17 @@ const port = parseInt(
   10
 )
 
-const { startHttpServer } = await import('./http-server.js')
+// 主进程是 CJS 输出，不能用顶层 await，包一层 main。
+// 注意这里是源码模块名（rollup 会重写到构建产物的 chunk 路径）
+async function main(): Promise<void> {
+  const { startHttpServer } = await import('./http-server.js')
+  await startHttpServer({ userData, port, rendererDir })
+}
 
-await startHttpServer({ userData, port, rendererDir })
+void main().catch((e) => {
+  console.error('[http-standalone] 启动失败:', e)
+  process.exit(1)
+})
 
 function resolveUserData(): string {
   const base =

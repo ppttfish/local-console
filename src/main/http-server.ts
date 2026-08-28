@@ -3,7 +3,7 @@
  * 可以在 Electron 内部启动，也可以 standalone 启动（无 GUI 模式）
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
-import { readFileSync, existsSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, statSync } from 'node:fs'
 import { join, extname, normalize } from 'node:path'
 import { URL } from 'node:url'
 import { initDatabase, closeDatabase } from './services/db.js'
@@ -20,7 +20,8 @@ import {
   listDistinctAgents,
   listSessions
 } from './plugins/builtin/token-usage/storage.js'
-import { UsageScanner } from './plugins/builtin/token-usage/scanner.js'
+import { usageScanner } from './plugins/builtin/token-usage/scanner.js'
+import { subscriptionRefresher } from './plugins/builtin/token-usage/refresh.js'
 import { loadPricing } from './plugins/builtin/token-usage/pricing.js'
 import {
   ensureSubscriptionSchema,
@@ -32,11 +33,10 @@ import {
   type CreateSubscriptionInput,
   type UpdateSubscriptionInput
 } from './plugins/builtin/token-usage/subscriptions.js'
-import { SubscriptionRefresher } from './plugins/builtin/token-usage/refresh.js'
 import { listProviderMetas } from './plugins/builtin/token-usage/providers/index.js'
 import { discoverOpencodeCredentials } from './plugins/builtin/token-usage/opencode-auth.js'
 import { getDataDir, getLogDir } from './utils/paths.js'
-import { openLocalUrl } from './utils/open-external.js'
+import { openLocalUrl, openLocalPath } from './utils/open-external.js'
 import { app } from 'electron'
 import { homedir } from 'node:os'
 
@@ -44,8 +44,8 @@ interface Runtime {
   svc: ServiceManager
   port: PortScanner
   log: LogStreamer
-  usageScanner: UsageScanner
-  subRefresher: SubscriptionRefresher
+  /** 这些实例是否由本函数创建（决定 shutdown 时该不该停它们） */
+  ownsRuntime: boolean
 }
 
 let runtime: Runtime | null = null
@@ -56,34 +56,41 @@ export async function startHttpServer(opts: {
   userData: string
   port: number
   rendererDir: string
+  /**
+   * Electron 主进程已有自己的 ServiceManager / PortScanner / LogStreamer 时注入进来。
+   * 不注入而各建一套，会导致 Web 端启停的服务在桌面端状态里看不见（两个 procs Map）。
+   */
+  svc?: ServiceManager
+  portScanner?: PortScanner
+  logStreamer?: LogStreamer
 }): Promise<void> {
   port = opts.port
   rendererDir = opts.rendererDir
 
-  // 初始化 db
-
+  // 初始化 db（同路径时幂等，Electron 主进程已经初始化过就直接复用）
   initDatabase(opts.userData)
   ensureUsageSchema()
   ensureSubscriptionSchema()
   loadPricing()
 
-  // 业务
+  const ownsRuntime = !opts.svc || !opts.portScanner || !opts.logStreamer
   const bus = new EventBus()
   const logsDir = join(opts.userData, 'logs')
-  const svc = new ServiceManager(bus, { userData: opts.userData, logsDir })
-  const portScanner = new PortScanner(bus)
-  const logStreamer = new LogStreamer(bus, logsDir)
-  const usageScanner = new UsageScanner()
-  const subRefresher = new SubscriptionRefresher()
+  const svc = opts.svc ?? new ServiceManager(bus, { userData: opts.userData, logsDir })
+  const portScanner = opts.portScanner ?? new PortScanner(bus)
+  const logStreamer = opts.logStreamer ?? new LogStreamer(bus, logsDir)
 
-  await svc.start()
-  await portScanner.start()
+  if (ownsRuntime) {
+    await svc.start()
+    await portScanner.start()
+  }
   // 让 ServiceState 携带真实端口占用信息（外部接管条目的状态展示依赖它）
   svc.setPortProvider(() => portScanner.snapshot())
-  await usageScanner.start()
-  subRefresher.start()
+  // 单例、幂等：Electron 模式下插件和 IPC 层已经起过了，这里再调不会重复扫描
+  usageScanner.start()
+  subscriptionRefresher.start()
 
-  runtime = { svc, port: portScanner, log: logStreamer, usageScanner, subRefresher }
+  runtime = { svc, port: portScanner, log: logStreamer, ownsRuntime }
 
   const server = createServer((req, res) => handle(req, res))
   server.listen(port, '127.0.0.1', () => {
@@ -93,12 +100,14 @@ export async function startHttpServer(opts: {
   // graceful shutdown
   const shutdown = async () => {
     console.log('[http] 关闭...')
-    await svc.shutdown()
-    await portScanner.stop()
-    usageScanner.stop()
-    subRefresher.stop()
+    if (runtime?.ownsRuntime) {
+      await svc.shutdown()
+      await portScanner.stop()
+      usageScanner.stop()
+      subscriptionRefresher.stop()
+      closeDatabase()
+    }
     server.close()
-    closeDatabase()
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
@@ -127,12 +136,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.end('forbidden')
     return
   }
-  if (!existsSync(filePath) || !statSync(filePath).isFile()) {
-    // SPA fallback
+  let st = null
+  try {
+    st = statSync(filePath)
+  } catch {
+    st = null
+  }
+  if (!st || !st.isFile()) {
+    // SPA fallback（hash 路由下除静态资源外都回 index.html）
     const fallback = join(rendererDir, 'index.html')
     if (existsSync(fallback)) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8')
-      res.end(readFileSync(fallback, 'utf8'))
+      // index.html 不能缓存，否则发新版后浏览器一直拿旧的入口
+      res.setHeader('Cache-Control', 'no-cache')
+      createReadStream(fallback).pipe(res)
       return
     }
     res.statusCode = 404
@@ -152,7 +169,21 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     '.woff2': 'font/woff2'
   }
   res.setHeader('Content-Type', mime[ext] ?? 'application/octet-stream')
-  res.end(readFileSync(filePath))
+  res.setHeader('Content-Length', st.size)
+  // Vite 产物文件名带 hash，可以放心长缓存；非 hash 的 index.html 走上面的 no-cache
+  res.setHeader(
+    'Cache-Control',
+    /-[A-Za-z0-9_]{8}\./.test(basenameOf(filePath))
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache'
+  )
+  // 用流而不是 readFileSync：JS/CSS 动辄上 MB，同步读会阻塞整个 HTTP server
+  createReadStream(filePath).pipe(res)
+}
+
+function basenameOf(p: string): string {
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+  return i < 0 ? p : p.slice(i + 1)
 }
 
 async function handleApi(
@@ -193,16 +224,8 @@ async function handleApi(
       })
     }
     if (pathname === '/api/state' && req.method === 'GET') {
-      const services = r.svc.list()
-      const ports = r.port.snapshot()
-      return json(res, 200, {
-        services,
-        ports,
-        total_cpu: 0,
-        total_mem: 0,
-        alerts: [],
-        captured_at: Date.now()
-      })
+      // 复用 ServiceManager 的快照，跟 IPC 链路保持同一套指标口径
+      return json(res, 200, r.svc.snapshotState())
     }
     if (pathname === '/api/port/scan' && req.method === 'GET') {
       return json(res, 200, r.port.snapshot())
@@ -217,6 +240,21 @@ async function handleApi(
     if (pathname === '/api/service/clear-logs' && req.method === 'POST') {
       const { id } = body as { id: string }
       r.log.clear(id)
+      return json(res, 200, { ok: true })
+    }
+    // 注意顺序：/api/service/reorder 必须排在 /api/service/:id/:action 之前
+    if (pathname === '/api/service/reorder' && req.method === 'POST') {
+      const { ids } = body as { ids?: string[] }
+      if (!Array.isArray(ids)) {
+        return json(res, 400, { ok: false, error: 'ids 必须是数组' })
+      }
+      r.svc.reorder(ids)
+      return json(res, 200, { ok: true })
+    }
+    if (pathname === '/api/service/reset-log-size' && req.method === 'POST') {
+      // 日志被清空后要把内存里的字节计数一起归零，否则会提前触发轮转
+      const { id } = body as { id: string }
+      r.svc.resetLogCounter(id)
       return json(res, 200, { ok: true })
     }
     if (pathname.startsWith('/api/service/') && req.method === 'POST') {
@@ -240,7 +278,7 @@ async function handleApi(
     }
     if (pathname === '/api/service/delete' && req.method === 'POST') {
       const { id } = body as { id: string }
-      r.svc.delete(id)
+      await r.svc.delete(id)
       return json(res, 200, { ok: true })
     }
     if (pathname === '/api/service/logs' && req.method === 'POST') {
@@ -252,6 +290,26 @@ async function handleApi(
     if (pathname === '/api/project/detect' && req.method === 'POST') {
       const { cwd } = body as { cwd: string }
       return json(res, 200, r.svc.detectProject(cwd))
+    }
+    // Web 端没有原生目录选择框，返回"不支持"而不是 404，
+    // 免得前端把它当接口缺失
+    if (pathname === '/api/project/pick-folder' && req.method === 'POST') {
+      return json(res, 200, { ok: false, canceled: true, unsupported: true })
+    }
+
+    // App 控制：这些原本只在 IPC 里有，web-bridge 会调，缺了就静默 404
+    if (pathname === '/api/app/open-log-dir' && req.method === 'POST') {
+      void openLocalPath(getLogDir())
+      return json(res, 200, { ok: true })
+    }
+    if (pathname === '/api/app/open-data-dir' && req.method === 'POST') {
+      void openLocalPath(getDataDir())
+      return json(res, 200, { ok: true })
+    }
+    if (pathname === '/api/app/quit' && req.method === 'POST') {
+      // standalone 模式下没有 Electron app，直接结束进程
+      setTimeout(() => process.exit(0), 100)
+      return json(res, 200, { ok: true })
     }
 
     // token-usage
@@ -279,10 +337,10 @@ async function handleApi(
       return json(res, 200, listSessions(filter, limit ?? 200))
     }
     if (pathname === '/api/usage/rescan' && req.method === 'POST') {
-      return json(res, 200, await r.usageScanner.rescan())
+      return json(res, 200, await usageScanner.rescan())
     }
     if (pathname === '/api/usage/status' && req.method === 'GET') {
-      return json(res, 200, r.usageScanner.getStats())
+      return json(res, 200, usageScanner.getStats())
     }
     if (pathname === '/api/usage/recap' && req.method === 'GET') {
       return json(res, 200, queryRecap())
@@ -316,7 +374,7 @@ async function handleApi(
     }
     if (pathname === '/api/subscription/refresh' && req.method === 'POST') {
       const { id } = body as { id: number }
-      await r.subRefresher.refreshOne(id)
+      await subscriptionRefresher.refreshOne(id)
       return json(res, 200, getSubscription(id))
     }
 

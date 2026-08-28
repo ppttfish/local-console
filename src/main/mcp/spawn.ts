@@ -14,12 +14,12 @@ export function startMcpSubprocess(): void {
 
   // 路径解析：开发期 vs 打包后
   const candidates = [
-    join(app.getAppPath(), 'out', 'main', 'mcp', 'standalone.js'),
-    join(process.resourcesPath || '', 'app', 'out', 'main', 'mcp', 'standalone.js')
+    join(app.getAppPath(), 'out', 'main', 'mcp', 'standalone.cjs'),
+    join(process.resourcesPath || '', 'app', 'out', 'main', 'mcp', 'standalone.cjs')
   ]
   const script = candidates.find((p) => existsSync(p))
   if (!script) {
-    console.warn('[mcp] standalone.js 未找到，先 build 后再启')
+    console.warn('[mcp] standalone.cjs 未找到，先 build 后再启')
     return
   }
 

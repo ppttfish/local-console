@@ -3,7 +3,7 @@
  *  - provider_subscription 表：每个 Provider 一行；存凭证、最新快照、最近错误
  *  - 凭证 v1 暂未加密（仅本机 SQLite；后续可接 electron.safeStorage）
  */
-import { getDb } from '../../../services/db.js'
+import { getDb, prepare } from '../../../services/db.js'
 import { readOpencodeCredential } from './opencode-auth.js'
 import type { QuotaSnapshot } from './providers/types.js'
 
@@ -115,15 +115,13 @@ function mapRow(r: Row): Subscription {
 // ===== CRUD =====
 
 export function listSubscriptions(): Subscription[] {
-  const rows = getDb()
-    .prepare('SELECT * FROM provider_subscription ORDER BY id ASC')
+  const rows = prepare('SELECT * FROM provider_subscription ORDER BY id ASC')
     .all() as Row[]
   return rows.map(mapRow)
 }
 
 export function getSubscription(id: number): Subscription | null {
-  const r = getDb()
-    .prepare('SELECT * FROM provider_subscription WHERE id = ?')
+  const r = prepare('SELECT * FROM provider_subscription WHERE id = ?')
     .get(id) as Row | undefined
   return r ? mapRow(r) : null
 }
@@ -135,8 +133,7 @@ export function createSubscription(input: CreateSubscriptionInput): Subscription
     input.opencodeKey && input.opencodeKey !== ''
       ? (readOpencodeCredential(input.opencodeKey) ?? '-')
       : input.credential
-  const info = getDb()
-    .prepare(
+  const info = prepare(
       `INSERT INTO provider_subscription (provider, display_name, credential, config, enabled, last_refresh_at, last_error, last_snapshot, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`
     )
@@ -165,8 +162,7 @@ export function updateSubscription(
     enabled: patch.enabled === undefined ? cur.enabled : patch.enabled
   }
   const now = Date.now()
-  getDb()
-    .prepare(
+  prepare(
       `UPDATE provider_subscription
        SET display_name = ?, credential = ?, config = ?, enabled = ?, updated_at = ?
        WHERE id = ?`
@@ -183,7 +179,7 @@ export function updateSubscription(
 }
 
 export function deleteSubscription(id: number): void {
-  getDb().prepare('DELETE FROM provider_subscription WHERE id = ?').run(id)
+  prepare('DELETE FROM provider_subscription WHERE id = ?').run(id)
 }
 
 export function setSubscriptionSnapshot(
@@ -192,8 +188,7 @@ export function setSubscriptionSnapshot(
   error: string | null = null
 ): void {
   const now = Date.now()
-  getDb()
-    .prepare(
+  prepare(
       `UPDATE provider_subscription
        SET last_refresh_at = ?, last_snapshot = ?, last_error = ?, updated_at = ?
        WHERE id = ?`

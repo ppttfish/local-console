@@ -46,6 +46,8 @@ export function installWebBridge(): void {
       post('/api/service/logs', { id, tail }),
     clearServiceLogs: (id) =>
       post('/api/service/clear-logs', { id }).then(() => ({ ok: true })),
+    resetLogCounter: (id) =>
+      post('/api/service/reset-log-size', { id }).then(() => ({ ok: true })),
     detectProject: (cwd) => post('/api/project/detect', { cwd }),
     pickFolder: () => post('/api/project/pick-folder'),
     getState: () => post('/api/state'),

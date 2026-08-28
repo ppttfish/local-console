@@ -20,6 +20,7 @@ export interface LcpApi {
   reorderServices: (ids: string[]) => Promise<unknown>
   getServiceLogs: (id: string, tail?: number) => Promise<unknown>
   clearServiceLogs: (id: string) => Promise<unknown>
+  resetLogCounter: (id: string) => Promise<unknown>
   detectProject: (cwd: string) => Promise<unknown>
   pickFolder: () => Promise<unknown>
   getState: () => Promise<unknown>

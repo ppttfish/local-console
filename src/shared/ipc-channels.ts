@@ -15,6 +15,7 @@ export const IpcChannels = {
   ServiceReorder: 'service:reorder',
   ServiceLogs: 'service:logs',
   ServiceClearLogs: 'service:clearLogs',
+  ServiceResetLogCounter: 'service:resetLogCounter',
 
   // 项目识别
   ProjectDetect: 'project:detect',

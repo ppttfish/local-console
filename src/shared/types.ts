@@ -29,7 +29,10 @@ export interface ServiceState extends Service {
   port_occupied_pid: number | null
   /** 端口监听进程名；监听者是本台托管进程时为 null */
   port_process_name?: string | null
+  /** 上一次运行的退出码；本次进程启动后为 null */
   last_exit_code: number | null
+  /** 进程占用的物理内存（MB）；进程不在运行或查询不到时为 null */
+  mem_mb: number | null
 }
 
 export interface PortSnapshot {
@@ -45,8 +48,11 @@ export interface PortSnapshot {
 export interface AppState {
   services: ServiceState[]
   ports: PortSnapshot[]
-  total_cpu: number
-  total_mem: number
+  /**
+   * 托管进程占用的物理内存合计（MB）。
+   * 只统计本台拉起且仍在运行的进程；5 秒采样一次，查不到时为 0。
+   */
+  total_mem_mb: number
   alerts: Alert[]
   captured_at: number
 }

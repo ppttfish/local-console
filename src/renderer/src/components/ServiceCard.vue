@@ -4,7 +4,7 @@
  *  - 视觉：shadcn Card + 边框状态色 (绿/蓝/红)
  *  - 微交互：motion-v hover scale 1.015, press 0.985，弹簧过渡
  *  - 业务：完全不重写（isExternalRunning / 命令回填检测 / 主按钮 / 三点菜单）
- *  - sparkline：取 store.cpuHistory（所有卡片用同一份全局系统指标）
+ *  - 状态行展示真实 PID / 运行时长 / 进程内存
  */
 import { computed, ref } from 'vue'
 import { Motion } from 'motion-v'
@@ -25,7 +25,6 @@ import { springCard, springSnappy } from '@/lib/motion'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui'
 import Tooltip from '@/components/ui/Tooltip.vue'
-import Sparkline from './Sparkline.vue'
 import DropdownMenu from '@/components/ui/DropdownMenu.vue'
 import DropdownMenuContent from '@/components/ui/DropdownMenuContent.vue'
 import DropdownMenuItem from '@/components/ui/DropdownMenuItem.vue'
@@ -142,13 +141,6 @@ const statusTone = computed<
   return 'muted'
 })
 
-const sparklineTone = computed(() => {
-  if (isExternalRunning.value) return 'primary' as const
-  if (props.service.status === 'failed') return 'danger' as const
-  if (props.service.status === 'running') return 'success' as const
-  return 'muted' as const
-})
-
 const cardBorderClass = computed(() => {
   if (isExternalRunning.value) return 'border-primary/45'
   if (props.service.status === 'running') return 'border-success/45'
@@ -173,10 +165,13 @@ const uptimeText = computed(() => {
   return `${h} 时 ${m} 分`
 })
 
-/** 状态行右侧 mono 小字：托管显 PID+时长，外部显 PID */
+/** 状态行右侧 mono 小字：托管显 PID+时长+内存，外部显 PID */
 const statusAside = computed(() => {
-  if (props.service.status === 'running' && props.service.pid)
-    return `PID ${props.service.pid} · ${uptimeText.value}`
+  if (props.service.status === 'running' && props.service.pid) {
+    const mem =
+      props.service.mem_mb !== null ? ` · ${props.service.mem_mb} MB` : ''
+    return `PID ${props.service.pid} · ${uptimeText.value}${mem}`
+  }
   if (isExternalRunning.value)
     return `外部 PID ${props.service.port_occupied_pid}`
   return ''
@@ -384,15 +379,6 @@ const statusDotClass = computed(() => {
     >
       端口由外部进程占用（非本台启动）。「重启接管」会结束它并用上面的命令拉起。
     </Motion>
-
-    <!-- Sparkline（仅运行中/外部接管时显示，停止态画零值平线像 bug） -->
-    <Sparkline
-      v-if="service.status === 'running' || isExternalRunning"
-      :data="store.cpuHistory"
-      :tone="sparklineTone"
-      :height="36"
-      class="-mt-1"
-    />
 
     <!-- 操作：主按钮 + 图标副操作 -->
     <div class="mt-1 flex items-center gap-2">

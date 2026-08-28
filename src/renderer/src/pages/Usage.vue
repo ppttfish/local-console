@@ -17,7 +17,14 @@ import {
 } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Motion } from 'motion-v'
-import { Plus, RefreshCw, RotateCw, Pencil, Trash2 } from 'lucide-vue-next'
+import {
+  Plus,
+  RefreshCw,
+  RotateCw,
+  Pencil,
+  Trash2,
+  AlertTriangle
+} from 'lucide-vue-next'
 import AddSubscriptionDialog from '@/components/AddSubscriptionDialog.vue'
 import RecapPanel from '@/components/RecapPanel.vue'
 import { fmtToken, fmtTokenShort, fmtCost, fmtCny } from '@/lib/format'
@@ -143,6 +150,11 @@ interface Status {
   opencode_messages: number
   dsh_sessions: number
   opencode_flavor: 'openchamber' | 'opencode'
+  /** 检测到源文件被重写、触发整文件重建的次数 */
+  rewrites: number
+  last_rewrite: { file: string; rows: number; at: number } | null
+  /** source_file 为空的历史行数 */
+  legacy_rows: number
 }
 
 const AGENT_LABEL_STATIC: Record<string, string> = {
@@ -762,6 +774,16 @@ function quotaToneToToneClass(
           <b>{{ status?.opencode_messages ?? 0 }}</b> 条 · DSH 会话
           <b>{{ status?.dsh_sessions ?? 0 }}</b> 个 · 上次扫描
           {{ status?.last_scan_at ? relativeTime(status.last_scan_at) : '从未' }}
+        </p>
+        <!-- 老数据没有 source_file 标记，文件被重写时只能靠 agent+session_id 兜底回收。
+             提示用户重扫一次，把兜底换成精确删除。 -->
+        <p
+          v-if="tab === 'usage' && (status?.legacy_rows ?? 0) > 0"
+          class="mt-1 flex items-center gap-1.5 text-xs text-warning"
+        >
+          <AlertTriangle class="size-3.5 shrink-0" />
+          有 {{ status?.legacy_rows }} 条历史记录未标记来源文件，建议点「重新扫描」一次，
+          之后文件被重写时才能精确重建（重扫会清掉源文件已删除的旧会话）。
         </p>
         <p v-else-if="tab === 'subscriptions'" class="mt-1 text-sm text-muted-foreground">
           监控已订阅的 AI 服务商配额 · 每 5 分钟自动刷新

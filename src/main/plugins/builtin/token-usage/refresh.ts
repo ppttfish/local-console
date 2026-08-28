@@ -16,6 +16,7 @@ import {
 export class SubscriptionRefresher {
   private timer: ReturnType<typeof setInterval> | undefined
   private running = false
+  private started = false
   private readonly intervalMs: number
   private readonly firstDelayMs: number
 
@@ -25,7 +26,10 @@ export class SubscriptionRefresher {
   }
 
   start(): void {
-    if (this.timer) return
+    // 幂等：插件、IPC、HTTP 三个入口都会调 start。
+    // 只看 timer 不够 —— 它要到首次延迟结束才赋值，3 秒内被调两次会起两条定时器。
+    if (this.started) return
+    this.started = true
     setTimeout(() => {
       void this.tick()
       this.timer = setInterval(() => void this.tick(), this.intervalMs)
@@ -37,6 +41,7 @@ export class SubscriptionRefresher {
       clearInterval(this.timer)
       this.timer = undefined
     }
+    this.started = false
   }
 
   /** 全量 tick：对所有 enabled 订阅并发拉一次 */
@@ -72,3 +77,10 @@ export class SubscriptionRefresher {
     }
   }
 }
+
+/**
+ * 进程级单例。
+ * 插件 onLoad、IPC 注册、HTTP server 三个入口都要用刷新器；
+ * 各 new 一个的话每条订阅每 5 分钟会被请求三次，既浪费配额又容易触发限流。
+ */
+export const subscriptionRefresher = new SubscriptionRefresher()

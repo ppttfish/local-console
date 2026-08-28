@@ -16,6 +16,7 @@ import {
 import { join } from 'node:path'
 import { appendFileSync, mkdirSync, existsSync } from 'node:fs'
 import { updater } from './updater.js'
+import { IpcChannels } from '../shared/ipc-channels.js'
 
 // 单实例锁（必须在 app 初始化前调）
 const gotLock = app.requestSingleInstanceLock()
@@ -271,11 +272,20 @@ app.whenReady().then(async () => {
   }
 
   // 6. 9600 HTTP server（容错）
+  //    共享主进程已有的 ServiceManager / PortScanner / LogStreamer：
+  //    各建一套的话 Web 端启停的服务在桌面端状态里看不见（两个独立的 procs Map）
   try {
     const rendererDir = isDev
       ? join(__dirname, '../renderer')
       : join(process.resourcesPath, 'renderer')
-    await startHttpServer({ userData, port: 9600, rendererDir })
+    await startHttpServer({
+      userData,
+      port: 9600,
+      rendererDir,
+      svc: serviceManager,
+      portScanner,
+      logStreamer
+    })
     slog('http server started on 9600')
   } catch (e) {
     slog(`http server error: ${(e as Error).message}`)
@@ -306,7 +316,12 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) void createMainWindow()
   })
 
-  // 9. 自动升级
+  // 9. 事件推送：主进程主动把状态变化发给渲染端
+  //    preload 早就暴露了 onStateChanged / onServiceLog，但之前没人发，
+  //    渲染端只能靠 2 秒一次的全量轮询。这里节流后推送，轮询降到兜底频率。
+  bridgeBusToRenderer()
+
+  // 10. 自动升级
   try {
     updater.init()
     slog('updater initialized')
@@ -317,15 +332,78 @@ app.whenReady().then(async () => {
   slog('all init done')
 })
 
+/**
+ * 把主进程事件总线接到渲染端。
+ * 状态类事件（服务启停 / 端口变化）合并节流后整体推一次快照；
+ * 日志流按条推，不节流（本来就是流式的）。
+ */
+function bridgeBusToRenderer(): void {
+  let pending = false
+  const SCHEDULE_MS = 400
+  const flush = (): void => {
+    const win = mainWindow
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+    try {
+      win.webContents.send(
+        IpcChannels.EventStateChanged,
+        serviceManager.snapshotState()
+      )
+    } catch (e) {
+      slog(`push state error: ${(e as Error).message}`)
+    }
+  }
+  const schedule = (): void => {
+    if (pending) return
+    pending = true
+    setTimeout(() => {
+      pending = false
+      flush()
+    }, SCHEDULE_MS)
+  }
+
+  bus.on_event('state:changed', schedule)
+  bus.on_event('port:changed', schedule)
+  bus.on_event('service:status', schedule)
+  bus.on_event('alert', schedule)
+
+  bus.on_event('service:log', (ev) => {
+    const win = mainWindow
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+    try {
+      win.webContents.send(IpcChannels.EventServiceLog, {
+        id: ev.service_id,
+        text: ev.text
+      })
+    } catch {
+      // 窗口已关闭时忽略
+    }
+  })
+}
+
 app.on('window-all-closed', () => {
   // 托盘模式下不退出
 })
 
-app.on('before-quit', async () => {
+let quitCleaned = false
+app.on('before-quit', (e) => {
+  if (quitCleaned) return
+  // 拦下第一次退出，把托管子进程收干净再真正退出。
+  // 之前只 closeDatabase()，子进程完全靠"父进程没了系统顺手收"，
+  // Windows 上并不保证，退出后常留下一堆孤儿服务继续占着端口。
+  e.preventDefault()
+  quitCleaned = true
   isQuitting = true
-  try {
-    closeDatabase()
-  } catch (e) {
-    slog(`before-quit error: ${(e as Error).message}`)
-  }
+  void (async () => {
+    try {
+      await serviceManager?.stopAll()
+    } catch (e) {
+      slog(`stopAll error: ${(e as Error).message}`)
+    }
+    try {
+      closeDatabase()
+    } catch (e) {
+      slog(`before-quit error: ${(e as Error).message}`)
+    }
+    app.quit()
+  })()
 })

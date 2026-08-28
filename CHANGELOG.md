@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.1 (2026-08-28) — Token 口径对齐社区实现（准确性修复）
+
+### 修复
+
+- **Token 统计口径全面对齐社区开源实现（codeburn / better-ccusage / skiplevel / ccusage）**
+  - **ZCode（`~/.zcode/cli/db/db.sqlite` 的 `model_usage`）**：`input_tokens` 为全量 prompt（含缓存命中/写入，OpenAI 风格），改为 `fresh = input - cache_read - cache_creation` 后再按 `input` 价计费，`cache_creation` / `cache_read` 单独按缓存价计费；遗漏的 `reasoning_tokens` 计入 `output`，时间戳优先 `completed_at`；校验口径与 codeburn `zcode.ts: fresh = input - cached - created` 完全一致，实测案例 100 = 36 fresh + 64 cached 不再被重复按原价计费（成本虚高 30-90% 已修复）
+  - **Codex（`~/.codex/sessions/**/rollout-*.jsonl`）**：`cached_input_tokens` / `cache_write_input_tokens` 均为 `input_tokens` 子集，按 `fresh = input - cached - cache_write` 计费；新增整文件有状态解析 `parseCodexSession`——模型以 `turn_context.model` 为权威（兜底 `info.model` / `model_context_window`），`last_token_usage` 优先、缺失时按 `total_token_usage` 增量差值并处理累计回退/分叉重放；`reasoning_output_tokens` 已含于 `output` 不重复加；口径与 skiplevel `schema-notes-codex.md` / codeburn `codex.ts` 一致
+  - **Claude Code（`~/.claude/projects/**/*.jsonl`）**：`cache_creation` 拆 5m / 1h 双桶——`ephemeral_5m_input_tokens` 按 1.25×、`ephemeral_1h_input_tokens` 按 2× 计费（ccusage#899，1h 占多数时旧单价低估约 60%）；定价表新增 `cache_write_1h`（Opus 30 / Sonnet 6 / Haiku 1.6），`calcCost` 支持双桶
+  - **OpenCode（`~/.local/share/opencode/opencode.db`）**：`tokens.reasoning` 计入 `output`，`cost` 曾漏算 `cache.read` 导致成本低 2-3 倍（issue #28494），改为优先按定价重算、仅定价缺失时回退到库内 `cost`；存储由 `fresh+cache` 归一化改为 `fresh` 统一存储，避免与 ZCode/Codex 的 inclusive 口径混淆
+  - **OMP（`~/.omp/agent/sessions/**/*.jsonl`）**：同 Opencode 改为 `fresh` 存储，成本分桶保持一致
+  - **DSH（`~/.dsh/sessions/**/session.jsonl.zstd`）**：`inputTokens` 同为全量，改为 `fresh = input - cacheRead`
+  - **聚合层（`storage.ts`）**：所有源统一为 `fresh` 存储后，`total_tokens / by_agent / by_model / by_day / timeline / recap` 的 `SUM` 统一为 `input + cached + output`（与 ccusage `totalTokens = input+cacheCreate+cacheRead+output` 一致），`cache_hit_ratio = cached / (fresh+cached)` 不再双计缓存
+- **性能与正确性**：`readZcodeDb` 补 `reasoning_tokens` / `completed_at` 字段；`readOpenCodeDb` 去双 `LIKE '%...%'` 全表扫（已改为 `time_created >= ?` + 索引）；ZCode 扫描保留 `model_usage` 为唯一权威源（rollout 文件仅作兜底，扫描后被 DB 全删全写覆盖，杜绝重复）
+- **定价表**：新增 `GLM-5.2` / `GLM-5.1` / `glm-5p1` 别名（codeburn `BUILTIN_ALIASES`），Claude 全系补 `cache_write_1h`；`priceFor` 模糊匹配保留，缺失模型回退 0
+
+### 验证
+
+- `npm run typecheck` / `npm run lint`（0 errors）通过；与 codeburn 提供的 ZCode 真实用例（36 fresh + 64 cached）及 Claude 5m/1h 示例对齐，ZCode 成本不再虚高，Claude 1h 缓存成本已按 2× 结算
+
 ## v0.4.0 (2026-08-28) — 薅羊毛页
 
 ### 新增

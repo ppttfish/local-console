@@ -138,7 +138,7 @@ async function runCommand(c: string, args: string[]): Promise<void> {
     case 'rm': {
       const target = resolve(args[0])
       if (!target) die(`未找到服务：${args[0]}`)
-      svc.delete(target.id)
+      await svc.delete(target.id)
       console.log(`已删除 ${target.name}`)
       return
     }

@@ -3,7 +3,6 @@
  */
 import { ipcMain, dialog, shell, type BrowserWindow, app } from 'electron'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
 import { getLogDir } from '../utils/paths.js'
 import { IpcChannels } from '../../shared/ipc-channels.js'
 import { ServiceManager } from '../services/service-manager.js'
@@ -18,7 +17,8 @@ import {
   listDistinctAgents,
   listSessions
 } from '../plugins/builtin/token-usage/storage.js'
-import { UsageScanner } from '../plugins/builtin/token-usage/scanner.js'
+import { usageScanner } from '../plugins/builtin/token-usage/scanner.js'
+import { subscriptionRefresher as subRefresher } from '../plugins/builtin/token-usage/refresh.js'
 import {
   ensureSubscriptionSchema,
   listSubscriptions,
@@ -29,13 +29,10 @@ import {
   type CreateSubscriptionInput,
   type UpdateSubscriptionInput
 } from '../plugins/builtin/token-usage/subscriptions.js'
-import { SubscriptionRefresher } from '../plugins/builtin/token-usage/refresh.js'
 import { listProviderMetas } from '../plugins/builtin/token-usage/providers/index.js'
 import { discoverOpencodeCredentials } from '../plugins/builtin/token-usage/opencode-auth.js'
 import { openLocalUrl } from '../utils/open-external.js'
-import type { AppState, PortSnapshot, ServiceState } from '@shared/types'
-let usageScanner: UsageScanner | null = null
-const subRefresher = new SubscriptionRefresher()
+import type { AppState } from '@shared/types'
 
 export function registerIpcHandlers(
   svc: ServiceManager,
@@ -53,8 +50,9 @@ export function registerIpcHandlers(
     const { id, ...patch } = input as { id: string } & Record<string, unknown>
     return svc.update(id, patch as Parameters<typeof svc.update>[1])
   })
-  ipcMain.handle(IpcChannels.ServiceDelete, (_e, id: string) => {
-    svc.delete(id)
+  ipcMain.handle(IpcChannels.ServiceDelete, async (_e, id: string) => {
+    // delete 内部要先停进程，必须等它完成，否则 UI 上条目已消失、进程还在跑
+    await svc.delete(id)
     return { ok: true }
   })
   ipcMain.handle(IpcChannels.ServiceStart, (_e, id: string) =>
@@ -82,6 +80,12 @@ export function registerIpcHandlers(
   )
   ipcMain.handle(IpcChannels.ServiceClearLogs, (_e, id: string) => {
     log.clear(id)
+    // 文件被清空了，ServiceManager 里记的字节数也要归零
+    svc.resetLogCounter(id)
+    return { ok: true }
+  })
+  ipcMain.handle(IpcChannels.ServiceResetLogCounter, (_e, id: string) => {
+    svc.resetLogCounter(id)
     return { ok: true }
   })
 
@@ -103,19 +107,8 @@ export function registerIpcHandlers(
 
   // ===== State =====
   svc.setPortProvider(() => port.snapshot())
-  ipcMain.handle(IpcChannels.StateGet, (): AppState => {
-    const services = svc.list() as ServiceState[]
-    const ports = port.snapshot() as PortSnapshot[]
-    const mem = process.memoryUsage()
-    return {
-      services,
-      ports,
-      total_cpu: 0,
-      total_mem: (mem.rss / 1024 / 1024 / 1024) * 10,
-      alerts: [],
-      captured_at: Date.now()
-    }
-  })
+  // 快照口径统一由 ServiceManager 产出，HTTP 链路复用同一个方法
+  ipcMain.handle(IpcChannels.StateGet, (): AppState => svc.snapshotState())
   ipcMain.handle(IpcChannels.PortScan, () => port.snapshot())
 
   // ===== System =====
@@ -163,14 +156,8 @@ export function registerIpcHandlers(
         args.limit ?? 200
       )
   )
-  ipcMain.handle(IpcChannels.UsageRescan, async () => {
-    if (!usageScanner) usageScanner = new UsageScanner()
-    return usageScanner.rescan()
-  })
-  ipcMain.handle(IpcChannels.UsageStatus, () => {
-    if (!usageScanner) usageScanner = new UsageScanner()
-    return usageScanner.getStats()
-  })
+  ipcMain.handle(IpcChannels.UsageRescan, async () => usageScanner.rescan())
+  ipcMain.handle(IpcChannels.UsageStatus, () => usageScanner.getStats())
   ipcMain.handle(IpcChannels.UsageRecap, () => queryRecap())
 
   // ===== 订阅监控 =====
@@ -198,11 +185,7 @@ export function registerIpcHandlers(
   )
 
 
-  // 启动 scheduler
+  // 启动 scheduler / scanner（都是幂等单例，HTTP server 那边再调一次也不会重复起）
   subRefresher.start()
-
-  // 启动 scanner
-  usageScanner = new UsageScanner()
   usageScanner.start()
-  void join
 }

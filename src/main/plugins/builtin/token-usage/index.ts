@@ -11,7 +11,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { Plugin } from '../../types.js'
-import { UsageScanner } from './scanner.js'
+// 用进程级单例：HTTP server 与 IPC 层共用同一套扫描/刷新，避免重复扫描与重复请求
+import { usageScanner as scanner } from './scanner.js'
+import { subscriptionRefresher as subRefresher } from './refresh.js'
 import {
   ensureUsageSchema,
   querySummary,
@@ -32,11 +34,7 @@ import {
   deleteSubscription,
   type CreateSubscriptionInput
 } from './subscriptions.js'
-import { SubscriptionRefresher } from './refresh.js'
 import { listProviderMetas } from './providers/index.js'
-
-const scanner = new UsageScanner()
-const subRefresher = new SubscriptionRefresher()
 
 export const tokenUsagePlugin: Plugin = {
   id: 'token-usage',

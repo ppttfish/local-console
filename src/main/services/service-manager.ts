@@ -6,10 +6,11 @@ import { join, basename } from 'node:path'
 import {
   existsSync,
   mkdirSync,
-  appendFileSync,
-  statSync,
+  createWriteStream,
+  renameSync,
   writeFileSync,
-  readFileSync
+  readFileSync,
+  type WriteStream
 } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import {
@@ -20,14 +21,14 @@ import {
   deleteServiceRow,
   reorderServices,
   insertRunStart,
+  updateRunPid,
   updateRunEnd,
   type ServiceRow
 } from './db.js'
 import { EventBus } from './event-bus.js'
-import { LogStreamer } from './log-streamer.js'
-import { attachToSessionJob } from '../utils/proc-tree.js'
-import { pidAlive } from './proc-info.js'
+import { pidAlive, pidMemoryMb } from './proc-info.js'
 import type {
+  AppState,
   ServiceState,
   ServiceStatus,
   TriggerSource,
@@ -50,19 +51,30 @@ interface RunningProc {
   trigger: TriggerSource
   /** 用户主动停止中：退出码非 0 也不算 failed（Windows taskkill 强杀退出码是 1） */
   stopRequested?: boolean
+  /** 日志写入流；轮转期间短暂为 null，此时写入进 pending */
+  logStream: WriteStream | null
+  /** 当前日志文件已写入字节数（内存计数，避免每次写盘都 statSync） */
+  logBytes: number
+  /** 轮转窗口内攒下的待写内容 */
+  pending: string[]
 }
 
+/** 单个日志文件超过这个大小就轮转为 <id>.log.1，重新开始写 */
 const LOG_MAX_BYTES = 2 * 1024 * 1024
-const LOG_KEEP_BYTES = 1 * 1024 * 1024
+/** 日志被清空后到轮转重建之前，允许攒这么多待写内容，超出直接丢弃 */
+const LOG_PENDING_MAX = 64 * 1024
 const STARTUP_GRACE_MS = 1500
+/** 配了端口的服务：等端口真正监听的上限。超时进程仍活着则降级为 running 并告警 */
+const STARTUP_PORT_TIMEOUT_MS = 30_000
+const STARTUP_PORT_POLL_MS = 500
 const STOP_GRACE_MS = 5000
 const RESTART_DELAY_MS = 500
 
 export class ServiceManager {
   private procs = new Map<string, RunningProc>()
   private statuses = new Map<string, ServiceStatus>()
+  private lastExitCode = new Map<string, number | null>()
   private bus: EventBus
-  private logStreamer: LogStreamer
   private paths: ServiceManagerPaths
   /** 端口快照提供者（由运行时注入 PortScanner.snapshot），用于合并 listening 信息 */
   private portProvider: (() => PortSnapshot[]) | null = null
@@ -70,7 +82,6 @@ export class ServiceManager {
   constructor(bus: EventBus, paths: ServiceManagerPaths) {
     this.bus = bus
     this.paths = paths
-    this.logStreamer = new LogStreamer(bus, paths.logsDir)
   }
 
   /** 在 PortScanner 就绪后注入，供 toState 合并端口占用信息 */
@@ -79,7 +90,6 @@ export class ServiceManager {
   }
 
   async start(): Promise<void> {
-    await this.logStreamer.start()
     for (const s of listServices()) {
       this.statuses.set(s.id, 'stopped')
     }
@@ -87,16 +97,49 @@ export class ServiceManager {
 
   async shutdown(): Promise<void> {
     await this.stopAll()
-    await this.logStreamer.stop()
+  }
+
+  /**
+   * 构造一次完整的应用状态快照。
+   * IPC 与 HTTP 两条链路共用，避免两边各写一份、指标口径再分叉。
+   */
+  snapshotState(): AppState {
+    const services = this.list()
+    let totalMem = 0
+    for (const s of services) {
+      if (s.mem_mb !== null) totalMem += s.mem_mb
+    }
+    return {
+      services,
+      ports: this.portProvider?.() ?? [],
+      total_mem_mb: Math.round(totalMem * 10) / 10,
+      alerts: [],
+      captured_at: Date.now()
+    }
   }
 
   list(): ServiceState[] {
-    return listServices().map((s) => this.toState(s))
+    const rows = listServices()
+    // 内存要批量查（一次 wmic），不能在 toState 里逐条查 —— 那样每查一个
+    // PID 就把共享缓存覆盖掉，后面的服务全部查不到
+    const mem = pidMemoryMb(this.managedPids())
+    return rows.map((s) => this.toState(s, mem))
   }
 
   get(id: string): ServiceState | null {
     const s = getService(id)
-    return s ? this.toState(s) : null
+    if (!s) return null
+    const proc = this.procs.get(s.id)
+    const mem = proc?.pid ? pidMemoryMb([proc.pid]) : null
+    return this.toState(s, mem ?? undefined)
+  }
+
+  private managedPids(): number[] {
+    const out: number[] = []
+    for (const p of this.procs.values()) {
+      if (p.pid !== null) out.push(p.pid)
+    }
+    return out
   }
 
   create(input: {
@@ -133,10 +176,13 @@ export class ServiceManager {
     return s ? this.toState(s) : null
   }
 
-  delete(id: string): void {
-    void this.stop(id, 'system')
+  async delete(id: string): Promise<void> {
+    // 必须等进程真的停了再删记录：原来是 fire-and-forget，
+    // 条目先消失、进程还在跑，端口也还占着，UI 上就再也收不到它。
+    await this.stop(id, 'system')
     deleteServiceRow(id)
     this.statuses.delete(id)
+    this.lastExitCode.delete(id)
   }
 
   reorder(ids: string[]): void {
@@ -160,7 +206,8 @@ export class ServiceManager {
       mkdirSync(this.paths.logsDir, { recursive: true })
     }
     const logPath = join(this.paths.logsDir, `${id}.log`)
-    writeFileSync(logPath, `--- ${new Date().toISOString()} start ---\n`)
+    const header = `--- ${new Date().toISOString()} start ---\n`
+    writeFileSync(logPath, header)
     const commandIssue = diagnoseCommand(s.command)
     if (commandIssue) {
       return {
@@ -207,21 +254,38 @@ export class ServiceManager {
       startedAt: Date.now(),
       runId,
       logPath,
-      trigger
+      trigger,
+      logStream: null,
+      logBytes: Buffer.byteLength(header),
+      pending: []
     }
     this.procs.set(id, proc)
+    this.openLogStream(proc)
 
     if (pid !== null) {
-      void attachToSessionJob(pid).catch(() => undefined)
+      // pid 要等 spawn 之后才拿得到，回填到 run_history，否则历史记录里全是 NULL
+      updateRunPid(runId, pid)
     }
 
-    child.stdout?.on('data', (buf: Buffer) => this.appendLog(proc, buf))
-    child.stderr?.on('data', (buf: Buffer) =>
-      this.appendLog(proc, buf, true)
-    )
+    child.stdout?.on('data', (buf: Buffer) => {
+      this.appendLog(proc, buf)
+      this.bus.emit_event({
+        type: 'service:log',
+        service_id: id,
+        text: buf.toString('utf8')
+      })
+    })
+    child.stderr?.on('data', (buf: Buffer) => {
+      this.appendLog(proc, buf)
+      this.bus.emit_event({
+        type: 'service:log',
+        service_id: id,
+        text: `[err] ${buf.toString('utf8')}`
+      })
+    })
 
     child.on('error', (err) => {
-      appendFileSync(logPath, `[error] ${err.message}\n`)
+      this.appendLog(proc, `[error] ${err.message}\n`)
       this.bus.emit_event({
         type: 'alert',
         level: 'error',
@@ -231,11 +295,10 @@ export class ServiceManager {
 
     child.on('exit', (code, signal) => {
       const exitCode = code ?? (signal ? -1 : 0)
-      appendFileSync(
-        logPath,
-        `--- exit code=${exitCode} signal=${signal} ---\n`
-      )
+      this.appendLog(proc, `--- exit code=${exitCode} signal=${signal} ---\n`)
+      this.closeLogStream(proc)
       updateRunEnd(runId, exitCode)
+      this.lastExitCode.set(id, exitCode)
       this.procs.delete(id)
       const finalStatus: ServiceStatus =
         code === 0 || signal === 'SIGTERM' || proc.stopRequested
@@ -266,6 +329,35 @@ export class ServiceManager {
 
     if (earlyExit || !this.procs.has(id)) {
       return { ok: false, error: '进程启动后立即退出，请检查命令' }
+    }
+
+    // 进程活着 ≠ 服务可用：shell 包装下 1.5s 时真正的服务进程往往还在
+    // 初始化，端口远未监听，UI 若此时标 running 会显示假"运行中"。
+    // 配了端口的服务等端口真正监听再标 running，让状态与实际可用对齐。
+    const wantPort = s.port
+    if (wantPort !== null && this.portProvider) {
+      const deadline = Date.now() + STARTUP_PORT_TIMEOUT_MS
+      let listening = false
+      while (Date.now() < deadline) {
+        if (!this.procs.has(id)) {
+          // 等待期间进程退出，exit 回调已写日志并置 stopped/failed
+          return { ok: false, error: '进程在启动过程中退出，请查看服务日志' }
+        }
+        if (this.portProvider().some((p) => p.port === wantPort)) {
+          listening = true
+          break
+        }
+        await new Promise<void>((r) => setTimeout(r, STARTUP_PORT_POLL_MS))
+      }
+      if (!listening) {
+        // 超时但进程仍在：可能服务不监听该端口（或端口填错），不再阻塞，
+        // 按旧逻辑标 running 并提示，避免卡死在"启动中"
+        this.bus.emit_event({
+          type: 'alert',
+          level: 'warn',
+          message: `${s.name} 进程已启动，但端口 ${wantPort} 超过 ${STARTUP_PORT_TIMEOUT_MS / 1000} 秒仍未监听，请检查服务日志`
+        })
+      }
     }
 
     this.setStatus(id, 'running')
@@ -299,6 +391,14 @@ export class ServiceManager {
       ok: boolean
       error?: string
     }>()
+    let settled = false
+    const finish = (r: { ok: boolean; error?: string }): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(killTimer)
+      clearTimeout(hardTimer)
+      resolve(r)
+    }
     const killTimer = setTimeout(() => {
       try {
         if (process.platform === 'win32' && pid !== null) {
@@ -307,13 +407,15 @@ export class ServiceManager {
           child.kill('SIGKILL')
         }
       } catch (e) {
-        resolve({ ok: false, error: String(e) })
+        finish({ ok: false, error: String(e) })
       }
     }, STOP_GRACE_MS)
-    child.once('exit', () => {
-      clearTimeout(killTimer)
-      resolve({ ok: true })
-    })
+    // 兜底：强制杀之后还没等到 exit 事件（句柄丢失 / 僵尸进程）就别再挂着了，
+    // 否则这个 IPC 调用会永久 pending，UI 上的按钮永远转圈
+    const hardTimer = setTimeout(() => {
+      finish({ ok: true })
+    }, STOP_GRACE_MS + 5000)
+    child.once('exit', () => finish({ ok: true }))
     try {
       if (process.platform === 'win32' && pid !== null) {
         spawn('taskkill', ['/pid', String(pid), '/t'], { shell: false })
@@ -321,8 +423,7 @@ export class ServiceManager {
         child.kill('SIGTERM')
       }
     } catch (e) {
-      clearTimeout(killTimer)
-      resolve({ ok: false, error: String(e) })
+      finish({ ok: false, error: String(e) })
     }
     return promise
   }
@@ -347,30 +448,89 @@ export class ServiceManager {
     this.statuses.set(id, status)
   }
 
-  private appendLog(proc: RunningProc, buf: Buffer, isErr = false): void {
-    const text = buf.toString('utf8')
+  // ========== 日志写入 ==========
+
+  private openLogStream(proc: RunningProc): void {
     try {
-      appendFileSync(proc.logPath, text)
-      try {
-        const sz = statSync(proc.logPath).size
-        if (sz > LOG_MAX_BYTES) {
-          const data = readFileSync(proc.logPath, 'utf8')
-          writeFileSync(proc.logPath, data.slice(-LOG_KEEP_BYTES))
-        }
-      } catch {
-        // ignore truncation
-      }
+      const s = createWriteStream(proc.logPath, { flags: 'a' })
+      s.on('error', () => {
+        // 磁盘满 / 文件被外部占用：别让流错误冒成未捕获异常把主进程带崩
+      })
+      proc.logStream = s
     } catch {
-      // ignore write failure
+      proc.logStream = null
     }
-    this.bus.emit_event({
-      type: 'service:log',
-      service_id: proc.serviceId,
-      text: isErr ? `[err] ${text}` : text
-    })
   }
 
-  private toState(s: ServiceRow): ServiceState {
+  private closeLogStream(proc: RunningProc): void {
+    try {
+      proc.logStream?.end()
+    } catch {
+      // ignore
+    }
+    proc.logStream = null
+  }
+
+  /**
+   * 日志轮转：当前文件改名成 <id>.log.1，重新起一个空文件。
+   *
+   * 旧实现是「读整个 2MB 文件再写回最后 1MB」，一次同步读写 1~2MB，
+   * 高频输出的服务会周期性卡住主进程。rename 是元数据操作，成本恒定。
+   */
+  private rotateLog(proc: RunningProc): void {
+    const old = proc.logStream
+    proc.logStream = null
+
+    const reopen = (): void => {
+      try {
+        renameSync(proc.logPath, `${proc.logPath}.1`)
+      } catch {
+        // 改不动就继续往原文件写，总比丢日志强
+      }
+      this.openLogStream(proc)
+      proc.logBytes = 0
+      const pending = proc.pending
+      proc.pending = []
+      for (const chunk of pending) this.appendLog(proc, chunk)
+    }
+
+    if (old) {
+      try {
+        old.end(reopen)
+      } catch {
+        reopen()
+      }
+    } else {
+      reopen()
+    }
+  }
+
+  /** 日志被 UI 清空后，内存里的字节计数要跟着归零，否则会提前触发轮转 */
+  resetLogCounter(id: string): void {
+    const proc = this.procs.get(id)
+    if (!proc) return
+    proc.logBytes = 0
+    proc.pending = []
+  }
+
+  private appendLog(proc: RunningProc, chunk: string | Buffer): void {
+    const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+    const bytes = Buffer.byteLength(text)
+
+    if (proc.logStream) {
+      proc.logStream.write(text)
+      proc.logBytes += bytes
+      if (proc.logBytes > LOG_MAX_BYTES) this.rotateLog(proc)
+    } else if (proc.pending.length === 0 && bytes < LOG_PENDING_MAX) {
+      // 轮转窗口（流关闭 → 重开）很短，攒一下再补写，不直接丢
+      proc.pending.push(text)
+    }
+  }
+
+  private toState(
+    s: ServiceRow,
+    mem?: Map<number, number>
+  ): ServiceState {
     const proc = this.procs.get(s.id)
     let listening = false
     let portPid: number | null = null
@@ -394,7 +554,8 @@ export class ServiceManager {
       listening,
       port_occupied_pid: portPid,
       port_process_name: portProcessName,
-      last_exit_code: null
+      last_exit_code: this.lastExitCode.get(s.id) ?? null,
+      mem_mb: proc?.pid ? (mem?.get(proc.pid) ?? null) : null
     }
   }
 

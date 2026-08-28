@@ -13,11 +13,13 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
   await store.bootstrap()
-  unsub = window.lcp.onStateChanged((s) => store.applyState(s))
-  // 主进程没主动推送数据，每 2 秒轮询拉一次
+  // 主进程会在服务启停、端口变化时主动推快照，这里的轮询只是兜底：
+  // 推送不可用（web 模式）或窗口重建时数据不会彻底停更。
+  unsub = window.lcp.onStateChanged((s) => store.applyState(s as never))
   pollTimer = setInterval(() => {
+    if (document.hidden) return
     void store.refresh()
-  }, 2000)
+  }, 15_000)
 })
 
 onUnmounted(() => {

@@ -22,6 +22,9 @@ const api = {
   getServiceLogs: (id: string, tail = 300) =>
     invoke(IpcChannels.ServiceLogs, { id, tail }),
   clearServiceLogs: (id: string) => invoke(IpcChannels.ServiceClearLogs, id),
+  /** 清空日志后把主进程侧的内存字节计数归零，免得紧接着触发一次轮转 */
+  resetLogCounter: (id: string) =>
+    invoke(IpcChannels.ServiceResetLogCounter, id),
 
   // 项目识别
   detectProject: (cwd: string) => invoke(IpcChannels.ProjectDetect, cwd),

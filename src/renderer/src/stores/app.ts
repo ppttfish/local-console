@@ -15,19 +15,77 @@ export interface Toast {
   text: string
 }
 
+/**
+ * 按 id 合并服务列表：内容相同的条目沿用旧对象引用。
+ * 2 秒一次的快照里绝大多数服务状态没变，让 Vue 的 props 比较直接命中跳过。
+ */
+function mergeById(prev: ServiceState[], next: ServiceState[]): ServiceState[] {
+  if (prev.length !== next.length) return next
+  const byId = new Map(prev.map((s) => [s.id, s]))
+  let allSame = true
+  const out = next.map((s) => {
+    const old = byId.get(s.id)
+    if (!old) {
+      allSame = false
+      return s
+    }
+    // 运行中的服务 uptime_sec 每轮都在变，会自然产生新对象 —— 这是对的，
+    // 卡片上要显示实时运行时长；已停止的服务则沿用旧引用，跳过重渲染
+    if (sameService(old, s)) return old
+    allSame = false
+    return s
+  })
+  return allSame ? prev : out
+}
+
+function sameService(a: ServiceState, b: ServiceState): boolean {
+  return (
+    a.status === b.status &&
+    a.pid === b.pid &&
+    a.uptime_sec === b.uptime_sec &&
+    a.listening === b.listening &&
+    a.port_occupied_pid === b.port_occupied_pid &&
+    a.port_process_name === b.port_process_name &&
+    a.last_exit_code === b.last_exit_code &&
+    a.mem_mb === b.mem_mb &&
+    a.updated_at === b.updated_at &&
+    a.name === b.name &&
+    a.command === b.command &&
+    a.cwd === b.cwd &&
+    a.port === b.port
+  )
+}
+
+function samePorts(a: PortSnapshot[], b: PortSnapshot[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!
+    const y = b[i]!
+    if (
+      x.port !== y.port ||
+      x.pid !== y.pid ||
+      x.process_name !== y.process_name ||
+      x.app_id !== y.app_id ||
+      x.cmd !== y.cmd
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 export const useAppStore = defineStore('app', () => {
   const services = ref<ServiceState[]>([])
   const ports = ref<PortSnapshot[]>([])
-  const totalCpu = ref(0)
-  const totalMem = ref(0)
+  /** 托管进程占用的物理内存合计（MB）；0 表示当前没有可统计的运行中进程 */
+  const totalMemMb = ref(0)
   const alerts = ref<AppState['alerts']>([])
   const capturedAt = ref(0)
   const ready = ref(false)
   const theme = ref<'light' | 'dark' | 'auto'>('auto')
 
-  /** 全局 CPU/内存 30 采样滚动窗口，2s 轮询写入。ServiceCard sparkline 用 */
+  /** 内存占用 30 采样滚动窗口（Monitor 页趋势用） */
   const metricWindow = 30
-  const cpuHistory = ref<number[]>([])
   const memHistory = ref<number[]>([])
 
   // 轻量通知：服务操作失败必须可见，否则按钮像"没反应"
@@ -72,17 +130,19 @@ export const useAppStore = defineStore('app', () => {
     ready.value = true
   }
 
+  /**
+   * 写入新快照。
+   * 主进程现在会主动推状态，加上渲染端轮询，同一个快照可能一秒内来两三次；
+   * 内容没变时逐个字段浅比较后复用旧对象引用，避免每张 ServiceCard
+   * 都因为 props 引用变化重渲染一遍。
+   */
   function applyState(s: AppState): void {
-    services.value = s.services
-    ports.value = s.ports
-    totalCpu.value = s.total_cpu
-    totalMem.value = s.total_mem
+    services.value = mergeById(services.value, s.services)
+    ports.value = samePorts(ports.value, s.ports) ? ports.value : s.ports
+    totalMemMb.value = s.total_mem_mb
     alerts.value = s.alerts
     capturedAt.value = s.captured_at
-    // 推入滚动历史
-    cpuHistory.value.push(s.total_cpu)
-    memHistory.value.push(s.total_mem)
-    if (cpuHistory.value.length > metricWindow) cpuHistory.value.shift()
+    memHistory.value.push(s.total_mem_mb)
     if (memHistory.value.length > metricWindow) memHistory.value.shift()
   }
 
@@ -154,7 +214,10 @@ export const useAppStore = defineStore('app', () => {
     return window.lcp.getServiceLogs(id, tail)
   }
   async function clearLogs(id: string): Promise<unknown> {
-    return window.lcp.clearServiceLogs(id)
+    const r = await window.lcp.clearServiceLogs(id)
+    // 主进程侧的内存字节计数也要归零，否则清空后会很快触发一次轮转
+    await window.lcp.resetLogCounter?.(id)
+    return r
   }
   async function detectProject(cwd: string): Promise<unknown> {
     return window.lcp.detectProject(cwd)
@@ -175,9 +238,7 @@ export const useAppStore = defineStore('app', () => {
   return {
     services,
     ports,
-    totalCpu,
-    totalMem,
-    cpuHistory,
+    totalMemMb,
     memHistory,
     alerts,
     capturedAt,

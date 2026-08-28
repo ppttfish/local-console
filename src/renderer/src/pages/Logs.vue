@@ -77,8 +77,14 @@ async function refresh() {
     return
   }
   try {
-    const r = (await store.getLogs(selectedId.value, tail.value)) as { text: string }
+    const r = (await store.getLogs(selectedId.value, tail.value)) as {
+      text: string
+      unchanged?: boolean
+    }
     if (seq !== reqSeq) return
+    // 日志没变化就什么都不做。原来每 2 秒都整体替换数组、重建上千个 DOM 节点，
+    // 而绝大多数轮询周期内日志根本没动过。
+    if (r.unchanged) return
     const newLines = r.text ? r.text.split('\n') : []
     lines.value = newLines
     lastLineCount = newLines.length

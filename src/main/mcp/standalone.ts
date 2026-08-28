@@ -42,8 +42,6 @@ const log = new LogStreamer(bus, logsDir)
 ensureUsageSchema()
 const usageScanner = new UsageScanner()
 void usageScanner.start()
-await svc.start()
-await port.start()
 
 const server = new McpServer({
   name: 'local-console',
@@ -134,7 +132,7 @@ server.tool(
   async ({ id, name }) => {
     const t = resolveService(id, name)
     if (!t) return textResult(`未找到服务: ${id ?? name}`, true)
-    svc.delete(t.id)
+    await svc.delete(t.id)
     return textResult(`已删除 ${t.name}`)
   }
 )
@@ -208,11 +206,6 @@ function textJson(data: unknown) {
   return textResult(JSON.stringify(data, null, 2))
 }
 
-const transport = new StdioServerTransport()
-await server.connect(transport)
-console.error(
-  `[local-console-mcp] 已连接，PID=${process.pid}，数据目录=${userData}，工具数=${11}`
-)
 
 process.on('SIGINT', async () => {
   await port.stop()
@@ -227,4 +220,23 @@ process.on('SIGTERM', async () => {
   usageScanner.stop()
   closeDatabase()
   process.exit(0)
+})
+
+/**
+ * 主进程是 CJS 输出，不支持顶层 await，把异步初始化包一层。
+ * server.tool 注册是同步的，在上面模块级完成；这里只等进程就绪后连接。
+ */
+async function bootstrap(): Promise<void> {
+  await svc.start()
+  await port.start()
+  const transport = new StdioServerTransport()
+  await server.connect(transport)
+  console.error(
+    `[local-console-mcp] 已连接，PID=${process.pid}，数据目录=${userData}，工具数=${11}`
+  )
+}
+
+void bootstrap().catch((e) => {
+  console.error('[local-console-mcp] 启动失败:', e)
+  process.exit(1)
 })

@@ -11,7 +11,9 @@ export interface ChartTheme {
   textMuted: string
   grid: string
   border: string
+  /** 画布用透明继承卡片底色；surface 是实底色（--card），给 tooltip 文字等需要实色的地方用 */
   background: string
+  surface: string
   primary: string
   warning: string
   success: string
@@ -48,6 +50,7 @@ export function getChartTheme(): ChartTheme {
       grid: readCssVar('--border', '#1f2937'),
       border: readCssVar('--border', '#1f2937'),
       background: 'transparent',
+      surface: readCssVar('--card', '#111827'),
       primary: readCssVar('--primary', '#38bdf8'),
       warning: readCssVar('--warning', '#fbbf24'),
       success: readCssVar('--success', '#34d399'),
@@ -60,6 +63,7 @@ export function getChartTheme(): ChartTheme {
     grid: readCssVar('--border', '#e2e8f0'),
     border: readCssVar('--border', '#e2e8f0'),
     background: 'transparent',
+    surface: readCssVar('--card', '#ffffff'),
     primary: readCssVar('--primary', '#0ea5e9'),
     warning: readCssVar('--warning', '#f59e0b'),
     success: readCssVar('--success', '#10b981'),
@@ -88,12 +92,12 @@ export function buildLegendOptions(t: ChartTheme) {
   }
 }
 
-/** 通用 tooltip 样式 */
+/** 通用 tooltip 样式：底色取文字色的反色（inverted），文字必须用实底色，transparent 会导致字看不见 */
 export function buildTooltipOptions(t: ChartTheme) {
   return {
     backgroundColor: t.text,
-    titleColor: t.background,
-    bodyColor: t.background,
+    titleColor: t.surface,
+    bodyColor: t.surface,
     borderWidth: 0,
     padding: 8,
     cornerRadius: 6,
