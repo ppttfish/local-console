@@ -27,6 +27,12 @@ export class PortScanner {
   private cache: PortSnapshot[] = []
   private bus: EventBus
   private servicesByPort = new Map<number, { id: string; name: string }>()
+  /** PID → 进程信息。enrich 结果缓存：监听端口集合没变时直接复用，避免反复 spawn PowerShell */
+  private procCache = new Map<number, ProcessInfo>()
+  private lastPidKey = ''
+  /** 防重入：一轮 scan（含 PowerShell 富化，可达数秒）没结束时跳过后续 tick，
+   *  否则 2s interval 会不断叠出新的 PowerShell 进程把 CPU 打满 */
+  private scanning = false
 
   constructor(bus: EventBus) {
     this.bus = bus
@@ -60,13 +66,38 @@ export class PortScanner {
   }
 
   private async scan(): Promise<void> {
+    if (this.scanning) return
+    this.scanning = true
     try {
       const rows = await this.runNetstat()
-      const enriched = await this.enrich(rows)
-      this.cache = enriched
-      this.bus.emit_event({ type: 'port:changed', ports: enriched })
+      const pids = [...new Set(rows.map((r) => r.pid))].sort((a, b) => a - b)
+      const pidKey = pids.join(',')
+      if (pidKey !== this.lastPidKey) {
+        // PID 集合有变化才值得做重量级的进程信息富化（PowerShell 单次约 1.5s）；
+        // 全量重查而非增量，顺带修正 PID 被系统复用导致的脏缓存
+        const info = await this.getProcessInfo(pids)
+        this.procCache.clear()
+        for (const [k, v] of info) this.procCache.set(k, v)
+        this.lastPidKey = pidKey
+      }
+      this.cache = rows.map((r) => {
+        const i = this.procCache.get(r.pid) ?? { name: '?', cmd: '', cwd: null }
+        const svc = this.servicesByPort.get(r.port)
+        return {
+          port: r.port,
+          pid: r.pid,
+          process_name: i.name,
+          cwd: i.cwd,
+          cmd: i.cmd,
+          app_id: svc?.id ?? null,
+          app_name: svc?.name ?? null
+        }
+      })
+      this.bus.emit_event({ type: 'port:changed', ports: this.cache })
     } catch {
       // 静默
+    } finally {
+      this.scanning = false
     }
   }
 
@@ -93,47 +124,21 @@ export class PortScanner {
     return promise
   }
 
-  private async enrich(rows: NetstatRow[]): Promise<PortSnapshot[]> {
-    const pids = [...new Set(rows.map((r) => r.pid))].join(',')
-    const info = await this.getProcessInfo(pids)
-    return rows.map((r) => {
-      const i = info.get(r.pid) ?? { name: '?', cmd: '', cwd: null }
-      const svc = this.servicesByPort.get(r.port)
-      return {
-        port: r.port,
-        pid: r.pid,
-        process_name: i.name,
-        cwd: i.cwd,
-        cmd: i.cmd,
-        app_id: svc?.id ?? null,
-        app_name: svc?.name ?? null
-      }
-    })
-  }
-
-  private getProcessInfo(
-    pids: string
-  ): Promise<Map<number, ProcessInfo>> {
+  /** 单次 PowerShell 批量拉取所有目标 PID 的进程信息（WMI 全量枚举 + 过滤），
+   *  耗时与 PID 数量基本无关（~1.5s）；原先逐 PID 发 WMI Filter 查询，10 个就要 4s+ */
+  private getProcessInfo(pids: number[]): Promise<Map<number, ProcessInfo>> {
     const { promise, resolve } = Promise.withResolvers<Map<number, ProcessInfo>>()
-    if (!pids) {
+    if (pids.length === 0) {
       resolve(new Map())
       return promise
     }
     const script = `
-$pids = @(${pids})
-$out = @()
-foreach ($p in $pids) {
-  try {
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction Stop
-    $exe = $proc.ExecutablePath
-    $cwd = if ($exe) { Split-Path -Parent $exe } else { $null }
-    $cmd = if ($proc.CommandLine) {
-      $proc.CommandLine.Substring(0, [Math]::Min(200, $proc.CommandLine.Length))
-    } else { '' }
-    $out += [pscustomobject]@{ Pid = $p; Name = $proc.Name; Cwd = $cwd; Cmd = $cmd }
-  } catch {}
-}
-$out | ConvertTo-Json -Compress
+$targets = @(${pids.join(',')})
+Get-CimInstance -ClassName Win32_Process | Where-Object { $targets -contains $_.ProcessId } | ForEach-Object {
+  $cwd = if ($_.ExecutablePath) { Split-Path -Parent $_.ExecutablePath } else { $null }
+  $cmd = if ($_.CommandLine) { $_.CommandLine.Substring(0, [Math]::Min(200, $_.CommandLine.Length)) } else { '' }
+  [pscustomobject]@{ Pid = $_.ProcessId; Name = $_.Name; Cwd = $cwd; Cmd = $cmd }
+} | ConvertTo-Json -Compress
 `
     const p = spawn(
       'powershell.exe',
@@ -145,13 +150,14 @@ $out | ConvertTo-Json -Compress
     p.on('close', () => {
       const map = new Map<number, ProcessInfo>()
       try {
-        const arr = JSON.parse(out.trim() || '[]') as Array<{
+        const parsed = JSON.parse(out.trim() || '[]')
+        const arr = Array.isArray(parsed) ? parsed : [parsed]
+        for (const r of arr as Array<{
           Pid: number
           Name: string
           Cmd: string
           Cwd: string | null
-        }>
-        for (const r of arr) {
+        }>) {
           map.set(r.Pid, { name: r.Name, cmd: r.Cmd || '', cwd: r.Cwd ?? null })
         }
       } catch {
