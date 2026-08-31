@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.2 (2026-08-31) — dsh 统计修复、订阅全息卡片、多实例与并发安全
+
+### 修复
+
+- **dsh 子代理会话重复统计**：dsh 子代理（`origin: subagent`）会把父会话 seed 历史原样复制进自己的 session 文件，同一 usage 事件（seq+time 相同）出现在两个文件里被统计两遍；dsh 扫描改为跨文件按 `seq@time` 去重，实测消除约 700 万 token 虚高
+- **dsh input 口径修正**：dsh 的 `totalTokens = inputTokens + outputTokens + cacheReadTokens`，即 `inputTokens` 本身为 fresh（不含缓存命中），不再误扣 `cacheRead`——此前大上下文会话（cacheRead > input）的 input 被扣成 0，fresh 少算、缓存命中率虚高（97.3% → 真实 95.4%）
+- **多进程并发重建防翻倍**：Electron 主进程与 MCP standalone 共享 state.db，`replaceUsageBySourceFile` / `replaceUsageByAgent` 把「删旧 + 插新」包进同一写事务（SQLite 写锁串行化），DB 连接加 `busy_timeout`，杜绝并发扫描交错导致用量翻倍
+- **HTTP 端口占用容错**：监听失败只记日志，不再把整个主进程拖崩
+
+### 新增
+
+- **订阅监控全息卡片（SubscriptionHoloCard.vue）**：虹彩箔 + 指针光晕 + 3D 倾斜的视觉重构，业务口径（quotaTone / primaryWindow / primaryPct）不变
+- **HTTP 端口可配置**：`LCP_PORT` / `PORT` 环境变量覆盖默认 9600，便于多实例共存；托盘「打开 Web 端」同步跟随
+- **rescan 异步化**：`/api/usage/rescan` 立即返回 `{ started }`，全量重建在后台扫描队列执行，前端轮询 `status.scanning` / `last_scan_at` 判断完成，请求不再卡 20-25s
+
+### 验证
+
+- `npm run typecheck` 通过；dsh 修复用真实会话数据核对（191 行 → 113 行，总量 1963 万 → 1288 万）
+
 ## v0.4.1 (2026-08-28) — Token 口径对齐社区实现（准确性修复）
 
 ### 修复
