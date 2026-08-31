@@ -218,9 +218,11 @@ function scrollToBottom() {
 
         <!-- 日志流：纯 div 渲染。逐行 Motion 在 1000 行时开销过大（每行一个动画组件实例），
              新行动效改为 CSS 动画只挂最后 3 行，key 用 idx 按位置复用、class 不变时不重播 -->
+        <!-- data-selectable / overscroll-contain：日志要能选中复制；滚到顶/底时不把滚动传给外层 -->
         <div
           ref="logEl"
-          class="flex-1 overflow-auto bg-muted/40 p-4 font-mono text-[12px] leading-[1.6] whitespace-pre-wrap break-all"
+          data-selectable
+          class="flex-1 overflow-auto overscroll-contain bg-muted/40 p-4 font-mono text-[12px] leading-[1.6] whitespace-pre-wrap break-all"
         >
           <div
             v-for="(line, idx) in lines"

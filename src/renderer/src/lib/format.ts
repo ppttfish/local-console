@@ -34,6 +34,16 @@ export function fmtCny(v: number): string {
   return '约¥' + (v * CNY_RATE).toFixed(2)
 }
 
+/** 相对时间：「12 秒前 / 3 分钟前 / 2 小时前 / 5 天前 / 从未」 */
+export function fmtRelative(ts: number | null | undefined): string {
+  if (!ts) return '从未'
+  const s = Math.floor((Date.now() - ts) / 1000)
+  if (s < 60) return s + ' 秒前'
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前'
+  if (s < 86400) return Math.floor(s / 3600) + ' 小时前'
+  return Math.floor(s / 86400) + ' 天前'
+}
+
 export function fmtDate(ts: number | null | undefined): string {
   if (!ts) return '—'
   const d = new Date(ts)

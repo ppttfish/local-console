@@ -13,10 +13,11 @@ import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSession, read
 import {
   ensureUsageSchema,
   insertUsageBatch,
+  replaceUsageBySourceFile,
+  replaceUsageByAgent,
   getCursor,
   upsertCursor,
   resetAllCursors,
-  deleteUsageBySourceFile,
   countLegacyRows,
   minAtForAgent,
   type UsageRow,
@@ -43,6 +44,8 @@ export interface ScannerStats {
   last_rewrite: { file: string; rows: number; at: number } | null
   /** source_file 为空的历史行数；> 0 时建议手动重扫一次以打上来源标记 */
   legacy_rows: number
+  /** 当前是否有扫描正在执行。rescan 异步化后，前端轮询 status 靠它判断「扫描中」/「完成」 */
+  scanning: boolean
 }
 
 interface DiscoveredFile {
@@ -85,8 +88,8 @@ export class UsageScanner extends EventEmitter {
     return this.stats
   }
 
-  private enqueueScan(): Promise<void> {
-    const next = this.scanQueue.then(() => this.runScanAll())
+  private enqueueScan(force = false): Promise<void> {
+    const next = this.scanQueue.then(() => this.runScanAll(force))
     // 队列吞掉错误，避免一个失败的扫描把后面的所有扫描都挡死
     this.scanQueue = next.catch(() => undefined)
     return next
@@ -101,19 +104,37 @@ export class UsageScanner extends EventEmitter {
     this.opencodeLastMtime = null
     this.dshFingerprint = null
     this.zcodeDbLastMtime = null
-    // 排队等前面的扫描跑完，确保这次重建一定会执行
-    await this.enqueueScan()
+    // 排队等前面的扫描跑完，确保这次重建一定会执行。
+    // force=true：禁用 cursor / mtime 捷径强制全量重建。原因是 state.db 由主进程与
+    // MCP standalone 共享，rescan 清空 cursor 后 MCP 的扫描可能抢先重建 cursor，
+    // 主进程的扫描全部命中「文件未变」捷径而 rows=0，数据恢复就完全依赖 MCP 时机。
+    await this.enqueueScan(true)
     return this.stats
   }
 
-  private async runScanAll(): Promise<void> {
+  /**
+   * 异步触发重扫：清空 + 全量重建在后台队列里执行，调用方立即拿到 { started }。
+   * HTTP 路由用它，避免 rescan 的 20-25s 同步重建把请求和事件循环一起卡死；
+   * 前端随后轮询 status.scanning / last_scan_at 判断完成。MCP 的
+   * pws_rescan_agents 仍走阻塞版 rescan()，保持「等结果」的语义。
+   */
+  startRescan(): { started: boolean } {
+    void this.rescan().catch((e) => {
+      this.stats.errors++
+      console.error('[token-usage] rescan 失败:', e)
+    })
+    return { started: true }
+  }
+
+  private async runScanAll(force = false): Promise<void> {
     let totalNew = 0
+    this.stats.scanning = true
     try {
       const files = this.discoverJsonl()
       this.stats.files_scanned = files.length
       for (const f of files) {
         try {
-          totalNew += await this.scanJsonlFile(f)
+          totalNew += await this.scanJsonlFile(f, force)
         } catch (e) {
           this.stats.errors++
           console.warn(`[token-usage] 扫描 ${f.path} 失败:`, e)
@@ -122,19 +143,19 @@ export class UsageScanner extends EventEmitter {
       // zcode 权威用量源：db.sqlite 的 model_usage 保留全部会话完整用量，
       // rollout model-io 文件被 ZCode 压缩/清理后这里是唯一留存
       try {
-        totalNew += this.scanZcodeDb()
+        totalNew += this.scanZcodeDb(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 zcode db 失败:', e)
       }
       try {
-        totalNew += await this.scanOpenCode()
+        totalNew += await this.scanOpenCode(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 opencode.db 失败:', e)
       }
       try {
-        totalNew += this.scanDsh()
+        totalNew += this.scanDsh(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 dsh sessions 失败:', e)
@@ -143,6 +164,7 @@ export class UsageScanner extends EventEmitter {
       this.stats.errors++
       console.error('[token-usage] scanAll 异常:', e)
     }
+    this.stats.scanning = false
     this.stats.rows_inserted += totalNew
     this.stats.last_scan_at = Date.now()
     this.stats.legacy_rows = countLegacyRows()
@@ -157,7 +179,7 @@ export class UsageScanner extends EventEmitter {
    * 用量，且再也补不回来（游标已经越过那些行）。所以每次扫描都要先校验
    * 「已经入库的那段前缀」是否还是原来的内容，变了就整文件重建。
    */
-  private async scanJsonlFile(file: DiscoveredFile): Promise<number> {
+  private async scanJsonlFile(file: DiscoveredFile, force = false): Promise<number> {
     const st = statSync(file.path)
     const cursor = getCursor(file.path)
     // size/mtime 捷径只在「有指纹基线」时才可信。
@@ -166,7 +188,10 @@ export class UsageScanner extends EventEmitter {
     // 但 lines_seen 已经越过文件末尾的脏状态（旧版按行号增量在文件被压缩重写后
     // 留下的），走捷径会跳过重建，重写窗口里的数据继续永久丢失。
     // 没有基线时强制读一次文件：正常续读并建立 head_hash，之后恢复捷径。
+    // force=true（rescan）时禁用捷径：cursor 刚被 resetAllCursors 清空，若 MCP 进程
+    // 抢先重建了 cursor，此处会误判「文件未变」而跳过，导致重建不出数据。
     if (
+      !force &&
       cursor &&
       cursor.head_hash !== null &&
       cursor.file_size === st.size &&
@@ -186,17 +211,17 @@ export class UsageScanner extends EventEmitter {
     // codex 走整文件有状态解析（turn_context 模型 + total 增量），不能按行增量 slice
     // 否则会丢模型上下文且 total 差值错乱。此处若文件有任何变动则全量重建
     if (file.agent === 'codex') {
-      const alreadyDone = cursor &&
+      const alreadyDone = !force &&
+        cursor &&
         cursor.head_hash !== null &&
         cursor.file_size === st.size &&
         cursor.file_mtime === Math.floor(st.mtimeMs)
       if (alreadyDone) return 0
       const codexRows = parseCodexSession(file.path, file.sessionId)
-      // 全删全写避免残留（file 追加后旧行仍在库里，重复会翻倍）
-      deleteUsageBySourceFile(file.path, file.agent, file.sessionId)
+      // 原子「删旧+插新」避免多进程并发重建翻倍
       const toInsert: UsageRow[] = codexRows.map(r => ({ ...r, source_file: file.path }))
+      replaceUsageBySourceFile(file.path, file.agent, file.sessionId, toInsert)
       if (toInsert.length > 0) {
-        insertUsageBatch(toInsert)
         this.stats.by_agent[file.agent] =
           (this.stats.by_agent[file.agent] ?? 0) + toInsert.length
       }
@@ -218,9 +243,11 @@ export class UsageScanner extends EventEmitter {
 
     // 已入库前缀是否被改写？head_hash 为 NULL 是升级前的老游标，
     // 没有基线可比，先按原逻辑续读，这一轮写完指纹后后续就能检测了。
+    // force=true（rescan）时 cursor 刚被清空，若被 MCP 抢先重建则不可信，
+    // 一律从头解析 + 原子重建。
     let startFrom = 0
     let rebuilt = false
-    if (cursor) {
+    if (cursor && !force) {
       const shrunk = lines.length < cursor.lines_seen
       const drifted =
         cursor.head_hash !== null &&
@@ -228,8 +255,7 @@ export class UsageScanner extends EventEmitter {
       if (!shrunk && !drifted) {
         startFrom = cursor.lines_seen
       } else {
-        // 全删全写：source_file 是干净的删除边界（session_id 可能被行内字段覆盖）
-        deleteUsageBySourceFile(file.path, file.agent, file.sessionId)
+        // 重建：删旧+插新由 replaceUsageBySourceFile 原子完成
         rebuilt = true
       }
     }
@@ -246,7 +272,15 @@ export class UsageScanner extends EventEmitter {
       const row = parser(line, ctx)
       if (row) newRows.push({ ...row, source_file: file.path })
     }
-    if (newRows.length > 0) {
+    if (rebuilt || force) {
+      // 原子「删旧+插新」：文件被重写或 rescan 强制重建都走 replace，
+      // 避免多进程（主进程 / MCP）并发重建同一文件时翻倍
+      replaceUsageBySourceFile(file.path, file.agent, file.sessionId, newRows)
+      if (newRows.length > 0) {
+        this.stats.by_agent[file.agent] =
+          (this.stats.by_agent[file.agent] ?? 0) + newRows.length
+      }
+    } else if (newRows.length > 0) {
       insertUsageBatch(newRows)
       this.stats.by_agent[file.agent] =
         (this.stats.by_agent[file.agent] ?? 0) + newRows.length
@@ -281,12 +315,13 @@ export class UsageScanner extends EventEmitter {
    * 每次模型调用的完整用量（token 四元组 + started_at），是唯一可靠来源。
    * 与 dsh / opencode 同策略：db 文件 mtime 变了就全删全写。
    */
-  private scanZcodeDb(): number {
+  private scanZcodeDb(force = false): number {
     const dbPath = join(homedir(), '.zcode', 'cli', 'db', 'db.sqlite')
     if (!existsSync(dbPath)) return 0
     const st = statSync(dbPath)
     const mtime = Math.floor(st.mtimeMs)
     if (
+      !force &&
       this.zcodeDbLastMtime &&
       this.zcodeDbLastMtime.path === dbPath &&
       this.zcodeDbLastMtime.mtime === mtime
@@ -298,8 +333,6 @@ export class UsageScanner extends EventEmitter {
       this.zcodeDbLastMtime = { path: dbPath, mtime }
       return 0
     }
-    // 全删全写：zcode 唯一权威来源，顺带清掉 rollout / 旧 transcript 的历史残留
-    getDb().prepare("DELETE FROM agent_usage WHERE agent = 'zcode'").run()
     const usageRows: UsageRow[] = rows.map((r) => ({
       agent: 'zcode',
       model: r.model,
@@ -314,21 +347,22 @@ export class UsageScanner extends EventEmitter {
       meta: null,
       source_file: dbPath
     }))
-    if (usageRows.length > 0) {
-      insertUsageBatch(usageRows)
-      this.stats.by_agent['zcode'] =
-        (this.stats.by_agent['zcode'] ?? 0) + usageRows.length
-    }
+    // 原子「删该 agent 旧行 + 插新」：zcode 唯一权威来源，顺带清掉 rollout 残留；
+    // 多进程并发重建时不翻倍
+    replaceUsageByAgent('zcode', usageRows)
+    this.stats.by_agent['zcode'] =
+      (this.stats.by_agent['zcode'] ?? 0) + usageRows.length
     this.zcodeDbLastMtime = { path: dbPath, mtime }
     return usageRows.length
   }
 
-  private async scanOpenCode(): Promise<number> {
+  private async scanOpenCode(force = false): Promise<number> {
     const dbPath = join(homedir(), '.local', 'share', 'opencode', 'opencode.db')
     if (!existsSync(dbPath)) return 0
     const st = statSync(dbPath)
     const mtime = Math.floor(st.mtimeMs)
     if (
+      !force &&
       this.opencodeLastMtime &&
       this.opencodeLastMtime.path === dbPath &&
       this.opencodeLastMtime.mtime === mtime
@@ -340,8 +374,6 @@ export class UsageScanner extends EventEmitter {
       this.opencodeLastMtime = { path: dbPath, mtime, count: 0 }
       return 0
     }
-    // opencode 没有稳定 request_id；用全删全写简化去重
-    getDb().prepare('DELETE FROM agent_usage WHERE agent = ?').run('opencode')
     const usageRows: UsageRow[] = rows.map((r) => ({
       agent: 'opencode',
       model: r.model,
@@ -358,18 +390,17 @@ export class UsageScanner extends EventEmitter {
       meta: null,
       source_file: dbPath
     }))
-    if (usageRows.length > 0) {
-      insertUsageBatch(usageRows)
-      this.stats.by_agent['opencode'] =
-        (this.stats.by_agent['opencode'] ?? 0) + usageRows.length
-    }
+    // opencode 没有稳定 request_id；原子「删旧+插新」简化去重，多进程并发安全
+    replaceUsageByAgent('opencode', usageRows)
+    this.stats.by_agent['opencode'] =
+      (this.stats.by_agent['opencode'] ?? 0) + usageRows.length
     this.opencodeLastMtime = { path: dbPath, mtime, count: rows.length }
     this.stats.opencode_messages = rows.length
     return usageRows.length
   }
 
   /** dsh：~/.dsh/sessions 下的 session.jsonl.zstd，指纹变化才全删全写 */
-  private scanDsh(): number {
+  private scanDsh(force = false): number {
     const root = join(homedir(), '.dsh', 'sessions')
     if (!existsSync(root)) return 0
     const files: Array<{ path: string; sessionId: string }> = []
@@ -389,20 +420,28 @@ export class UsageScanner extends EventEmitter {
       parts.push(`${f.path}:${st.size}:${Math.floor(st.mtimeMs)}`)
     }
     const fingerprint = parts.sort().join('|')
-    if (this.dshFingerprint === fingerprint) return 0
+    if (!force && this.dshFingerprint === fingerprint) return 0
 
-    getDb().prepare('DELETE FROM agent_usage WHERE agent = ?').run('dsh')
     const all: UsageRow[] = []
+    // dsh 子代理会话（origin:subagent）会复制父会话的 seed 历史，usage 事件（seq+time）
+    // 原样出现在两个文件里，跨文件按 seq@time 去重，否则同一请求被统计两遍
+    const seen = new Set<string>()
     for (const f of files) {
       try {
-        const rows = parseDshSession(f.path, f.sessionId)
-        for (const r of rows) all.push({ ...r, source_file: f.path })
+        for (const r of parseDshSession(f.path, f.sessionId)) {
+          const key = `${r.seq ?? ''}@${r.at}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          const { seq, ...row } = r
+          all.push({ ...row, source_file: f.path })
+        }
       } catch (e) {
         this.stats.errors++
         console.warn(`[token-usage] 解析 dsh 会话 ${f.path} 失败:`, e)
       }
     }
-    if (all.length > 0) insertUsageBatch(all)
+    // 原子「删 dsh 旧行 + 插新」
+    replaceUsageByAgent('dsh', all)
     this.dshFingerprint = fingerprint
     this.stats.by_agent['dsh'] = (this.stats.by_agent['dsh'] ?? 0) + all.length
     this.stats.dsh_sessions = files.length
@@ -526,7 +565,8 @@ function freshStats(): ScannerStats {
     opencode_flavor: detectOpenCodeFlavor(),
     rewrites: 0,
     last_rewrite: null,
-    legacy_rows: 0
+    legacy_rows: 0,
+    scanning: false
   }
 }
 

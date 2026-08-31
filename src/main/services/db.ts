@@ -101,6 +101,10 @@ export function initDatabase(userDataDir?: string): void {
   dbPath = nextPath
   db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
+  // 多进程共享同一 state.db（Electron 主进程 / HTTP server / MCP standalone），
+  // WAL 下并发写会撞 SQLITE_BUSY；busy_timeout 让写等待而不是立即抛错，
+  // 否则 rescan / 订阅刷新偶发 500，前端表现为「重新扫描失败」
+  db.pragma('busy_timeout = 5000')
   db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
   db.exec(SCHEMA)

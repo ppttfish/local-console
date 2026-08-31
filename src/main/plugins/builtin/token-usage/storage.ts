@@ -125,6 +125,48 @@ export function deleteUsageBySourceFile(
   return r.changes
 }
 
+const USAGE_INSERT_SQL = `INSERT INTO agent_usage (agent, model, input_tokens, output_tokens, cached_tokens, cache_read_tokens, cache_write_tokens, cost_usd, at, session_id, meta, source_file)
+     VALUES (@agent, @model, @input_tokens, @output_tokens, @cached_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd, @at, @session_id, @meta, @source_file)`
+
+/**
+ * 原子「删旧 + 插新」（按源文件）。
+ * 整文件重建路径用：如果「删」和「插」分两次提交，多进程（Electron 主进程 / MCP
+ * standalone）并发重建同一文件时可能交错导致用量翻倍；包进同一个写事务后由 SQLite
+ * 写锁串行化，最终只保留最后一次写入的结果。rescan 的强制重建必须走这个。
+ */
+export function replaceUsageBySourceFile(
+  filePath: string,
+  agent: Platform,
+  sessionId: string,
+  rows: UsageRow[]
+): number {
+  if (rows.length === 0) {
+    return deleteUsageBySourceFile(filePath, agent, sessionId)
+  }
+  const stmt = prepare(USAGE_INSERT_SQL)
+  const tx = getDb().transaction(() => {
+    deleteUsageBySourceFile(filePath, agent, sessionId)
+    for (const r of rows) stmt.run(r)
+  })
+  tx()
+  return rows.length
+}
+
+/** 原子「删该 agent 全部旧行 + 插新」（zcode / opencode / dsh 全量重建路径） */
+export function replaceUsageByAgent(agent: Platform, rows: UsageRow[]): number {
+  if (rows.length === 0) {
+    prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
+    return 0
+  }
+  const stmt = prepare(USAGE_INSERT_SQL)
+  const tx = getDb().transaction(() => {
+    prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
+    for (const r of rows) stmt.run(r)
+  })
+  tx()
+  return rows.length
+}
+
 /** 某个 agent 当前最早一条的时间戳；没有数据返回 0（表示从头扫） */
 export function minAtForAgent(agent: Platform): number {
   const r = prepare('SELECT MIN(at) AS m FROM agent_usage WHERE agent = ?')

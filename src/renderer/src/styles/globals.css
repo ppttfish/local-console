@@ -1,8 +1,8 @@
 /*
  * Tailwind v4 + shadcn-vue 设计令牌
  *  - 暗色判定走 [data-theme="dark"] 或 system + data-mode=auto
- *  - 老 CSS（index.css）继续用旧变量；新组件吃新令牌；迁移完最后删 index.css
  *  - 浅色走 shadcn 语义令牌；深色在 :root[data-theme="dark"] 下覆盖
+ *  - 旧 index.css 已全部迁移到令牌并删除，这里是唯一的全局样式入口
  */
 @import "tailwindcss";
 @import "tw-animate-css";
@@ -64,6 +64,9 @@
 /* ============== 浅色令牌（默认） ============== */
 :root,
 :root[data-theme="light"] {
+  /* 让浏览器原生控件（滚动条 / 下拉 / 自动填充 / 日期选择器）走浅色 */
+  color-scheme: light;
+
   --background: #ffffff;
   --foreground: #0f172a;
 
@@ -103,6 +106,9 @@
 
 /* ============== 暗色令牌 ============== */
 :root[data-theme="dark"] {
+  /* 同上，暗色：不设的话原生下拉、自动填充、滚动条仍是亮色 */
+  color-scheme: dark;
+
   --background: #0b1220;
   --foreground: #e2e8f0;
 
@@ -159,11 +165,67 @@ html {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* 原生表单控件（checkbox / radio / range）吃主题主色，而不是浏览器默认蓝 */
+  accent-color: var(--primary);
+  -webkit-tap-highlight-color: transparent;
+  /* Firefox / 标准属性兜底（chromium 走下面的 ::-webkit-scrollbar） */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--muted-foreground) 30%, transparent)
+    transparent;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
+}
+
+/* 选中文字跟随主色，而不是系统默认蓝 */
+::selection {
+  background: color-mix(in srgb, var(--primary) 26%, transparent);
+  color: var(--foreground);
+}
+
+@layer base {
+  /* 主内容区常驻滚动条槽位：长短页切换时内容不会左右跳一下 */
+  main {
+    scrollbar-gutter: stable;
+  }
+
+  /* 桌面应用观感：按钮 / 导航文字不参与拖拽选中，输入与代码区保持可选 */
+  button,
+  [role="button"],
+  label,
+  summary {
+    user-select: none;
+  }
+  input,
+  textarea,
+  pre,
+  code,
+  [data-selectable] {
+    user-select: text;
+  }
+
+  /* 表格与统计数字等宽对齐，轮询刷新时不左右抖 */
+  table,
+  [data-numeric] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 标题换行更均衡，避免出现孤字行 */
+  h1,
+  h2 {
+    text-wrap: balance;
+  }
+
+  /* 键盘焦点兜底：shadcn 组件自带 ring，这里只补没写 ring 的原生交互元素 */
+  :where(a, button, [role="button"], summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  :where([class*="focus-visible:ring"]):focus-visible {
+    outline: none;
+  }
 }
 
 /* 滚动条收一收，跟设计稿简约风匹配 */

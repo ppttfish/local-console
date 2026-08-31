@@ -171,8 +171,11 @@ function buildTray(): void {
       },
       { type: 'separator' },
       {
-        label: '打开 Web 版 (127.0.0.1:9600)',
-        click: () => shell.openExternal('http://127.0.0.1:9600')
+        label: `打开 Web 版 (127.0.0.1:${process.env['LCP_PORT'] ?? process.env['PORT'] ?? 9600})`,
+        click: () =>
+          shell.openExternal(
+            `http://127.0.0.1:${process.env['LCP_PORT'] ?? process.env['PORT'] ?? 9600}`
+          )
       },
       {
         label: '打开数据目录',
@@ -280,7 +283,8 @@ app.whenReady().then(async () => {
       : join(process.resourcesPath, 'renderer')
     await startHttpServer({
       userData,
-      port: 9600,
+      // 端口可被 LCP_PORT / PORT 环境变量覆盖，便于多实例共存（如另一份构建已在 9600）
+      port: Number(process.env['LCP_PORT'] ?? process.env['PORT'] ?? 9600),
       rendererDir,
       svc: serviceManager,
       portScanner,

@@ -20,8 +20,19 @@ function post<T = unknown>(path: string, body?: unknown): Promise<T> {
     method: body === undefined ? 'GET' : 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body)
-  }).then((r) => {
-    if (!r.ok) throw new Error(`${path} -> ${r.status}`)
+  }).then(async (r) => {
+    if (!r.ok) {
+      // 优先展示服务端返回的具体错误（如 500 时 { error: "database is locked" }），
+      // 否则退化为「路径 -> 状态码」，避免失败原因不可见
+      let msg = `${path} -> ${r.status}`
+      try {
+        const j = (await r.json()) as { error?: unknown }
+        if (j && typeof j.error === 'string' && j.error) msg = j.error
+      } catch {
+        // 响应体不是 JSON 或已消费，忽略
+      }
+      throw new Error(msg)
+    }
     return r.json() as Promise<T>
   })
 }
@@ -63,7 +74,7 @@ export function installWebBridge(): void {
     usageModels: () => post('/api/usage/models'),
     usageAgents: () => post('/api/usage/agents'),
     usageSessions: (args) => post('/api/usage/sessions', args),
-    usageRescan: () => post('/api/usage/rescan'),
+    usageRescan: () => post('/api/usage/rescan', {}),
     usageStatus: () => post('/api/usage/status'),
     usageRecap: () => post('/api/usage/recap'),
 

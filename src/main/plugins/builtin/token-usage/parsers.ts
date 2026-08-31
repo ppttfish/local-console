@@ -399,7 +399,7 @@ function parseClaudeLine(line: string, ctx: ParseContext): ParsedUsageRow | null
 export function parseDshSession(
   filePath: string,
   fallbackSessionId: string
-): ParsedUsageRow[] {
+): Array<ParsedUsageRow & { seq?: number }> {
   if (!existsSync(filePath)) return []
   let raw: Uint8Array
   try {
@@ -407,7 +407,7 @@ export function parseDshSession(
   } catch {
     return [] // 损坏的压缩流直接跳过，下次 mtime 变了会重试
   }
-  const rows: ParsedUsageRow[] = []
+  const rows: Array<ParsedUsageRow & { seq?: number }> = []
   let sessionId = fallbackSessionId
   let model = 'unknown'
   for (const line of new TextDecoder().decode(raw).split('\n')) {
@@ -423,7 +423,8 @@ export function parseDshSession(
     const data = (e['data'] ?? {}) as Record<string, unknown>
     const t = e['type']
     if (t === 'session') {
-      sessionId = strOr(data['id'] as string | undefined, sessionId)
+      // id 在事件顶层，不在 data 里
+      sessionId = strOr(e['id'] as string | undefined, sessionId)
     } else if (t === 'request/context') {
       model = strOr(data['model'] as string | undefined, model)
     } else if (t === 'request/header') {
@@ -435,12 +436,12 @@ export function parseDshSession(
       if (!chunk || chunk['type'] !== 'usage') continue
       const usage = chunk['usage'] as Record<string, unknown> | undefined
       if (!usage) continue
-      const rawInput = numOr(usage['inputTokens'], 0)
+      const input = numOr(usage['inputTokens'], 0)
       const output = numOr(usage['outputTokens'], 0)
       const cacheRead = numOr(usage['cacheReadTokens'], 0)
-      if (rawInput + output + cacheRead === 0) continue
-      // DeepSeek Harness 的 inputTokens 同样为全量 prompt（含缓存），与 ZCode 同口径需扣减
-      const input = Math.max(0, rawInput - cacheRead)
+      if (input + output + cacheRead === 0) continue
+      // dsh 的 totalTokens = inputTokens + outputTokens + cacheReadTokens，
+      // 即 inputTokens 为 fresh（不含缓存命中），与 omp 同口径，无需扣减
       rows.push({
         agent: 'dsh',
         model,
@@ -452,7 +453,8 @@ export function parseDshSession(
         cost_usd: calcCost(model, input, output, cacheRead, 0),
         at: numOr(e['time'], Date.now()),
         session_id: sessionId,
-        meta: null
+        meta: null,
+        seq: typeof e['seq'] === 'number' ? e['seq'] : undefined
       })
     }
   }

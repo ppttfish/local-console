@@ -352,9 +352,9 @@ const statusDotClass = computed(() => {
       </DropdownMenu>
     </div>
 
-    <!-- 命令条 -->
+    <!-- 命令条：select-text 保证命令仍可选中复制（全局默认把非交互文本设为不可选） -->
     <div
-      class="cursor-default truncate rounded-md border border-border bg-muted px-2.5 py-1.5 font-mono text-[10.5px] leading-relaxed text-muted-foreground"
+      class="cursor-default truncate rounded-md border border-border bg-muted px-2.5 py-1.5 font-mono text-[10.5px] leading-relaxed text-muted-foreground select-text"
       :title="cmdTitle"
     >
       {{ service.command }}

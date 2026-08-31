@@ -3,9 +3,9 @@
  * Token 用量 + 订阅监控
  *  - 顶部 Tabs：Token 用量 / 订阅监控
  *  - Token 用量：筛选条（平台/时间/粒度/模型）+ 4 KPI + 趋势图 + 平台分布 + 模型分布 + Top 会话
- *  - 订阅监控：Provider 卡片网格（图标 + 状态 + 主百分比 + 进度条 + 窗口明细 + 操作）
+ *  - 订阅监控：Provider 全息卡片网格（虹彩箔 + 指针光晕 + 3D 倾斜，见 SubscriptionHoloCard.vue）
  *  - 图表通过 lib/chartTheme 跟随 data-theme 切换配色
- *  - 业务逻辑零修改（refresh / summary / timeline / sessions / quotaTone / fmtToken 等函数原样保留）
+ *  - 业务逻辑零修改（refresh / summary / timeline / sessions 等函数原样保留）
  */
 import {
   ref,
@@ -16,18 +16,18 @@ import {
   onBeforeUnmount
 } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Motion } from 'motion-v'
-import {
-  Plus,
-  RefreshCw,
-  RotateCw,
-  Pencil,
-  Trash2,
-  AlertTriangle
-} from 'lucide-vue-next'
+import { Plus, RefreshCw, AlertTriangle } from 'lucide-vue-next'
 import AddSubscriptionDialog from '@/components/AddSubscriptionDialog.vue'
 import RecapPanel from '@/components/RecapPanel.vue'
-import { fmtToken, fmtTokenShort, fmtCost, fmtCny } from '@/lib/format'
+import SubscriptionHoloCard from '@/components/SubscriptionHoloCard.vue'
+import { useAppStore } from '@/stores/app'
+import {
+  fmtToken,
+  fmtTokenShort,
+  fmtCost,
+  fmtCny,
+  fmtRelative
+} from '@/lib/format'
 import {
   Card,
   CardContent,
@@ -36,7 +36,6 @@ import {
   CardDescription,
   Button,
   Badge,
-  Progress,
   Tabs,
   TabsList,
   TabsTrigger,
@@ -57,7 +56,6 @@ import {
   DialogFooter as DCFooter,
   DialogTitle as DCTitle
 } from '@/components/ui'
-import { springCard } from '@/lib/motion'
 import {
   getChartTheme,
   watchTheme,
@@ -67,13 +65,7 @@ import {
   type ChartTheme
 } from '@/lib/chartTheme'
 import { cn } from '@/lib/utils'
-import type {
-  QuotaSnapshot,
-  QuotaWindow,
-  Sub,
-  ConfigField,
-  ProviderMeta
-} from '@/types/subscription'
+import type { Sub, ProviderMeta } from '@/types/subscription'
 import { Line, Doughnut, Bar } from 'vue-chartjs'
 import {
   Chart as ChartJS,
@@ -155,6 +147,8 @@ interface Status {
   last_rewrite: { file: string; rows: number; at: number } | null
   /** source_file 为空的历史行数 */
   legacy_rows: number
+  /** 是否有扫描正在后台执行（rescan 异步化后判断「扫描中」/「完成」） */
+  scanning?: boolean
 }
 
 const AGENT_LABEL_STATIC: Record<string, string> = {
@@ -199,60 +193,12 @@ const timeline = ref<TimelinePoint[]>([])
 const sessions = ref<Session[]>([])
 const status = ref<Status | null>(null)
 const loading = ref(false)
+const store = useAppStore()
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 function providerMetaOf(id: string): ProviderMeta | undefined {
   return providerMetas.value.find((p) => p.id === id)
 }
-function subStatus(s: Sub): 'active' | 'stale' | 'error' {
-  if (s.lastError) return 'error'
-  if (!s.lastRefreshAt) return 'stale'
-  return Date.now() - s.lastRefreshAt <= 10 * 60 * 1000 ? 'active' : 'stale'
-}
-
-const SUB_STATUS_TEXT: Record<'active' | 'stale' | 'error', string> = {
-  active: '同步正常',
-  stale: '未更新',
-  error: '获取失败'
-}
-function subStatusText(s: Sub): string {
-  return SUB_STATUS_TEXT[subStatus(s)]
-}
-
-function quotaTone(pct: number | null | undefined): 'ok' | 'warn' | 'danger' {
-  const p = pct ?? 0
-  if (p >= 90) return 'danger'
-  if (p >= 70) return 'warn'
-  return 'ok'
-}
-
-function primaryWindow(s: Sub): QuotaWindow | null {
-  let best: QuotaWindow | null = null
-  for (const w of s.lastSnapshot?.windows ?? []) {
-    if (typeof w.usedPct !== 'number') continue
-    if (!best || (w.usedPct as number) > (best.usedPct as number)) best = w
-  }
-  return best
-}
-
-function primaryPct(s: Sub): number | null {
-  const snap = s.lastSnapshot
-  if (!snap) return null
-  const pw = primaryWindow(s)
-  if (pw) return pw.usedPct
-  return typeof snap.usedPct === 'number' ? snap.usedPct : null
-}
-
-function primaryResetAt(s: Sub): number | null {
-  const snap = s.lastSnapshot
-  if (!snap) return null
-  const pw = primaryWindow(s)
-  if (pw?.resetAt) return pw.resetAt
-  if (snap.windowEnd) return snap.windowEnd
-  const anyWithReset = (snap.windows ?? []).find((w) => w.resetAt)
-  return anyWithReset?.resetAt ?? null
-}
-
 const route = useRoute()
 const router = useRouter()
 const tab = ref<'usage' | 'recap' | 'subscriptions'>(
@@ -280,60 +226,6 @@ const confirmOpen = computed({
     if (!v) confirmDelete.value = null
   }
 })
-
-function hasQuotaData(s: Sub): boolean {
-  const snap = s.lastSnapshot
-  if (!snap) return false
-  return (snap.windows?.length ?? 0) > 0 || typeof snap.usedPct === 'number'
-}
-
-function primaryTitle(s: Sub): string {
-  const wins = s.lastSnapshot?.windows ?? []
-  if (wins.length === 0) return '总体额度'
-  if (wins.length === 1) return `${wins[0].label} 窗口`
-  const pw = primaryWindow(s)
-  return pw ? `${pw.label} 窗口 · 用量最高` : '各窗口用量'
-}
-
-function pctText(p: number | null): string {
-  return p === null ? '—' : p.toFixed(1) + '%'
-}
-
-function barWidth(pct: number | null | undefined, minPx = 0): string {
-  if (typeof pct !== 'number' || pct <= 0) return '0%'
-  return Math.min(100, Math.max(minPx, pct)) + '%'
-}
-
-function quotaSublineLeft(s: Sub): string | null {
-  const snap = s.lastSnapshot
-  if (!snap) return null
-  if (typeof snap.used === 'number') {
-    const lim = typeof snap.limit === 'number' ? snap.limit : null
-    return lim
-      ? `已用 ${fmtToken(snap.used)} / ${fmtToken(lim)}`
-      : `已用 ${fmtToken(snap.used)}`
-  }
-  if (snap.planLabel) return `套餐 ${snap.planLabel}`
-  return null
-}
-
-function fmtDur(ms: number): string {
-  const totalMin = Math.floor(Math.abs(ms) / 60000)
-  const d = Math.floor(totalMin / 1440)
-  const h = Math.floor((totalMin % 1440) / 60)
-  const m = totalMin % 60
-  if (d > 0) return h > 0 ? `${d}天${h}小时` : `${d}天`
-  if (h > 0) return m > 0 ? `${h}小时${m}分` : `${h}小时`
-  return `${Math.max(1, m)}分钟`
-}
-
-function fmtResetIn(ts: number | null | undefined): string {
-  if (!ts) return ''
-  const diff = ts - Date.now()
-  if (!Number.isFinite(diff)) return ''
-  if (diff <= 0) return '即将重置'
-  return `${fmtDur(diff)}后重置`
-}
 
 async function refreshSubs() {
   try {
@@ -457,13 +349,36 @@ async function refresh() {
   }
 }
 
+const rescanning = ref(false)
+const RESCAN_POLL_MS = 1500
+const RESCAN_TIMEOUT_MS = 5 * 60 * 1000
 async function rescan() {
-  loading.value = true
+  if (rescanning.value) return
+  rescanning.value = true
   try {
+    // 异步触发：POST 立即返回 { started }，后台全量重建约 20-25s
+    const before = (await window.lcp.usageStatus()) as Status
+    const beforeAt = before?.last_scan_at ?? 0
     await window.lcp.usageRescan()
+    // 轮询 status 直到「没有扫描在跑 且 上次扫描时间比触发时新」，再拉数据
+    const deadline = Date.now() + RESCAN_TIMEOUT_MS
+    let done = false
+    while (Date.now() < deadline) {
+      const st = (await window.lcp.usageStatus()) as Status
+      if (!st?.scanning && (st?.last_scan_at ?? 0) > beforeAt) {
+        done = true
+        break
+      }
+      await new Promise((r) => setTimeout(r, RESCAN_POLL_MS))
+    }
+    if (!done) throw new Error('扫描超时（5 分钟）')
     await refresh()
+    store.notify('success', '重新扫描完成')
+  } catch (e) {
+    // 失败必须可见，否则按钮像「没反应」
+    store.notify('error', `重新扫描失败：${(e as Error)?.message ?? String(e)}`)
   } finally {
-    loading.value = false
+    rescanning.value = false
   }
 }
 
@@ -707,15 +622,6 @@ function fmtTime(ts: number): string {
   )
 }
 
-function relativeTime(ts: number): string {
-  if (!ts) return '从未'
-  const s = Math.floor((Date.now() - ts) / 1000)
-  if (s < 60) return s + ' 秒前'
-  if (s < 3600) return Math.floor(s / 60) + ' 分钟前'
-  if (s < 86400) return Math.floor(s / 3600) + ' 小时前'
-  return Math.floor(s / 86400) + ' 天前'
-}
-
 const rangeLabel = computed(() => presetLabels[presetRange.value])
 const granularityLabel = computed(() =>
   granularity.value === 'hour' ? '小时' : granularity.value === 'day' ? '日' : '月'
@@ -751,16 +657,6 @@ const modelOptions = computed(() => [
   { value: 'all', label: '全部模型' },
   ...models.value.map((m) => ({ value: m, label: m }))
 ])
-
-function quotaToneToToneClass(
-  t: 'ok' | 'warn' | 'danger'
-): 'text-success' | 'text-warning' | 'text-destructive' {
-  return t === 'ok'
-    ? 'text-success'
-    : t === 'warn'
-      ? 'text-warning'
-      : 'text-destructive'
-}
 </script>
 
 <template>
@@ -773,7 +669,7 @@ function quotaToneToToneClass(
           {{ opencodeLabel }} 消息
           <b>{{ status?.opencode_messages ?? 0 }}</b> 条 · DSH 会话
           <b>{{ status?.dsh_sessions ?? 0 }}</b> 个 · 上次扫描
-          {{ status?.last_scan_at ? relativeTime(status.last_scan_at) : '从未' }}
+          {{ fmtRelative(status?.last_scan_at) }}
         </p>
         <!-- 老数据没有 source_file 标记，文件被重写时只能靠 agent+session_id 兜底回收。
              提示用户重扫一次，把兜底换成精确删除。 -->
@@ -791,11 +687,14 @@ function quotaToneToToneClass(
       </div>
       <div class="flex items-center gap-2">
         <template v-if="tab === 'usage'">
-          <Button :disabled="loading" variant="outline" @click="refresh">
+          <Button :disabled="loading || rescanning" variant="outline" @click="refresh">
             <RefreshCw :class="['size-4', loading && 'animate-spin']" />
             刷新
           </Button>
-          <Button :disabled="loading" @click="rescan">重新扫描</Button>
+          <Button :disabled="loading || rescanning" @click="rescan">
+            <RefreshCw :class="['size-4', rescanning && 'animate-spin']" />
+            {{ rescanning ? '扫描中…' : '重新扫描' }}
+          </Button>
         </template>
         <template v-else-if="tab === 'subscriptions'">
           <Button variant="outline" @click="refreshSubs">刷新列表</Button>
@@ -1183,203 +1082,18 @@ function quotaToneToToneClass(
           </Button>
         </Card>
 
-        <div v-else class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-          <Motion
+        <!-- 全息卡片网格：gap 稍大，避免卡片倾斜/发光时互相遮挡 -->
+        <div v-else class="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
+          <SubscriptionHoloCard
             v-for="s in subs"
             :key="s.id"
-            as-child
-            :initial="{ opacity: 0, y: 8 }"
-            :animate="{ opacity: 1, y: 0 }"
-            :transition="springCard"
-          >
-            <Card class="flex flex-col gap-3 p-4">
-              <div class="flex items-center gap-2.5">
-                <div
-                  class="flex size-8 shrink-0 items-center justify-center rounded-lg text-sm font-bold text-white"
-                  :style="{ background: providerMetaOf(s.provider)?.color || '#64748b' }"
-                >
-                  {{ providerMetaOf(s.provider)?.short || '?' }}
-                </div>
-                <div class="min-w-0 flex-1">
-                  <div class="truncate text-[13.5px] font-semibold" :title="s.displayName">
-                    {{ s.displayName }}
-                  </div>
-                  <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                    <span
-                      :class="[
-                        'size-1.5 shrink-0 rounded-full',
-                        subStatus(s) === 'active' && 'bg-success',
-                        subStatus(s) === 'stale' && 'bg-warning',
-                        subStatus(s) === 'error' && 'bg-destructive',
-                        refreshingIds.has(s.id) && 'animate-pulse opacity-60'
-                      ]"
-                    />
-                    <span class="whitespace-nowrap">
-                      {{ refreshingIds.has(s.id) ? '刷新中…' : subStatusText(s) }}
-                    </span>
-                    <template v-if="providerMetaOf(s.provider)">
-                      <span>·</span>
-                      <span
-                        class="truncate"
-                        :title="providerMetaOf(s.provider)?.label"
-                      >
-                        {{ providerMetaOf(s.provider)?.label }}
-                      </span>
-                    </template>
-                  </div>
-                </div>
-                <div class="flex shrink-0 items-center gap-0.5">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    :disabled="refreshingIds.has(s.id) || !s.enabled"
-                    class="h-7 px-2 text-[11.5px]"
-                    @click="refreshOneSub(s)"
-                  >
-                    <RotateCw
-                      :class="['size-3', refreshingIds.has(s.id) && 'animate-spin']"
-                    />
-                    刷新
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="h-7 px-2 text-[11.5px]"
-                    @click="openEditDialog(s)"
-                  >
-                    <Pencil class="size-3" />
-                    编辑
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="h-7 px-2 text-[11.5px] text-destructive hover:text-destructive"
-                    @click="askDelete(s)"
-                  >
-                    <Trash2 class="size-3" />
-                    删除
-                  </Button>
-                </div>
-              </div>
-
-              <template v-if="s.lastSnapshot && hasQuotaData(s)">
-                <div class="flex flex-col gap-1.5">
-                  <div class="flex items-baseline justify-between gap-2">
-                    <span class="truncate text-[11px] text-muted-foreground">
-                      {{ primaryTitle(s) }}
-                    </span>
-                    <span
-                      v-if="primaryResetAt(s)"
-                      class="shrink-0 text-[11px] tabular-nums text-muted-foreground"
-                    >
-                      {{ fmtResetIn(primaryResetAt(s)) }}
-                    </span>
-                  </div>
-                  <div
-                    :class="[
-                      'text-[28px] font-bold leading-tight tabular-nums tracking-tight',
-                      quotaToneToToneClass(quotaTone(primaryPct(s)))
-                    ]"
-                  >
-                    {{ pctText(primaryPct(s)) }}
-                  </div>
-                  <Progress
-                    :model-value="primaryPct(s) ?? 0"
-                    :tone="quotaTone(primaryPct(s))"
-                  />
-                  <div
-                    v-if="quotaSublineLeft(s) || typeof s.lastSnapshot.remaining === 'number'"
-                    class="mt-1 flex items-baseline justify-between text-[11.5px] text-muted-foreground"
-                  >
-                    <span>{{ quotaSublineLeft(s) ?? '' }}</span>
-                    <span
-                      v-if="typeof s.lastSnapshot.remaining === 'number'"
-                      class="text-success tabular-nums"
-                    >
-                      剩余 {{ fmtToken(s.lastSnapshot.remaining) }}
-                    </span>
-                  </div>
-                </div>
-
-                <div
-                  v-if="(s.lastSnapshot.windows?.length ?? 0) >= 2"
-                  class="flex flex-col gap-2 border-t border-dashed border-border pt-2.5"
-                >
-                  <div class="text-[10.5px] uppercase tracking-wider text-muted-foreground">
-                    各窗口明细
-                  </div>
-                  <div
-                    v-for="w in s.lastSnapshot.windows"
-                    :key="w.label"
-                    :class="[
-                      'grid grid-cols-[minmax(64px,auto)_1fr_44px_auto] items-center gap-2.5 text-[11.5px]',
-                      w === primaryWindow(s) && '[&_.win-label]:text-foreground [&_.win-label]:font-semibold'
-                    ]"
-                  >
-                    <span class="win-label flex items-center gap-1 text-muted-foreground">
-                      {{ w.label }}
-                      <Badge
-                        v-if="w === primaryWindow(s)"
-                        variant="default"
-                        class="px-1.5 py-0 text-[9.5px]"
-                      >
-                        最高
-                      </Badge>
-                    </span>
-                    <div class="h-1.5 overflow-hidden rounded-full bg-muted">
-                      <div
-                        :class="[
-                          'h-full rounded-full transition-all',
-                          quotaTone(w.usedPct) === 'ok' && 'bg-success',
-                          quotaTone(w.usedPct) === 'warn' && 'bg-warning',
-                          quotaTone(w.usedPct) === 'danger' && 'bg-destructive'
-                        ]"
-                        :style="{ width: barWidth(w.usedPct, 3) }"
-                      />
-                    </div>
-                    <span
-                      :class="[
-                        'text-right font-semibold tabular-nums',
-                        quotaToneToToneClass(quotaTone(w.usedPct))
-                      ]"
-                    >
-                      {{ w.usedPct === null ? '—' : Math.round(w.usedPct) + '%' }}
-                    </span>
-                    <span class="text-right text-[10.5px] tabular-nums text-muted-foreground">
-                      {{ fmtResetIn(w.resetAt) }}
-                    </span>
-                  </div>
-                </div>
-              </template>
-              <div v-else class="flex flex-col gap-1.5">
-                <div class="text-[11px] text-muted-foreground">配额状态未知</div>
-                <div class="text-[28px] font-bold leading-tight text-muted-foreground opacity-50">
-                  —
-                </div>
-                <Progress :model-value="0" tone="unknown" />
-                <div class="text-[11.5px] text-muted-foreground">
-                  暂无数据 · 点击「刷新」按钮立即获取
-                </div>
-              </div>
-
-              <div
-                v-if="s.lastError"
-                class="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[11.5px] text-destructive"
-              >
-                {{ s.lastError }}
-              </div>
-
-              <div
-                class="mt-auto flex items-center justify-between gap-2 border-t border-dashed border-border pt-2.5 text-[11px] text-muted-foreground"
-              >
-                <span>
-                  上次刷新
-                  {{ s.lastRefreshAt ? relativeTime(s.lastRefreshAt) : '从未' }}
-                </span>
-                <Badge v-if="!s.enabled" variant="warning">已停用</Badge>
-              </div>
-            </Card>
-          </Motion>
+            :sub="s"
+            :meta="providerMetaOf(s.provider)"
+            :refreshing="refreshingIds.has(s.id)"
+            @refresh="refreshOneSub"
+            @edit="openEditDialog"
+            @delete="askDelete"
+          />
         </div>
       </TabsContent>
     </Tabs>

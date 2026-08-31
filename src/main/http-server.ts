@@ -93,6 +93,10 @@ export async function startHttpServer(opts: {
   runtime = { svc, port: portScanner, log: logStreamer, ownsRuntime }
 
   const server = createServer((req, res) => handle(req, res))
+  server.on('error', (err) => {
+    // 端口被占用（如另一份实例已在跑）不要因此把整个主进程拖崩，仅记日志
+    console.error(`[http] 监听 ${port} 失败：${err.message}`)
+  })
   server.listen(port, '127.0.0.1', () => {
     console.log(`[http] 已启动 http://127.0.0.1:${port}`)
   })
@@ -337,7 +341,14 @@ async function handleApi(
       return json(res, 200, listSessions(filter, limit ?? 200))
     }
     if (pathname === '/api/usage/rescan' && req.method === 'POST') {
-      return json(res, 200, await usageScanner.rescan())
+      try {
+        // 异步触发：立即返回 { started }，全量重建在后台队列执行，
+        // 前端轮询 status.scanning / last_scan_at 判断完成，请求不再卡 20-25s
+        return json(res, 200, usageScanner.startRescan())
+      } catch (e) {
+        console.error('[token-usage] rescan 触发失败:', e)
+        return json(res, 500, { error: (e as Error)?.message ?? String(e) })
+      }
     }
     if (pathname === '/api/usage/status' && req.method === 'GET') {
       return json(res, 200, usageScanner.getStats())
