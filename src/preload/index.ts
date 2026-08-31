@@ -49,6 +49,7 @@ const api = {
   usageAgents: () => invoke(IpcChannels.UsageAgents),
   usageSessions: (args: { filter: unknown; limit?: number }) =>
     invoke(IpcChannels.UsageSessions, args),
+  usageRescan: () => invoke(IpcChannels.UsageRescan),
   usageStatus: () => invoke(IpcChannels.UsageStatus),
   usageRecap: () => invoke(IpcChannels.UsageRecap),
 
