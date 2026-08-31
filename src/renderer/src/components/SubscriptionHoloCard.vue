@@ -10,7 +10,9 @@
  *   5. holo-ring  渐变描边：conic 彩虹 + mask 挖空，只留 1px 边
  *   6. holo-sheen 掠光：hover 时一道斜向白光扫过
  *
- * 交互：指针驱动 --mx/--my/--rot-x/--rot-y，卡片 3D 轻微倾斜，内容层 translateZ 产生景深；
+ * 交互：指针驱动 --mx/--my/--rot-x/--rot-y，卡片 3D 轻微倾斜；
+ *      内容层反向旋转补偿（旋转列表与卡片严格互逆 + 同款过渡），文字始终平行屏幕、
+ *      1:1 渲染——3D 动效不产生非整数缩放，杜绝文字发糊；
  *      prefers-reduced-motion 下关闭倾斜与所有动画。
  *
  * 业务逻辑沿用原订阅卡片的口径（quotaTone / primaryWindow / primaryPct / 重置倒计时等）。
@@ -233,7 +235,7 @@ onBeforeUnmount(() => {
       <div class="holo-sheen" />
     </div>
 
-    <!-- 内容（translateZ 制造景深） -->
+    <!-- 内容（反向补偿旋转，保持平行屏幕） -->
     <div class="holo-content">
       <!-- 头部：Provider 标识 + 状态 + 悬浮操作 -->
       <header class="flex items-start gap-3">
@@ -444,8 +446,7 @@ onBeforeUnmount(() => {
   /* 自身 3D：perspective() 写在 transform 里（perspective 属性只作用于子元素，管不到自己） */
   perspective: 900px;
   transform-style: preserve-3d;
-  transform: perspective(900px) rotateX(var(--rot-x)) rotateY(var(--rot-y))
-    scale(var(--holo-scale, 1));
+  transform: perspective(900px) rotateX(var(--rot-x)) rotateY(var(--rot-y));
   transition:
     transform 0.35s cubic-bezier(0.22, 1, 0.36, 1),
     box-shadow 0.35s ease;
@@ -455,7 +456,6 @@ onBeforeUnmount(() => {
 }
 
 .holo-card:hover {
-  --holo-scale: 1.014;
   box-shadow:
     0 2px 4px rgb(0 0 0 / 0.06),
     0 26px 50px -22px color-mix(in srgb, var(--accent) 55%, transparent),
@@ -610,7 +610,8 @@ onBeforeUnmount(() => {
   }
 }
 
-/* 内容层：抬高产生景深 */
+/* 内容层：反向旋转补偿（旋转列表与卡片严格互逆、同款过渡），
+   文字层始终平行屏幕且 1:1 渲染，3D 倾斜不再让文字发糊 */
 .holo-content {
   position: relative;
   display: flex;
@@ -618,20 +619,22 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 0;
   padding: 16px;
-  transform: translateZ(26px);
-  transform-style: preserve-3d;
+  transform: rotateY(calc(var(--rot-y) * -1))
+    rotateX(calc(var(--rot-x) * -1));
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* Provider 头像：accent 渐变 + 内高光 + 外发光 */
+/* Provider 头像：accent 渐变 + 内高光 + 外发光（38×38 正方形） */
 .holo-avatar {
   position: relative;
   display: flex;
-  size: 38px;
+  width: 38px;
+  height: 38px;
   flex-shrink: 0;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  border-radius: 11px;
+  border-radius: 8px;
   background: linear-gradient(
     145deg,
     var(--accent),
@@ -691,7 +694,8 @@ onBeforeUnmount(() => {
 }
 
 .holo-dot {
-  size: 6px;
+  width: 6px;
+  height: 6px;
   border-radius: 9999px;
   background: currentColor;
   box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);
@@ -788,7 +792,8 @@ onBeforeUnmount(() => {
   position: absolute;
   top: 50%;
   right: 0;
-  size: 7px;
+  width: 7px;
+  height: 7px;
   translate: 0 -50%;
   border-radius: 9999px;
   background: #fff;
