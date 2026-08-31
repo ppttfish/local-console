@@ -93,6 +93,11 @@ ChartJS.register(
   Filler
 )
 
+// 关闭图表入场动画：大数据图表动画毫无信息价值，却在首次进入时让
+// 3 个 canvas 并行逐帧重绘（远程/虚拟显示器会话里 canvas 走软件光栅化，
+// 动画期间能把窗口拖到"未响应"）；关掉后图表立即呈现，渲染成本趋零。
+ChartJS.defaults.animation = false
+
 interface Summary {
   total_tokens: number
   input_tokens: number
