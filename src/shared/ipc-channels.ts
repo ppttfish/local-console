@@ -45,6 +45,7 @@ export const IpcChannels = {
   UsageRescan: 'usage:rescan',
   UsageStatus: 'usage:status',
   UsageRecap: 'usage:recap',
+  UsageBatch: 'usage:batch',
 
   // 订阅监控
   SubList: 'subscription:list',

@@ -3,6 +3,7 @@
  *  每个 parser 返回 UsageRow | null
  */
 import { existsSync, readFileSync } from 'node:fs'
+import { readFile as readFileAsync } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import Database from 'better-sqlite3'
 import { decompress as zstdDecompress } from 'fzstd'
@@ -209,6 +210,10 @@ export function parseCodexSession(filePath: string, fallbackSessionId: string): 
   } catch {
     return []
   }
+  return parseCodexSessionFromContent(content, fallbackSessionId)
+}
+
+export function parseCodexSessionFromContent(content: string, fallbackSessionId: string): ParsedUsageRow[] {
   const lines = content.split('\n')
   const rows: ParsedUsageRow[] = []
   let sessionId = fallbackSessionId
@@ -406,6 +411,70 @@ export function parseDshSession(
     raw = zstdDecompress(readFileSync(filePath))
   } catch {
     return [] // 损坏的压缩流直接跳过，下次 mtime 变了会重试
+  }
+  const rows: Array<ParsedUsageRow & { seq?: number }> = []
+  let sessionId = fallbackSessionId
+  let model = 'unknown'
+  for (const line of new TextDecoder().decode(raw).split('\n')) {
+    if (!line) continue
+    let ev: unknown
+    try {
+      ev = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!ev || typeof ev !== 'object') continue
+    const e = ev as Record<string, unknown>
+    const data = (e['data'] ?? {}) as Record<string, unknown>
+    const t = e['type']
+    if (t === 'session') {
+      sessionId = strOr(e['id'] as string | undefined, sessionId)
+    } else if (t === 'request/context') {
+      model = strOr(data['model'] as string | undefined, model)
+    } else if (t === 'request/header') {
+      const cfg = data['header'] as Record<string, unknown> | undefined
+      const m = (cfg?.['config'] as Record<string, unknown> | undefined)?.['model']
+      model = strOr(m as string | undefined, model)
+    } else if (t === 'assistant/chunk') {
+      const chunk = data['chunk'] as Record<string, unknown> | undefined
+      if (!chunk || chunk['type'] !== 'usage') continue
+      const usage = chunk['usage'] as Record<string, unknown> | undefined
+      if (!usage) continue
+      const input = numOr(usage['inputTokens'], 0)
+      const output = numOr(usage['outputTokens'], 0)
+      const cacheRead = numOr(usage['cacheReadTokens'], 0)
+      if (input + output + cacheRead === 0) continue
+      rows.push({
+        agent: 'dsh',
+        model,
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: cacheRead,
+        cache_read_tokens: cacheRead,
+        cache_write_tokens: 0,
+        cost_usd: calcCost(model, input, output, cacheRead, 0),
+        at: numOr(e['time'], Date.now()),
+        session_id: sessionId,
+        meta: null,
+        seq: typeof e['seq'] === 'number' ? e['seq'] : undefined
+      })
+    }
+  }
+  return rows
+}
+
+/** 异步版：文件读取走 fs/promises，不阻塞主线程；解压仍为同步（fzstd 纯 JS），但已在 scanner 的让出切片中 */
+export async function parseDshSessionAsync(
+  filePath: string,
+  fallbackSessionId: string
+): Promise<Array<ParsedUsageRow & { seq?: number }>> {
+  if (!existsSync(filePath)) return []
+  let raw: Uint8Array
+  try {
+    const buf = await readFileAsync(filePath)
+    raw = zstdDecompress(buf)
+  } catch {
+    return []
   }
   const rows: Array<ParsedUsageRow & { seq?: number }> = []
   let sessionId = fallbackSessionId

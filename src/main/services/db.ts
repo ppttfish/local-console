@@ -107,8 +107,14 @@ export function initDatabase(userDataDir?: string): void {
   db.pragma('busy_timeout = 5000')
   db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
+  // 极致：内存与 I/O 优化（仅影响本连接，不改文件格式）
+  try { db.pragma('cache_size = -64000') } catch {}
+  try { db.pragma('temp_store = MEMORY') } catch {}
+  try { db.pragma('mmap_size = 268435456') } catch {}
+  try { db.pragma('journal_size_limit = 67108864') } catch {}
   db.exec(SCHEMA)
   stmtCache.clear()
+  invalidateServicesCache()
 }
 
 export function getDb(): Database.Database {
@@ -127,6 +133,11 @@ export function closeDatabase(): void {
   }
 }
 
+// 极致：services 表常驻内存缓存，400ms 快照 + 5s 端口映射不再每次扫库
+let servicesCache: { at: number; rows: ServiceRow[] } | null = null
+const SERVICES_CACHE_TTL = 1000
+function invalidateServicesCache(): void { servicesCache = null }
+
 // ========== Service CRUD ==========
 
 export interface ServiceRow {
@@ -144,8 +155,10 @@ export interface ServiceRow {
 }
 
 export function listServices(): ServiceRow[] {
-  return prepare('SELECT * FROM services ORDER BY sort_order ASC, created_at ASC')
-    .all() as ServiceRow[]
+  if (servicesCache && Date.now() - servicesCache.at < SERVICES_CACHE_TTL) return servicesCache.rows
+  const rows = prepare('SELECT * FROM services ORDER BY sort_order ASC, created_at ASC').all() as ServiceRow[]
+  servicesCache = { at: Date.now(), rows }
+  return rows
 }
 
 export function getService(id: string): ServiceRow | undefined {
@@ -159,6 +172,7 @@ export function createServiceRow(row: ServiceRow): void {
        VALUES (@id, @name, @kind, @cwd, @command, @port, @color, @group_name, @sort_order, @created_at, @updated_at)`
     )
     .run(row)
+  invalidateServicesCache()
 }
 
 export function updateServiceRow(id: string, patch: Partial<ServiceRow>): void {
@@ -169,10 +183,12 @@ export function updateServiceRow(id: string, patch: Partial<ServiceRow>): void {
       `UPDATE services SET ${setClause}, updated_at = @updated_at WHERE id = @id`
     )
     .run({ ...patch, id, updated_at: Date.now() })
+  invalidateServicesCache()
 }
 
 export function deleteServiceRow(id: string): void {
   prepare('DELETE FROM services WHERE id = ?').run(id)
+  invalidateServicesCache()
 }
 
 export function reorderServices(ids: string[]): void {
@@ -183,6 +199,7 @@ export function reorderServices(ids: string[]): void {
     rows.forEach((id, idx) => stmt.run(idx, id))
   })
   tx(ids)
+  invalidateServicesCache()
 }
 
 // ========== Run history ==========

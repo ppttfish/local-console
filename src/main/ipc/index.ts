@@ -11,11 +11,15 @@ import { LogStreamer } from '../services/log-streamer.js'
 import {
   ensureUsageSchema,
   querySummary,
+  querySummaryAsync,
   queryRecap,
+  queryRecapAsync,
   queryTimeline,
+  queryTimelineAsync,
   listDistinctModels,
   listDistinctAgents,
-  listSessions
+  listSessions,
+  listSessionsAsync
 } from '../plugins/builtin/token-usage/storage.js'
 import { usageScanner } from '../plugins/builtin/token-usage/scanner.js'
 import { subscriptionRefresher as subRefresher } from '../plugins/builtin/token-usage/refresh.js'
@@ -75,8 +79,8 @@ export function registerIpcHandlers(
   // ===== Logs =====
   ipcMain.handle(
     IpcChannels.ServiceLogs,
-    (_e, payload: { id: string; tail?: number }) =>
-      log.tail(payload.id, payload.tail ?? 300)
+    (_e, payload: { id: string; tail?: number; force?: boolean }) =>
+      log.tail(payload.id, payload.tail ?? 300, payload.force)
   )
   ipcMain.handle(IpcChannels.ServiceClearLogs, (_e, id: string) => {
     log.clear(id)
@@ -158,7 +162,34 @@ export function registerIpcHandlers(
   )
   ipcMain.handle(IpcChannels.UsageRescan, async () => usageScanner.rescan())
   ipcMain.handle(IpcChannels.UsageStatus, () => usageScanner.getStats())
-  ipcMain.handle(IpcChannels.UsageRecap, () => queryRecap())
+  ipcMain.handle(IpcChannels.UsageRecap, async () => {
+    try { return await queryRecapAsync() } catch { return queryRecap() }
+  })
+  // 批量：一次 IPC 拿齐 Usage 页所需 5 份数据，切片让出避免 4 连查定住
+  ipcMain.handle(
+    IpcChannels.UsageBatch,
+    async (
+      _e,
+      args: { filter: unknown; granularity: 'hour' | 'day' | 'month'; limit?: number }
+    ) => {
+      const filter = args.filter as Parameters<typeof querySummary>[0]
+      const gran = args.granularity
+      const limit = args.limit ?? 50
+      const summary = await querySummaryAsync(filter)
+      await new Promise<void>((r) => setImmediate(r))
+      const timeline = await queryTimelineAsync(filter, gran)
+      await new Promise<void>((r) => setImmediate(r))
+      const sessions = await listSessionsAsync(filter, limit)
+      // models/status 轻量，同步即可
+      return {
+        summary,
+        timeline,
+        sessions,
+        models: listDistinctModels(),
+        status: usageScanner.getStats()
+      }
+    }
+  )
 
   // ===== 订阅监控 =====
   ensureSubscriptionSchema()

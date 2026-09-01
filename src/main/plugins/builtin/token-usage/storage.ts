@@ -3,6 +3,7 @@
  */
 import { getDb, prepare } from '../../../services/db.js'
 import { calcCost, priceFor, loadPricing, type ModelPrice } from './pricing.js'
+import { dbWorkerQuerySummary, dbWorkerQueryTimeline, dbWorkerListSessions, dbWorkerQueryRecap, dbWorkerCountLegacy } from '../../../workers/db-worker-client.js'
 
 export type Platform = 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh' | 'unknown'
 
@@ -91,6 +92,13 @@ export function ensureUsageSchema(): void {
   db.exec(
     'CREATE INDEX IF NOT EXISTS idx_usage_source ON agent_usage(source_file)'
   )
+  // 极致：复合索引覆盖最热的过滤组合（agent+model+at），避免全表扫
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_usage_agent_model_at ON agent_usage(agent, model, at)'
+  )
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_usage_at_cost ON agent_usage(at, cost_usd)'
+  )
 }
 
 export function insertUsageBatch(rows: UsageRow[]): number {
@@ -103,6 +111,34 @@ export function insertUsageBatch(rows: UsageRow[]): number {
     for (const r of items) stmt.run(r)
   })
   tx(rows)
+  // 写后失效查询缓存，前端下次拉取拿到新数据
+  summaryCache.clear()
+  timelineCache.clear()
+  sessionCache.clear()
+  legacyRowsCache = null
+  return rows.length
+}
+
+// 极致：分片异步插入，每 500 行让出一次，避免 5000 行大事务一次性定住 80ms
+export async function insertUsageBatchAsync(rows: UsageRow[]): Promise<number> {
+  if (rows.length === 0) return 0
+  if (rows.length <= 500) return insertUsageBatch(rows)
+  const stmt = prepare(
+    `INSERT INTO agent_usage (agent, model, input_tokens, output_tokens, cached_tokens, cache_read_tokens, cache_write_tokens, cost_usd, at, session_id, meta, source_file)
+     VALUES (@agent, @model, @input_tokens, @output_tokens, @cached_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd, @at, @session_id, @meta, @source_file)`
+  )
+  for (let i = 0; i < rows.length; i += 500) {
+    const slice = rows.slice(i, i + 500)
+    const tx = getDb().transaction((items: UsageRow[]) => {
+      for (const r of items) stmt.run(r)
+    })
+    tx(slice)
+    if (i + 500 < rows.length) await new Promise<void>((r) => setImmediate(r))
+  }
+  summaryCache.clear()
+  timelineCache.clear()
+  sessionCache.clear()
+  legacyRowsCache = null
   return rows.length
 }
 
@@ -141,7 +177,12 @@ export function replaceUsageBySourceFile(
   rows: UsageRow[]
 ): number {
   if (rows.length === 0) {
-    return deleteUsageBySourceFile(filePath, agent, sessionId)
+    const n = deleteUsageBySourceFile(filePath, agent, sessionId)
+    summaryCache.clear()
+    timelineCache.clear()
+    sessionCache.clear()
+    legacyRowsCache = null
+    return n
   }
   const stmt = prepare(USAGE_INSERT_SQL)
   const tx = getDb().transaction(() => {
@@ -149,6 +190,35 @@ export function replaceUsageBySourceFile(
     for (const r of rows) stmt.run(r)
   })
   tx()
+  summaryCache.clear()
+  timelineCache.clear()
+  sessionCache.clear()
+  legacyRowsCache = null
+  return rows.length
+}
+
+export async function replaceUsageBySourceFileAsync(
+  filePath: string,
+  agent: Platform,
+  sessionId: string,
+  rows: UsageRow[]
+): Promise<number> {
+  if (rows.length === 0) {
+    const n = deleteUsageBySourceFile(filePath, agent, sessionId)
+    summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
+    return n
+  }
+  if (rows.length <= 500) return replaceUsageBySourceFile(filePath, agent, sessionId, rows)
+  // 大批量：先原子删，再分片插，每片让出
+  deleteUsageBySourceFile(filePath, agent, sessionId)
+  const stmt = prepare(USAGE_INSERT_SQL)
+  for (let i = 0; i < rows.length; i += 500) {
+    const slice = rows.slice(i, i + 500)
+    const tx = getDb().transaction((items: UsageRow[]) => { for (const r of items) stmt.run(r) })
+    tx(slice)
+    if (i + 500 < rows.length) await new Promise<void>((r) => setImmediate(r))
+  }
+  summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
   return rows.length
 }
 
@@ -156,6 +226,10 @@ export function replaceUsageBySourceFile(
 export function replaceUsageByAgent(agent: Platform, rows: UsageRow[]): number {
   if (rows.length === 0) {
     prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
+    summaryCache.clear()
+    timelineCache.clear()
+    sessionCache.clear()
+    legacyRowsCache = null
     return 0
   }
   const stmt = prepare(USAGE_INSERT_SQL)
@@ -164,6 +238,29 @@ export function replaceUsageByAgent(agent: Platform, rows: UsageRow[]): number {
     for (const r of rows) stmt.run(r)
   })
   tx()
+  summaryCache.clear()
+  timelineCache.clear()
+  sessionCache.clear()
+  legacyRowsCache = null
+  return rows.length
+}
+
+export async function replaceUsageByAgentAsync(agent: Platform, rows: UsageRow[]): Promise<number> {
+  if (rows.length === 0) {
+    prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
+    summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
+    return 0
+  }
+  if (rows.length <= 500) return replaceUsageByAgent(agent, rows)
+  prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
+  const stmt = prepare(USAGE_INSERT_SQL)
+  for (let i = 0; i < rows.length; i += 500) {
+    const slice = rows.slice(i, i + 500)
+    const tx = getDb().transaction((items: UsageRow[]) => { for (const r of items) stmt.run(r) })
+    tx(slice)
+    if (i + 500 < rows.length) await new Promise<void>((r) => setImmediate(r))
+  }
+  summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
   return rows.length
 }
 
@@ -174,16 +271,33 @@ export function minAtForAgent(agent: Platform): number {
   return r.m ?? 0
 }
 
+let legacyRowsCache: { at: number; val: number } | null = null
+const LEGACY_TTL = 30000
+
 /**
  * source_file 为空的历史行数：> 0 说明还有只能靠 agent+session_id 兜底回收的老数据。
  * 只判 IS NULL —— 再并一个 `OR source_file = ''` 会让这条每 30 秒跑一次的统计退化成全表扫。
+ * 极致：30s 缓存，写后失效
  */
 export function countLegacyRows(): number {
+  if (legacyRowsCache && Date.now() - legacyRowsCache.at < LEGACY_TTL) return legacyRowsCache.val
   const r = prepare(
       'SELECT COUNT(*) AS n FROM agent_usage WHERE source_file IS NULL'
     )
     .get() as { n: number }
-  return r.n ?? 0
+  const val = r.n ?? 0
+  legacyRowsCache = { at: Date.now(), val }
+  return val
+}
+
+export async function countLegacyRowsAsync(): Promise<number> {
+  if (legacyRowsCache && Date.now() - legacyRowsCache.at < LEGACY_TTL) return legacyRowsCache.val
+  const fromWorker = await dbWorkerCountLegacy()
+  if (typeof fromWorker === 'number') {
+    legacyRowsCache = { at: Date.now(), val: fromWorker }
+    return fromWorker
+  }
+  return countLegacyRows()
 }
 
 // ========== Cursor ==========
@@ -299,7 +413,19 @@ export interface UsageSummary {
   by_day: Array<{ day: string; tokens: number; calls: number; cost: number }>
 }
 
+const SUMMARY_CACHE_TTL = 1500
+const summaryCache = new Map<string, { at: number; val: UsageSummary }>()
+const timelineCache = new Map<string, { at: number; val: TimelinePoint[] }>()
+const TIMELINE_CACHE_TTL = 1500
+
+function cacheKey(obj: unknown): string {
+  return JSON.stringify(obj ?? {})
+}
+
 export function querySummary(filter: UsageFilter): UsageSummary {
+  const key = cacheKey(filter)
+  const hit = summaryCache.get(key)
+  if (hit && Date.now() - hit.at < SUMMARY_CACHE_TTL) return hit.val
   const where = buildWhere(filter)
   const totals = prepare(
       `SELECT
@@ -371,7 +497,7 @@ export function querySummary(filter: UsageFilter): UsageSummary {
   const cacheHit =
     inp + cached > 0 ? Math.round((cached / (inp + cached)) * 1000) / 10 : 0
 
-  return {
+  const result: UsageSummary = {
     // 统一 fresh 存储：total = fresh + cached + output（与 ccusage totalTokens = input+cacheCreate+cacheRead+output 一致）
     total_tokens: inp + (totals.out ?? 0) + cached,
     input_tokens: inp,
@@ -386,6 +512,118 @@ export function querySummary(filter: UsageFilter): UsageSummary {
     by_model: byModel,
     by_day: byDay
   }
+  summaryCache.set(key, { at: Date.now(), val: result })
+  // 防内存泄漏：只留最近 20 个过滤组合
+  if (summaryCache.size > 20) {
+    const oldest = summaryCache.keys().next().value
+    if (oldest) summaryCache.delete(oldest)
+  }
+  return result
+}
+
+// 极致：异步切片版，每条聚合间让出事件循环，避免 4 连扫一次性定住主线程 80~200ms
+// 优先走 DB Worker（只读连接），主线程零阻塞
+export async function querySummaryAsync(filter: UsageFilter): Promise<UsageSummary> {
+  const key = cacheKey(filter)
+  const hit = summaryCache.get(key)
+  if (hit && Date.now() - hit.at < SUMMARY_CACHE_TTL) return hit.val
+  const fromWorker = await dbWorkerQuerySummary(filter) as UsageSummary | null
+  if (fromWorker) {
+    summaryCache.set(key, { at: Date.now(), val: fromWorker })
+    if (summaryCache.size > 20) {
+      const oldest = summaryCache.keys().next().value
+      if (oldest) summaryCache.delete(oldest)
+    }
+    return fromWorker
+  }
+  const where = buildWhere(filter)
+  const totals = prepare(
+      `SELECT
+         COALESCE(SUM(input_tokens), 0) AS inp,
+         COALESCE(SUM(output_tokens), 0) AS out,
+         COALESCE(SUM(cached_tokens), 0) AS cached,
+         COALESCE(SUM(cache_read_tokens), 0) AS cr,
+         COALESCE(SUM(cache_write_tokens), 0) AS cw,
+         COALESCE(SUM(cost_usd), 0) AS cost,
+         COUNT(*) AS calls
+       FROM agent_usage ${where.clause}`
+    )
+    .get(where.params) as {
+    inp: number
+    out: number
+    cached: number
+    cr: number
+    cw: number
+    cost: number
+    calls: number
+  }
+  await new Promise<void>((r) => setImmediate(r))
+  const byAgent = prepare(
+      `SELECT agent,
+              SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+              COUNT(*) AS calls,
+              COALESCE(SUM(cost_usd), 0) AS cost
+       FROM agent_usage ${where.clause}
+       GROUP BY agent
+       ORDER BY cost DESC`
+    )
+    .all(where.params) as Array<{ agent: string; tokens: number; calls: number; cost: number }>
+  await new Promise<void>((r) => setImmediate(r))
+  const byModel = prepare(
+      `SELECT model,
+              SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+              COUNT(*) AS calls,
+              COALESCE(SUM(cost_usd), 0) AS cost,
+              COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+              COALESCE(SUM(cache_write_tokens), 0) AS cache_write
+       FROM agent_usage ${where.clause}
+       GROUP BY model
+       ORDER BY cost DESC
+       LIMIT 50`
+    )
+    .all(where.params) as Array<{
+    model: string
+    tokens: number
+    calls: number
+    cost: number
+    cache_read: number
+    cache_write: number
+  }>
+  await new Promise<void>((r) => setImmediate(r))
+  const byDay = prepare(
+      `SELECT
+         strftime('%Y-%m-%d', at/1000, 'unixepoch', '+8 hours') AS day,
+         SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+         COUNT(*) AS calls,
+         COALESCE(SUM(cost_usd), 0) AS cost
+       FROM agent_usage ${where.clause}
+       GROUP BY day
+       ORDER BY day ASC`
+    )
+    .all(where.params) as Array<{ day: string; tokens: number; calls: number; cost: number }>
+  const inp = totals.inp ?? 0
+  const cached = totals.cached ?? 0
+  const cacheHit = inp + cached > 0 ? Math.round((cached / (inp + cached)) * 1000) / 10 : 0
+  const result: UsageSummary = {
+    total_tokens: inp + (totals.out ?? 0) + cached,
+    input_tokens: inp,
+    output_tokens: totals.out ?? 0,
+    cached_tokens: cached,
+    cache_read_tokens: totals.cr ?? 0,
+    cache_write_tokens: totals.cw ?? 0,
+    cache_hit_ratio: cacheHit,
+    cost_usd: totals.cost ?? 0,
+    calls: totals.calls ?? 0,
+    by_agent: byAgent,
+    by_model: byModel,
+    by_day: byDay
+  }
+  summaryCache.set(key, { at: Date.now(), val: result })
+  if (summaryCache.size > 20) {
+    const oldest = summaryCache.keys().next().value
+    if (oldest) summaryCache.delete(oldest)
+  }
+  return result
 }
 
 export function listDistinctModels(): string[] {
@@ -413,26 +651,109 @@ export interface SessionDetail {
   model: string | null
 }
 
-export function listSessions(filter: UsageFilter, limit = 200): SessionDetail[] {
+const sessionCache = new Map<string, { at: number; val: SessionDetail[] }>()
+const SESSION_CACHE_TTL = 2000
+
+export async function listSessionsAsync(filter: UsageFilter, limit = 200): Promise<SessionDetail[]> {
+  const key = cacheKey({ filter, limit })
+  const hit = sessionCache.get(key)
+  if (hit && Date.now() - hit.at < SESSION_CACHE_TTL) return hit.val
+  const fromWorker = await dbWorkerListSessions(filter, limit) as SessionDetail[] | null
+  if (fromWorker) {
+    sessionCache.set(key, { at: Date.now(), val: fromWorker })
+    if (sessionCache.size > 20) {
+      const oldest = sessionCache.keys().next().value
+      if (oldest) sessionCache.delete(oldest)
+    }
+    return fromWorker
+  }
   const where = buildWhere(filter)
-  return prepare(
+  const base = prepare(
       `SELECT
          session_id,
-         agent,
+         MAX(agent) AS agent,
          MIN(at) AS first_at,
          MAX(at) AS last_at,
          COUNT(*) AS calls,
          SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
-         COALESCE(SUM(cost_usd), 0) AS cost,
-         (SELECT model FROM agent_usage u2
-            WHERE u2.session_id = agent_usage.session_id
-            ORDER BY at DESC LIMIT 1) AS model
+         COALESCE(SUM(cost_usd), 0) AS cost
        FROM agent_usage ${where.clause}
        GROUP BY session_id
        ORDER BY cost DESC
        LIMIT @limit`
     )
-    .all({ ...where.params, limit }) as SessionDetail[]
+    .all({ ...where.params, limit }) as Array<Omit<SessionDetail, 'model'>>
+  if (base.length === 0) {
+    sessionCache.set(key, { at: Date.now(), val: [] })
+    return []
+  }
+  await new Promise<void>((r) => setImmediate(r))
+  const ids = base.map((r) => r.session_id)
+  const placeholders = ids.map(() => '?').join(',')
+  const winRows = prepare(
+      `SELECT session_id, model FROM (
+         SELECT session_id, model, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY at DESC) AS rn
+         FROM agent_usage WHERE session_id IN (${placeholders})
+       ) WHERE rn = 1`
+    ).all(...ids) as Array<{ session_id: string; model: string }>
+  const modelMap = new Map(winRows.map((r) => [r.session_id, r.model]))
+  const val = base.map((r) => ({
+    ...r,
+    model: modelMap.get(r.session_id) ?? null
+  })) as SessionDetail[]
+  sessionCache.set(key, { at: Date.now(), val })
+  if (sessionCache.size > 20) {
+    const oldest = sessionCache.keys().next().value
+    if (oldest) sessionCache.delete(oldest)
+  }
+  return val
+}
+
+export function listSessions(filter: UsageFilter, limit = 200): SessionDetail[] {
+  const key = cacheKey({ filter, limit })
+  const hit = sessionCache.get(key)
+  if (hit && Date.now() - hit.at < SESSION_CACHE_TTL) return hit.val
+  const where = buildWhere(filter)
+  // 极致：移除 N 次相关子查询（每会话一次），改为两阶段单查询
+  const base = prepare(
+      `SELECT
+         session_id,
+         MAX(agent) AS agent,
+         MIN(at) AS first_at,
+         MAX(at) AS last_at,
+         COUNT(*) AS calls,
+         SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+         COALESCE(SUM(cost_usd), 0) AS cost
+       FROM agent_usage ${where.clause}
+       GROUP BY session_id
+       ORDER BY cost DESC
+       LIMIT @limit`
+    )
+    .all({ ...where.params, limit }) as Array<Omit<SessionDetail, 'model'>>
+  if (base.length === 0) {
+    sessionCache.set(key, { at: Date.now(), val: [] })
+    return []
+  }
+  // 单次批量取每会话最新 model，避免 N 次相关子查询（200 会话 = 200 次索引扫）
+  const ids = base.map((r) => r.session_id)
+  const placeholders = ids.map(() => '?').join(',')
+  const winRows = prepare(
+      `SELECT session_id, model FROM (
+         SELECT session_id, model, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY at DESC) AS rn
+         FROM agent_usage WHERE session_id IN (${placeholders})
+       ) WHERE rn = 1`
+    ).all(...ids) as Array<{ session_id: string; model: string }>
+  const modelMap = new Map(winRows.map((r) => [r.session_id, r.model]))
+  const val = base.map((r) => ({
+    ...r,
+    model: modelMap.get(r.session_id) ?? null
+  })) as SessionDetail[]
+  sessionCache.set(key, { at: Date.now(), val })
+  if (sessionCache.size > 20) {
+    const oldest = sessionCache.keys().next().value
+    if (oldest) sessionCache.delete(oldest)
+  }
+  return val
 }
 
 export interface TimelinePoint {
@@ -450,6 +771,9 @@ export function queryTimeline(
   filter: UsageFilter,
   granularity: 'hour' | 'day' | 'month' = 'day'
 ): TimelinePoint[] {
+  const key = cacheKey({ filter, granularity })
+  const hit = timelineCache.get(key)
+  if (hit && Date.now() - hit.at < TIMELINE_CACHE_TTL) return hit.val
   const where = buildWhere(filter)
   const fmt =
     granularity === 'hour'
@@ -457,21 +781,82 @@ export function queryTimeline(
       : granularity === 'month'
         ? '%Y-%m'
         : '%Y-%m-%d'
-  return prepare(
+  const val = prepare(
       `SELECT
          strftime('${fmt}', at/1000, 'unixepoch', '+8 hours') AS bucket,
-         SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
-         COALESCE(SUM(input_tokens), 0) AS input,
-         COALESCE(SUM(output_tokens), 0) AS output,
-         COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
-         COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
-         COALESCE(SUM(cost_usd), 0) AS cost,
-         COUNT(*) AS calls
-       FROM agent_usage ${where.clause}
-       GROUP BY bucket
-       ORDER BY bucket ASC`
+          SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+          COALESCE(SUM(input_tokens), 0) AS input,
+          COALESCE(SUM(output_tokens), 0) AS output,
+          COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+          COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+          COALESCE(SUM(cost_usd), 0) AS cost,
+          COUNT(*) AS calls
+        FROM agent_usage ${where.clause}
+        GROUP BY bucket
+        ORDER BY bucket ASC`
     )
     .all(where.params) as TimelinePoint[]
+  timelineCache.set(key, { at: Date.now(), val })
+  if (timelineCache.size > 20) {
+    const oldest = timelineCache.keys().next().value
+    if (oldest) timelineCache.delete(oldest)
+  }
+  return val
+}
+
+export async function queryTimelineAsync(
+  filter: UsageFilter,
+  granularity: 'hour' | 'day' | 'month' = 'day'
+): Promise<TimelinePoint[]> {
+  const key = cacheKey({ filter, granularity })
+  const hit = timelineCache.get(key)
+  if (hit && Date.now() - hit.at < TIMELINE_CACHE_TTL) return hit.val
+  const fromWorker = await dbWorkerQueryTimeline(filter, granularity) as TimelinePoint[] | null
+  if (fromWorker) {
+    timelineCache.set(key, { at: Date.now(), val: fromWorker })
+    if (timelineCache.size > 20) {
+      const oldest = timelineCache.keys().next().value
+      if (oldest) timelineCache.delete(oldest)
+    }
+    return fromWorker
+  }
+  const where = buildWhere(filter)
+  const fmt =
+    granularity === 'hour'
+      ? "%Y-%m-%d %H:00"
+      : granularity === 'month'
+        ? '%Y-%m'
+        : '%Y-%m-%d'
+  // 让出一次，避免与 summary 的后续查询连续阻塞
+  await new Promise<void>((r) => setImmediate(r))
+  const val = prepare(
+      `SELECT
+         strftime('${fmt}', at/1000, 'unixepoch', '+8 hours') AS bucket,
+          SUM(input_tokens + output_tokens + cached_tokens) AS tokens,
+          COALESCE(SUM(input_tokens), 0) AS input,
+          COALESCE(SUM(output_tokens), 0) AS output,
+          COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+          COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+          COALESCE(SUM(cost_usd), 0) AS cost,
+          COUNT(*) AS calls
+        FROM agent_usage ${where.clause}
+        GROUP BY bucket
+        ORDER BY bucket ASC`
+    )
+    .all(where.params) as TimelinePoint[]
+  timelineCache.set(key, { at: Date.now(), val })
+  if (timelineCache.size > 20) {
+    const oldest = timelineCache.keys().next().value
+    if (oldest) timelineCache.delete(oldest)
+  }
+  return val
+}
+
+export function invalidateQueryCache(): void {
+  summaryCache.clear()
+  timelineCache.clear()
+  sessionCache.clear()
+  legacyRowsCache = null
 }
 
 // ========== 回顾（Wrapped） ==========
@@ -609,6 +994,13 @@ export function queryRecap(): UsageRecap {
     streak_days: currentStreak,
     best_streak: bestStreak
   }
+}
+
+export async function queryRecapAsync(): Promise<UsageRecap> {
+  const fromWorker = await dbWorkerQueryRecap() as UsageRecap | null
+  if (fromWorker) return fromWorker
+  await new Promise<void>((r) => setImmediate(r))
+  return queryRecap()
 }
 
 export { calcCost, priceFor, loadPricing, type ModelPrice }

@@ -99,7 +99,7 @@ async function runCommand(c: string, args: string[]): Promise<void> {
       if (!target) die(`未找到服务：${args[0]}`)
       const tailIdx = args.indexOf('--tail')
       const tail = tailIdx >= 0 ? parseInt(args[tailIdx + 1] ?? '200', 10) : 200
-      const r = log.tail(target.id, tail)
+      const r = await log.tail(target.id, tail)
       process.stdout.write(r.text)
       return
     }

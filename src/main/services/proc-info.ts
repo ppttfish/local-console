@@ -13,7 +13,7 @@
  *   - 启动器注入的 token 通过命令行 set LCP_RUN_TOKEN=xxx 传递，校验时回看 cmdline
  *   - 同用户校验：UserName 字段是 DOMAIN\Account，跟 os.userInfo().username 比较
  */
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { userInfo } from 'node:os'
 
@@ -39,7 +39,7 @@ function getSelfUsername(): string {
   return selfUsername
 }
 
-/** 用 tasklist 校验单个 PID 是否存活。 */
+/** 用 tasklist 校验单个 PID 是否存活（同步，阻塞）。非热路径可用；热路径请用 pidAliveAsync。 */
 export function pidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false
   const r = spawnSync('tasklist', ['/fi', `pid eq ${pid}`, '/nh', '/fo', 'csv'], {
@@ -52,6 +52,31 @@ export function pidAlive(pid: number): boolean {
   // tasklist 输出形如 "node.exe","1234","Console","1","12,345 K"
   // 没找到时会输出 INFO: No tasks...
   return r.stdout.includes(`,"${pid}",`)
+}
+
+/** 异步版 pidAlive，不阻塞主线程（热路径/轮询用）。 */
+export function pidAliveAsync(pid: number): Promise<boolean> {
+  if (!Number.isFinite(pid) || pid <= 0) return Promise.resolve(false)
+  const { promise, resolve } = Promise.withResolvers<boolean>()
+  const p = spawn('tasklist', ['/fi', `pid eq ${pid}`, '/nh', '/fo', 'csv'], {
+    windowsHide: true,
+    shell: false
+  })
+  let out = ''
+  let done = false
+  const finish = (v: boolean) => {
+    if (done) return
+    done = true
+    resolve(v)
+  }
+  p.stdout.on('data', (d) => (out += d.toString()))
+  p.on('close', (code) => {
+    if (code !== 0) finish(false)
+    else finish(out.includes(`,"${pid}",`))
+  })
+  p.on('error', () => finish(false))
+  setTimeout(() => finish(false), 5000).unref()
+  return promise
 }
 
 /**
@@ -132,63 +157,133 @@ function deriveCwdFromExe(exe: string): string | null {
 
 const MEM_TTL_MS = 5000
 let memCache: { at: number; map: Map<number, number> } | null = null
+let memRefreshInFlight: Promise<Map<number, number>> | null = null
+
+function parseWmicMemoryOutput(stdout: string): Map<number, number> {
+  const map = new Map<number, number>()
+  const lines = stdout.split(/\r?\n/).filter((l) => l.trim().length > 0)
+  if (lines.length < 2) return map
+  const header = lines[0]!.split(',')
+  const iPid = header.indexOf('ProcessId')
+  const iWs = header.indexOf('WorkingSetSize')
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i]!.split(',')
+    const pid = parseInt(cells[iPid] ?? '', 10)
+    const ws = parseInt(cells[iWs] ?? '', 10)
+    if (Number.isFinite(pid) && Number.isFinite(ws) && ws > 0) {
+      map.set(pid, Math.round((ws / 1024 / 1024) * 10) / 10)
+    }
+  }
+  return map
+}
+
+function spawnWmicMemoryAsync(pids: number[]): Promise<Map<number, number>> {
+  if (pids.length === 0) return Promise.resolve(new Map())
+  const whereClause = pids.map((p) => `ProcessId=${p}`).join(' or ')
+  const { promise, resolve } = Promise.withResolvers<Map<number, number>>()
+  const p = spawn(
+    'wmic',
+    ['process', 'where', whereClause, 'get', 'ProcessId,WorkingSetSize', '/format:csv'],
+    { windowsHide: true, shell: false }
+  )
+  let out = ''
+  let done = false
+  const finish = (map: Map<number, number>) => {
+    if (done) return
+    done = true
+    resolve(map)
+  }
+  p.stdout.on('data', (d) => (out += d.toString()))
+  p.on('close', () => finish(parseWmicMemoryOutput(out)))
+  p.on('error', () => finish(new Map()))
+  setTimeout(() => finish(new Map()), 8000).unref()
+  return promise
+}
 
 /**
- * 批量取进程物理内存（MB）。
- *
- * 一次 wmic 拿全部目标 PID，结果缓存 5 秒 —— 状态轮询是 2 秒一次，
- * 不缓存的话每轮都要 spawn 一个 wmic。
+ * 异步批量取进程物理内存（MB），不阻塞主线程。
+ * 真正的查询在这里；同步版只读缓存。
+ */
+export async function pidMemoryMbAsync(pids: number[]): Promise<Map<number, number>> {
+  const unique = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))]
+  if (unique.length === 0) return new Map()
+  // 复用 TTL：缓存命中直接返回
+  if (memCache && Date.now() - memCache.at < MEM_TTL_MS) {
+    const out = new Map<number, number>()
+    for (const p of unique) {
+      const v = memCache.map.get(p)
+      if (v !== undefined) out.set(p, v)
+    }
+    // 如果缓存已覆盖所有请求的 PID，直接返回
+    if (out.size === unique.length) return out
+  }
+  if (memRefreshInFlight) {
+    const map = await memRefreshInFlight
+    const out = new Map<number, number>()
+    for (const p of unique) {
+      const v = map.get(p)
+      if (v !== undefined) out.set(p, v)
+    }
+    return out
+  }
+  const task = spawnWmicMemoryAsync(unique).then((map) => {
+    memCache = { at: Date.now(), map }
+    return map
+  }).finally(() => {
+    memRefreshInFlight = null
+  })
+  memRefreshInFlight = task
+  const map = await task
+  const out = new Map<number, number>()
+  for (const p of unique) {
+    const v = map.get(p)
+    if (v !== undefined) out.set(p, v)
+  }
+  return out
+}
+
+/** 后台触发一次内存刷新，不等待结果（供快照热路径调用，永不阻塞）。 */
+export function triggerMemoryRefresh(pids: number[]): void {
+  const unique = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))]
+  if (unique.length === 0) return
+  if (memCache && Date.now() - memCache.at < MEM_TTL_MS) return
+  if (memRefreshInFlight) return
+  void pidMemoryMbAsync(unique).catch(() => {})
+}
+
+/**
+ * 同步批量取进程物理内存（MB）—— 只读缓存，永不 spawn。
+ * 热路径（snapshotState/list）必须用它，避免主线程被 wmic 定住。
+ * 首次/过期时返回空或旧缓存，后台会自动刷新，下次快照即有数据。
  */
 export function pidMemoryMb(pids: number[]): Map<number, number> {
-  const out = new Map<number, number>()
   const unique = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))]
-  if (unique.length === 0) return out
-
+  if (unique.length === 0) return new Map()
   if (memCache && Date.now() - memCache.at < MEM_TTL_MS) {
+    const out = new Map<number, number>()
     for (const p of unique) {
       const v = memCache.map.get(p)
       if (v !== undefined) out.set(p, v)
     }
     return out
   }
-
-  const whereClause = unique.map((p) => `ProcessId=${p}`).join(' or ')
-  const r = spawnSync(
-    'wmic',
-    [
-      'process',
-      'where',
-      whereClause,
-      'get',
-      'ProcessId,WorkingSetSize',
-      '/format:csv'
-    ],
-    { windowsHide: true, shell: false, timeout: 10_000, encoding: 'utf8' }
-  )
-
-  const map = new Map<number, number>()
-  if (!r.error && typeof r.stdout === 'string') {
-    const lines = r.stdout.split(/\r?\n/).filter((l) => l.trim().length > 0)
-    if (lines.length >= 2) {
-      const header = lines[0]!.split(',')
-      const iPid = header.indexOf('ProcessId')
-      const iWs = header.indexOf('WorkingSetSize')
-      for (let i = 1; i < lines.length; i++) {
-        const cells = lines[i]!.split(',')
-        const pid = parseInt(cells[iPid] ?? '', 10)
-        const ws = parseInt(cells[iWs] ?? '', 10)
-        if (Number.isFinite(pid) && Number.isFinite(ws) && ws > 0) {
-          map.set(pid, Math.round((ws / 1024 / 1024) * 10) / 10)
-        }
-      }
+  // 缓存过期：触发异步刷新，立即返回旧缓存（或空），绝不阻塞
+  if (memCache) {
+    const out = new Map<number, number>()
+    for (const p of unique) {
+      const v = memCache.map.get(p)
+      if (v !== undefined) out.set(p, v)
     }
+    triggerMemoryRefresh(unique)
+    return out
   }
-  memCache = { at: Date.now(), map }
-  for (const p of unique) {
-    const v = map.get(p)
-    if (v !== undefined) out.set(p, v)
-  }
-  return out
+  triggerMemoryRefresh(unique)
+  return new Map()
+}
+
+/** 供测试/启动时预热：强制同步刷新已废弃，请用 pidMemoryMbAsync */
+export function invalidateMemoryCache(): void {
+  memCache = null
 }
 
 /** 检查两个路径是否指向同一个真实路径。失败时返回 false（不抛）。 */

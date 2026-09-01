@@ -210,8 +210,8 @@ export const useAppStore = defineStore('app', () => {
   async function reorderServices(ids: string[]): Promise<unknown> {
     return window.lcp.reorderServices(ids)
   }
-  async function getLogs(id: string, tail = 300): Promise<unknown> {
-    return window.lcp.getServiceLogs(id, tail)
+  async function getLogs(id: string, tail = 300, force?: boolean): Promise<unknown> {
+    return window.lcp.getServiceLogs(id, tail, force)
   }
   async function clearLogs(id: string): Promise<unknown> {
     const r = await window.lcp.clearServiceLogs(id)

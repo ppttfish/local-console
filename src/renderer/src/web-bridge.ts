@@ -53,8 +53,8 @@ export function installWebBridge(): void {
     restartService: (id) => post(`/api/service/${id}/restart`, {}),
     stopExternalService: (id) => post('/api/service/stop-external', { id }),
     reorderServices: (ids) => post('/api/service/reorder', { ids }),
-    getServiceLogs: (id, tail = 300) =>
-      post('/api/service/logs', { id, tail }),
+    getServiceLogs: (id: string, tail = 300, force?: boolean) =>
+      post('/api/service/logs', { id, tail, force }),
     clearServiceLogs: (id) =>
       post('/api/service/clear-logs', { id }).then(() => ({ ok: true })),
     resetLogCounter: (id) =>
@@ -77,6 +77,14 @@ export function installWebBridge(): void {
     usageRescan: () => post('/api/usage/rescan', {}),
     usageStatus: () => post('/api/usage/status'),
     usageRecap: () => post('/api/usage/recap'),
+    usageBatch: (args: { filter: unknown; granularity: string; limit?: number }) =>
+      post('/api/usage/batch', args) as Promise<{
+        summary: unknown
+        timeline: unknown
+        sessions: unknown
+        models: unknown
+        status: unknown
+      }>,
 
     // 订阅监控
     subList: () => post('/api/subscription/list'),

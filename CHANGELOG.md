@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.4.5 (2026-09-01) — 极致性能
+
+### 性能
+
+- **主线程零阻塞**：`wmic/tasklist` 全异步+5s 缓存后台刷新，`log tail` 全异步+`setImmediate`切片，`scanner` 全链路异步化+`yieldToLoop`每 2000 行/8 文件让出，`fs.watch` 2s 防抖替代 30s 轮询（闲时 5 分钟兜底）
+- **大文件零大串**：`>2MB` 流式 `createReadStream+readline`，`streamFileStats/streamFingerprintUpTo/parseLargeFileStreamed` 三段式，Codex/DSH 解压与解析搬入 `parse-worker` 线程，主线程 50MB+ 峰值由 50MB 字符串降为逐行缓冲；全量 `readFile` 改阈值 0，全文件流式
+- **DB 零阻塞**：`better-sqlite3` 增 `cache_size=-64000/mmap 256M`，复合索引 `agent_model_at/at_cost`，`summary/timeline/sessions/legacy` 1.5~30s LRU + 写后失效，`querySummaryAsync/timelineAsync/listSessionsAsync` 切片+ `db-worker` 只读连接（WAL 并发），`insert/replace` 500 行/事务分片异步
+- **服务/端口**：`services` 1s 内存缓存，`snapshotState→toState` 端口 `find` 改 `Map`（100×50 由 5000 次降 150 次），`port-scanner` `powershell→wmic` 优先（300ms）+自适应退避 5→10→30s，`appendLog` `Buffer.length` 避二次编码+16ms 微批次聚合
+- **启动/渲染**：`initDatabase` 后 `log/port/service` 并行，`plugin/updater/http/mcp` 延后至窗口显后/30s，`Usage` 图表 `requestIdleCallback` 空闲计算，`Logs` `content-visibility:auto`，`http` 静态资源 `statCache 5s`+`ETag/304`，`pricing:priceFor` 记忆化（40 万次→数百次），`detectProject` 全异步
+
+### 验证
+
+- `typecheck` 0 error / `lint` 0 error (10 warning 历史遗留) / `build` 三端成功
+- Worker 双线程 `parse-worker`/`db-worker` 回包正确（`cost_usd`/`session_id` 校验）
+
+## Unreleased — 日志中心：切换卡顿与空白修复
+
+### 修复
+
+- **日志中心切换后日志空白/串台**：旧实现用单一全局行数组承载日志，切走再切回时若命中主进程的 mtime/size 缓存（`unchanged`）就直接跳过刷新，于是看到的是上一个服务的残留内容或一片空白（切过空日志服务的服务必现）。改为**按服务缓存日志窗口**，切换瞬间先从缓存恢复显示、再后台刷新；缓存缺失或行数切换时用 `force` 强制读盘，不再被其它调用方（CLI/MCP）预热过的缓存吞掉首次内容
+- **日志中心切换卡顿**：旧实现任何一次非 `unchanged` 响应都整体替换行数组，1000 行窗口下每次滑动都要重写全部文本节点；快速连点还会并发触发多次 IPC 读盘。现在同一 (服务, 行数) 的请求在途时直接复用（不再并发读盘）、只有真正发出请求的那次占请求序号（复用等待者沿用同一次响应，杜绝「响应被自己占的新号丢弃」导致界面停在旧窗口）；纯追加的轮询由 `mergeLogWindow` 只产出新增行，keyed diff 只插入新节点
+- **行数切换不生效**：行数 100→300→1000 切换时主进程缓存会直接返回 `unchanged`，旧版经常切了没反应；现在行数变化即强制重读
+- **「最近 N 行」少一行**：主进程 `readTailLines` 把文件结尾 `\n` 产生的空元素也算进窗口，`slice(-want)` 后最新一行被顶掉、空白行占位（界面显示 300 行实际只有 299 行内容）。读取时先剔除结尾空元素，`Logs.vue` 侧同样归一化，顺带状态行行数变为真实日志行数
+- **row 增量合并插空白行**：纯追加轮询时新旧窗口的结尾空行错位，会在新旧内容之间插入一行空白；已由上述归一化一并修复
+- **Web 模式（standalone HTTP）无法使用**：`/api/app/info` 在无 Electron 上下文时调用 `app.getName()` 崩溃，页面 bootstrap 直接 500。改为独立运行时捕获的 userData 兜底（名称/版本回退「小福鱼」/0.0.0）
+- **后台轮询浪费**：页面切到后台（窗口最小化/隐藏）时暂停 2s 轮询，回前台恢复
+
+### 验证
+
+- `npm run typecheck` / `npm run lint`（0 errors）/ `npm run build` 通过
+- e2e（playwright + standalone HTTP + 3 个真实服务日志文件，8 次全绿）：切到空日志再切回不空白不串台；快速连点停在正确内容；文件未变化时两个轮询周期 DOM 子节点 0 变更；纯追加只新增 3 个节点；滑动窗口整体正确；1000↔100 行切换立即生效
+- `mergeLogWindow` 纯函数单测 6 组全过（幽灵行、纯追加、连续追加、窗口滑动、tail 裁剪、空文本）
+
 ## v0.4.3 (2026-08-31) — 订阅全息卡片：文字模糊、点击失效、头像尺寸修复
 
 ### 修复

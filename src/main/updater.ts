@@ -93,6 +93,9 @@ class Updater {
 
     if (!app.isPackaged) {
       slog('init skipped: dev mode')
+      // dev 模式也注册 IPC：checkInteractive() 会返回 dev-skip；
+      // 否则设置页「检查更新」invoke 报 “No handler registered”
+      this.registerIpc()
       return
     }
 

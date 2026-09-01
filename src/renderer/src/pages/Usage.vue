@@ -326,12 +326,33 @@ const filter = computed(() => ({
 }))
 
 // 请求序号：筛选 / 粒度 / 轮询 / rescan 会并发触发 refresh，
-// 只让最后一次发出的请求写回数据，防止快速切换筛选时旧响应覆盖新数据
 let reqSeq = 0
 async function refresh() {
+  if (document.hidden) return
   const seq = ++reqSeq
   loading.value = true
   try {
+    // 优先走批量接口：1 次 IPC 拿齐 5 份数据，减少 5 倍往返 + DB 竞争
+    const batch = (window.lcp as unknown as { usageBatch?: (a: unknown) => Promise<never> }).usageBatch
+    if (batch) {
+      try {
+        const b = await (window.lcp as unknown as { usageBatch: (a: unknown) => Promise<{ summary: Summary; timeline: { timeline: TimelinePoint[] } | TimelinePoint[]; sessions: Session[]; models: string[]; status: Status }> }).usageBatch({
+          filter: filter.value,
+          granularity: granularity.value,
+          limit: 50
+        })
+        if (seq !== reqSeq) return
+        summary.value = b.summary as Summary
+        const t = b.timeline as { timeline: TimelinePoint[] } | TimelinePoint[]
+        timeline.value = (t as { timeline: TimelinePoint[] }).timeline ?? (t as TimelinePoint[])
+        sessions.value = b.sessions as Session[]
+        models.value = b.models as string[]
+        status.value = b.status as Status
+        return
+      } catch {
+        // 批量失败回退到并行（兼容旧版 standalone）
+      }
+    }
     const [s, t, ss, m, st] = await Promise.all([
       window.lcp.usageSummary(filter.value),
       window.lcp.usageTimeline({
@@ -349,7 +370,6 @@ async function refresh() {
     models.value = m as string[]
     status.value = st as Status
   } finally {
-    // 过期响应不关 loading：此时更新的那次请求还在飞行中，由它负责收尾
     if (seq === reqSeq) loading.value = false
   }
 }
@@ -391,20 +411,50 @@ onMounted(() => {
   refresh()
   refreshSubs()
   pollTimer = setInterval(() => {
+    if (document.hidden) return
     void refresh()
     void refreshSubs()
   }, 30_000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
 })
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
   stopThemeWatch?.()
 })
+
+function onVisibilityChange() {
+  if (!document.hidden) {
+    void refresh()
+    void refreshSubs()
+  }
+}
 
 // filter 是 computed，每次依赖变化返回新对象，引用比较即可感知变化，无需 deep
 watch(filter, refresh)
 watch(granularity, refresh)
 
 // ===== Charts =====
+// 极致：图表数据在 idle 时计算，避免筛选/轮询的同步 10~20ms 阻塞主线程
+function idle<T>(fn: () => T): Promise<T> {
+  return new Promise((resolve) => {
+    const cb = () => resolve(fn())
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback
+    if (ric) (ric as (cb: () => void, opts: { timeout: number }) => number)(cb, { timeout: 50 })
+    else setTimeout(cb, 16)
+  })
+}
+function scheduleIdle(fn: () => void | Promise<void>): number {
+  const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback
+  if (ric) return (ric as unknown as (cb: () => void, opts: { timeout: number }) => number)(fn as unknown as () => void, { timeout: 50 }) as unknown as number
+  return setTimeout(fn as unknown as () => void, 16) as unknown as number
+}
+function cancelIdle(id: number | null) {
+  if (id == null) return
+  const cic = (window as unknown as { cancelIdleCallback?: (id: number) => void }).cancelIdleCallback
+  if (cic) cic(id)
+  else clearTimeout(id)
+}
 
 function num(v: unknown): number {
   const n = Number(v)
@@ -435,34 +485,21 @@ function withThemeColors(baseOptions: ChartOptions): ChartOptions {
   return baseOptions
 }
 
-const lineChartData = computed<ChartData<'line'>>(() => {
-  const t = theme.value
-  const datasets: ChartData<'line'>['datasets'] = [
-    {
-      label: 'Token 用量',
-      data: timeline.value.map((p) => p.tokens),
-      borderColor: t.primary,
-      backgroundColor: t.primary + '26',
-      fill: true,
-      tension: 0.3,
-      yAxisID: 'y'
+const lineChartData = ref<ChartData<'line'>>({ labels: [], datasets: [] })
+let lineIdle: number | null = null
+watch([timeline, summary, theme], () => {
+  if (lineIdle) cancelIdle(lineIdle)
+  lineIdle = scheduleIdle(() => {
+    const t = theme.value
+    const datasets: ChartData<'line'>['datasets'] = [
+      { label: 'Token 用量', data: timeline.value.map((p) => p.tokens), borderColor: t.primary, backgroundColor: t.primary + '26', fill: true, tension: 0.3, yAxisID: 'y' }
+    ]
+    if ((summary.value?.cost_usd ?? 0) > 0) {
+      datasets.push({ label: '成本 (USD)', data: timeline.value.map((p) => p.cost), borderColor: t.warning, backgroundColor: t.warning + '0d', borderDash: [4, 4], fill: false, tension: 0.3, yAxisID: 'y1' })
     }
-  ]
-  // 全 0 成本时不画成本线，避免 y1 轴出现 ±$1 的对称噪音
-  if ((summary.value?.cost_usd ?? 0) > 0) {
-    datasets.push({
-      label: '成本 (USD)',
-      data: timeline.value.map((p) => p.cost),
-      borderColor: t.warning,
-      backgroundColor: t.warning + '0d',
-      borderDash: [4, 4],
-      fill: false,
-      tension: 0.3,
-      yAxisID: 'y1'
-    })
-  }
-  return { labels: timeline.value.map((p) => p.bucket), datasets }
-})
+    lineChartData.value = { labels: timeline.value.map((p) => p.bucket), datasets }
+  })
+}, { immediate: true })
 
 const hasCostSeries = computed(() => (summary.value?.cost_usd ?? 0) > 0)
 
@@ -506,19 +543,18 @@ const lineChartOptions = computed<ChartOptions<'line'>>(
     }) as ChartOptions<'line'>
 )
 
-const agentDoughnut = computed<ChartData<'doughnut'>>(() => {
-  const rows = summary.value?.by_agent ?? []
-  return {
-    labels: rows.map((r) => agentLabels.value[r.agent] ?? r.agent),
-    datasets: [
-      {
-        data: rows.map((r) => r.cost),
-        backgroundColor: rows.map((r) => AGENT_COLOR[r.agent] ?? '#94a3b8'),
-        borderWidth: 0
-      }
-    ]
-  }
-})
+const agentDoughnut = ref<ChartData<'doughnut'>>({ labels: [], datasets: [] })
+let doughnutIdle: number | null = null
+watch([() => summary.value?.by_agent, () => status.value?.opencode_flavor], () => {
+  if (doughnutIdle) cancelIdle(doughnutIdle)
+  doughnutIdle = scheduleIdle(() => {
+    const rows = summary.value?.by_agent ?? []
+    agentDoughnut.value = {
+      labels: rows.map((r) => agentLabels.value[r.agent] ?? r.agent),
+      datasets: [{ data: rows.map((r) => r.cost), backgroundColor: rows.map((r) => AGENT_COLOR[r.agent] ?? '#94a3b8'), borderWidth: 0 }]
+    }
+  })
+}, { immediate: true, deep: true })
 
 const platformTab = ref<'rank' | 'cost'>('rank')
 const rankRows = computed(() =>
@@ -552,25 +588,22 @@ const agentDoughnutOptions = computed<ChartOptions<'doughnut'>>(
     }) as ChartOptions<'doughnut'>
 )
 
-const modelBar = computed<ChartData<'bar'>>(() => {
-  const t = theme.value
-  const top = (summary.value?.by_model ?? []).slice(0, 10)
-  return {
-    labels: top.map((r) => r.model),
-    datasets: [
-      {
-        label: 'Token',
-        data: top.map((r) => r.tokens),
-        backgroundColor: t.primary
-      },
-      {
-        label: '缓存命中',
-        data: top.map((r) => r.cache_read),
-        backgroundColor: t.success
-      }
-    ]
-  }
-})
+const modelBar = ref<ChartData<'bar'>>({ labels: [], datasets: [] })
+let barIdle: number | null = null
+watch([() => summary.value?.by_model, theme], () => {
+  if (barIdle) cancelIdle(barIdle)
+  barIdle = scheduleIdle(() => {
+    const t = theme.value
+    const top = (summary.value?.by_model ?? []).slice(0, 10)
+    modelBar.value = {
+      labels: top.map((r) => r.model),
+      datasets: [
+        { label: 'Token', data: top.map((r) => r.tokens), backgroundColor: t.primary },
+        { label: '缓存命中', data: top.map((r) => r.cache_read), backgroundColor: t.success }
+      ]
+    }
+  })
+}, { immediate: true, deep: true })
 
 const modelBarOptions = computed<ChartOptions<'bar'>>(
   () =>

@@ -26,15 +26,26 @@ import {
   DialogFooter
 } from '@/components/ui'
 import { cn } from '@/lib/utils'
+import { mergeLogWindow, type LogWindow } from '@/lib/log-merge'
 
 const store = useAppStore()
 const selectedId = ref<string | null>(null)
+/** 当前选中服务可见的日志行（视图层） */
 const lines = ref<string[]>([])
+/** 按服务缓存最近拿到的日志窗口：切换服务瞬间从缓存恢复，不空白、不串台 */
+const logCache = new Map<string, LogWindow>()
+/** 每个缓存窗口对应的 tail 值：行数切换后必须强制重读，否则 unchanged 会吃掉新行数 */
+const cacheTailN = new Map<string, number>()
 const tail = ref(300)
 const autoScroll = ref(true)
 const logEl = ref<HTMLElement | null>(null)
 let pollTimer: ReturnType<typeof setInterval> | null = null
-let lastLineCount = 0
+/** 每个服务只让最后一次「真正发出」的请求写回，防止旧快照覆盖新快照 */
+const reqSeqById = new Map<string, number>()
+/** 同一 (服务, 行数) 的请求在途时直接复用，快速连点不再并发读盘 */
+const inflight = new Map<string, Promise<unknown>>()
+/** 在途请求的元信息：复用的等待者必须沿用发起者的 seq/tail，否则响应会被自己占的新号丢掉 */
+const inflightMeta = new Map<string, { id: string; seq: number; tailN: number }>()
 
 const selected = computed(() =>
   store.services.find((s) => s.id === selectedId.value)
@@ -49,7 +60,20 @@ const tailItems = [
 onMounted(() => {
   if (store.services.length > 0) selectedId.value = store.services[0]!.id
   pollTimer = setInterval(refresh, 2000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
 })
+
+/** 页面切到后台时停掉 2s 轮询，回前台再恢复，避免不可见时还在反复读盘/重渲染 */
+function onVisibilityChange() {
+  if (document.hidden) {
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  } else if (!pollTimer) {
+    pollTimer = setInterval(refresh, 2000)
+  }
+}
 
 // 打开页面时服务列表可能还在异步加载（bootstrap 未完成），
 // 等它到位后自动选中第一个，避免每次都要手动点
@@ -62,36 +86,87 @@ watch(
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  pollTimer = null
+  document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 
-watch(selectedId, () => refresh())
+watch(selectedId, (id) => {
+  // 先瞬间切回该服务上次看到的窗口（首次为空），再后台刷一轮
+  if (id) restoreVisible(id)
+  refresh()
+})
 
-// 请求序号：轮询 / 切服务 / 切行数 / 手动刷新都会并发触发 refresh，
-// 只让最后一次发出的请求写回数据，防止慢响应把旧服务的日志盖到新服务名下
-let reqSeq = 0
+/** 把某个服务的最新窗口提交进缓存；若它正是当前选中，同步到视图并滚动 */
+function commit(id: string, entry: LogWindow, tailN: number) {
+  logCache.set(id, entry)
+  cacheTailN.set(id, tailN)
+  if (logCache.size > 80) {
+    // 防御性上限：只留最早见过的 80 个服务，避免历史服务日志长期占内存
+    const oldest = logCache.keys().next().value
+    if (oldest !== undefined) {
+      logCache.delete(oldest)
+      cacheTailN.delete(oldest)
+    }
+  }
+  if (id === selectedId.value) restoreVisible(id)
+}
+
+function restoreVisible(id: string) {
+  if (id !== selectedId.value) return
+  lines.value = logCache.get(id)?.lines ?? []
+  if (autoScroll.value) {
+    void nextTick().then(() => {
+      if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+    })
+  }
+}
+
+// 请求序号：轮询 / 切服务 / 切行数 / 手动刷新会并发触发 refresh，
+// 每个服务只让最后一次发出的请求写回，防止慢响应把旧快照盖到新快照上
 async function refresh() {
-  const seq = ++reqSeq
-  if (!selectedId.value) {
+  const id = selectedId.value
+  if (!id) {
     lines.value = []
-    lastLineCount = 0
     return
   }
-  try {
-    const r = (await store.getLogs(selectedId.value, tail.value)) as {
-      text: string
+  const tailN = tail.value
+  const key = `${id}:${tailN}`
+
+  let p = inflight.get(key)
+  if (!p) {
+    // 只有真正发请求的那次才占号；复用同 key 在途请求的等待者沿用同一 meta，
+    // 否则响应会被新占的号判为过期而丢弃（界面停在旧窗口）
+    const seq = (reqSeqById.get(id) ?? 0) + 1
+    reqSeqById.set(id, seq)
+    // 缓存缺失或行数切换时 force 一次：主进程的 mtime/size 缓存可能被 CLI/MCP
+    // 等调用方预热过、或行数变了但文件没动，直接放行会返回 unchanged，前端就一直空白/不生效
+    const needForce = !logCache.has(id) || cacheTailN.get(id) !== tailN
+    p = store.getLogs(id, tailN, needForce) as Promise<{
+      text?: string
       unchanged?: boolean
-    }
-    if (seq !== reqSeq) return
-    // 日志没变化就什么都不做。原来每 2 秒都整体替换数组、重建上千个 DOM 节点，
-    // 而绝大多数轮询周期内日志根本没动过。
+    }>
+    inflight.set(key, p)
+    inflightMeta.set(key, { id, seq, tailN })
+    void p
+      .finally(() => {
+        if (inflight.get(key) === p) inflight.delete(key)
+        if (inflightMeta.get(key)?.seq === seq) inflightMeta.delete(key)
+      })
+      .catch(() => {})
+  }
+  const meta = inflightMeta.get(key)
+  if (!meta) return
+  try {
+    const r = (await p) as { text?: string; unchanged?: boolean }
+    if (reqSeqById.get(meta.id) !== meta.seq) return
+    // 日志没变化：缓存里已有正确内容（切回时 restoreVisible 已恢复显示），无需重渲染
     if (r.unchanged) return
-    const newLines = r.text ? r.text.split('\n') : []
-    lines.value = newLines
-    lastLineCount = newLines.length
-    if (autoScroll.value) {
-      await nextTick()
-      if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
-    }
+    const merged = mergeLogWindow(
+      logCache.get(meta.id) ?? null,
+      r.text ?? '',
+      meta.tailN
+    )
+    commit(meta.id, merged.window, meta.tailN)
   } catch {
     // 读日志失败（如服务刚被删除）：跳过本轮，下个轮询周期自动重试，不弹打扰性提示
   }
@@ -109,8 +184,9 @@ async function doClear() {
   clearing.value = true
   try {
     await store.clearLogs(selectedId.value)
+    logCache.delete(selectedId.value)
+    cacheTailN.delete(selectedId.value)
     lines.value = []
-    lastLineCount = 0
     showClearConfirm.value = false
   } finally {
     clearing.value = false
@@ -217,7 +293,8 @@ function scrollToBottom() {
         </div>
 
         <!-- 日志流：纯 div 渲染。逐行 Motion 在 1000 行时开销过大（每行一个动画组件实例），
-             新行动效改为 CSS 动画只挂最后 3 行，key 用 idx 按位置复用、class 不变时不重播 -->
+             新行动效改为 CSS 动画只挂最后 3 行，key 用 idx 按位置复用、class 不变时不重播；
+             纯追加的轮询由 mergeLogWindow 只产出新增行，keyed diff 只插入新节点，不做整表重写 -->
         <!-- data-selectable / overscroll-contain：日志要能选中复制；滚到顶/底时不把滚动传给外层 -->
         <div
           ref="logEl"
@@ -227,7 +304,7 @@ function scrollToBottom() {
           <div
             v-for="(line, idx) in lines"
             :key="idx"
-            :class="idx >= lines.length - 3 && 'log-line-enter'"
+            :class="['log-line', idx >= lines.length - 3 && 'log-line-enter']"
           >
             {{ line }}
           </div>
@@ -302,5 +379,10 @@ function scrollToBottom() {
     opacity: 1;
     transform: translateX(0);
   }
+}
+/* 极致：视口外日志行跳过渲染，1000 行滚动时仅渲染可见区 + 缓冲，GPU 占用骤降 */
+.log-line {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 20px;
 }
 </style>

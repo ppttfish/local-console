@@ -20,9 +20,10 @@ interface ProcessInfo {
 }
 
 type IntervalHandle = ReturnType<typeof setInterval>
+type TimeoutHandle = ReturnType<typeof setTimeout>
 
 export class PortScanner {
-  private timer: IntervalHandle | undefined = undefined
+  private timer: TimeoutHandle | undefined = undefined
   private refreshTimer: IntervalHandle | undefined = undefined
   private cache: PortSnapshot[] = []
   private bus: EventBus
@@ -35,6 +36,9 @@ export class PortScanner {
   /** 防重入：一轮 scan（含 PowerShell 富化，可达数秒）没结束时跳过后续 tick，
    *  否则 2s interval 会不断叠出新的 PowerShell 进程把 CPU 打满 */
   private scanning = false
+  // 极致：自适应退避，稳定时降低 netstat 频率
+  private stableCount = 0
+  private currentInterval = 5000
 
   constructor(bus: EventBus) {
     this.bus = bus
@@ -44,16 +48,29 @@ export class PortScanner {
     this.refreshServiceMap()
     this.refreshTimer = setInterval(() => this.refreshServiceMap(), 5000)
     await this.scan()
-    // 5 秒一轮。原来 2 秒一轮，而状态变化现在会主动推给渲染端，
-    // 没必要让 netstat 每 2 秒 spawn 一次
-    this.timer = setInterval(() => void this.scan(), 5000)
+    this.scheduleNext()
   }
 
   async stop(): Promise<void> {
-    clearInterval(this.timer)
+    if (this.timer) clearTimeout(this.timer)
     clearInterval(this.refreshTimer)
     this.timer = undefined
     this.refreshTimer = undefined
+  }
+
+  private scheduleNext(): void {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = setTimeout(() => void this.scanAndReschedule(), this.currentInterval)
+  }
+
+  private async scanAndReschedule(): Promise<void> {
+    await this.scan()
+    // 自适应：连续稳定则退避，变化则立即回到 5s
+    if (this.stableCount >= 6) this.currentInterval = 30000
+    else if (this.stableCount >= 3) this.currentInterval = 10000
+    else if (this.stableCount >= 1) this.currentInterval = 5000
+    else this.currentInterval = 5000
+    this.scheduleNext()
   }
 
   snapshot(): PortSnapshot[] {
@@ -112,7 +129,11 @@ export class PortScanner {
       const sig = this.cache.map((p) => `${p.port}:${p.pid}`).join(',')
       if (sig !== this.lastPortSig) {
         this.lastPortSig = sig
+        this.stableCount = 0
+        this.currentInterval = 5000
         this.bus.emit_event({ type: 'port:changed', ports: this.cache })
+      } else {
+        this.stableCount++
       }
     } catch {
       // 静默
@@ -145,11 +166,55 @@ export class PortScanner {
   }
 
   /**
-   * 单次 PowerShell 批量拉取目标 PID 的进程信息。
-   * 用 WMI 的 -Filter 把条件下推到服务端，而不是 `Get-CimInstance | Where-Object`
-   * —— 后者要枚举机器上所有进程再在 PowerShell 里过滤，固定开销约 1.5s。
+   * 单次批量拉取目标 PID 的进程信息 —— 优先 wmic（~300ms），失败回退 PowerShell。
+   * wmic 用 where 子句下推，仅查缺失 PID，避免全量 Get-CimInstance 1.5s 开销。
    */
   private getProcessInfo(pids: number[]): Promise<Map<number, ProcessInfo>> {
+    if (pids.length === 0) return Promise.resolve(new Map())
+    // 优先 wmic，失败回退 powershell
+    return this.getProcessInfoViaWmic(pids).then((m) => {
+      if (m.size > 0) return m
+      return this.getProcessInfoViaPowershell(pids)
+    }).catch(() => this.getProcessInfoViaPowershell(pids))
+  }
+
+  private getProcessInfoViaWmic(pids: number[]): Promise<Map<number, ProcessInfo>> {
+    const { promise, resolve } = Promise.withResolvers<Map<number, ProcessInfo>>()
+    const whereClause = pids.map((p) => `ProcessId=${p}`).join(' or ')
+    const p = spawn('wmic', ['process', 'where', whereClause, 'get', 'ProcessId,Name,ExecutablePath,CommandLine', '/format:csv'], { windowsHide: true, shell: false })
+    let out = ''
+    const killTimer = setTimeout(() => { try { p.kill() } catch {} }, 5000)
+    p.stdout.on('data', (d) => (out += d.toString()))
+    p.on('close', () => {
+      clearTimeout(killTimer)
+      const map = new Map<number, ProcessInfo>()
+      try {
+        const lines = out.split(/\r?\n/).filter((l) => l.trim().length > 0)
+        if (lines.length >= 2) {
+          const header = parseCsvLine(lines[0]!)
+          const idxPid = header.indexOf('ProcessId')
+          const idxName = header.indexOf('Name')
+          const idxExe = header.indexOf('ExecutablePath')
+          const idxCmd = header.indexOf('CommandLine')
+          for (let i = 1; i < lines.length; i++) {
+            const cells = parseCsvLine(lines[i]!)
+            const pid = parseInt(cells[idxPid] ?? '', 10)
+            if (!Number.isFinite(pid)) continue
+            const name = (cells[idxName] ?? '').trim() || '?'
+            const exe = (cells[idxExe] ?? '').trim()
+            const cmd = (cells[idxCmd] ?? '').trim().slice(0, 200)
+            const cwd = exe ? exe.slice(0, Math.max(exe.lastIndexOf('\\'), exe.lastIndexOf('/'))) || null : null
+            map.set(pid, { name, cmd, cwd: cwd && cwd.length > 0 ? cwd : null })
+          }
+        }
+      } catch {}
+      resolve(map)
+    })
+    p.on('error', () => { clearTimeout(killTimer); resolve(new Map()) })
+    return promise
+  }
+
+  private getProcessInfoViaPowershell(pids: number[]): Promise<Map<number, ProcessInfo>> {
     const { promise, resolve } = Promise.withResolvers<Map<number, ProcessInfo>>()
     if (pids.length === 0) {
       resolve(new Map())
@@ -169,8 +234,12 @@ Get-CimInstance -ClassName Win32_Process -Filter $filter | ForEach-Object {
       { windowsHide: true }
     )
     let out = ''
+    const killTimer = setTimeout(() => {
+      try { p.kill() } catch {}
+    }, 8000)
     p.stdout.on('data', (d) => (out += d.toString()))
     p.on('close', () => {
+      clearTimeout(killTimer)
       const map = new Map<number, ProcessInfo>()
       try {
         const parsed = JSON.parse(out.trim() || '[]')
@@ -188,7 +257,31 @@ Get-CimInstance -ClassName Win32_Process -Filter $filter | ForEach-Object {
       }
       resolve(map)
     })
-    p.on('error', () => resolve(new Map()))
+    p.on('error', () => {
+      clearTimeout(killTimer)
+      resolve(new Map())
+    })
     return promise
   }
+}
+
+function parseCsvLine(line: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { cur += '"'; i++ }
+      else inQuotes = !inQuotes
+    } else if (ch === ',' && !inQuotes) {
+      out.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  out.push(cur)
+  // 去掉首尾引号
+  return out.map((s) => s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1).replace(/""/g, '"') : s)
 }

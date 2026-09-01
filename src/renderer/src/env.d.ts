@@ -18,7 +18,7 @@ export interface LcpApi {
   restartService: (id: string) => Promise<unknown>
   stopExternalService: (id: string) => Promise<unknown>
   reorderServices: (ids: string[]) => Promise<unknown>
-  getServiceLogs: (id: string, tail?: number) => Promise<unknown>
+  getServiceLogs: (id: string, tail?: number, force?: boolean) => Promise<unknown>
   clearServiceLogs: (id: string) => Promise<unknown>
   resetLogCounter: (id: string) => Promise<unknown>
   detectProject: (cwd: string) => Promise<unknown>
@@ -38,6 +38,7 @@ export interface LcpApi {
   usageRescan: () => Promise<unknown>
   usageStatus: () => Promise<unknown>
   usageRecap: () => Promise<unknown>
+  usageBatch?: (args: { filter: unknown; granularity: string; limit?: number }) => Promise<unknown>
 
   // 订阅监控
   subList: () => Promise<unknown>

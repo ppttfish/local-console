@@ -8,10 +8,9 @@ import {
   mkdirSync,
   createWriteStream,
   renameSync,
-  writeFileSync,
-  readFileSync,
   type WriteStream
 } from 'node:fs'
+import { writeFile, readFile, stat as statAsync } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import {
   listServices,
@@ -26,7 +25,7 @@ import {
   type ServiceRow
 } from './db.js'
 import { EventBus } from './event-bus.js'
-import { pidAlive, pidMemoryMb } from './proc-info.js'
+import { pidAliveAsync, pidMemoryMb, pidMemoryMbAsync, triggerMemoryRefresh } from './proc-info.js'
 import type {
   AppState,
   ServiceState,
@@ -57,6 +56,10 @@ interface RunningProc {
   logBytes: number
   /** 轮转窗口内攒下的待写内容 */
   pending: string[]
+  /** 微批次聚合：高频 stdout 时合并为一次 write，减少 syscall */
+  logBatch: string[]
+  logBatchBytes: number
+  logFlushScheduled: boolean
 }
 
 /** 单个日志文件超过这个大小就轮转为 <id>.log.1，重新开始写 */
@@ -78,6 +81,7 @@ export class ServiceManager {
   private paths: ServiceManagerPaths
   /** 端口快照提供者（由运行时注入 PortScanner.snapshot），用于合并 listening 信息 */
   private portProvider: (() => PortSnapshot[]) | null = null
+  private memRefreshTimer: ReturnType<typeof setInterval> | undefined = undefined
 
   constructor(bus: EventBus, paths: ServiceManagerPaths) {
     this.bus = bus
@@ -93,9 +97,20 @@ export class ServiceManager {
     for (const s of listServices()) {
       this.statuses.set(s.id, 'stopped')
     }
+    // 后台内存采样：每 5s 异步刷新一次 wmic，避免快照热路径同步 spawn 导致卡顿
+    if (!this.memRefreshTimer) {
+      this.memRefreshTimer = setInterval(() => {
+        const pids = this.managedPids()
+        if (pids.length > 0) triggerMemoryRefresh(pids)
+      }, 5000)
+    }
   }
 
   async shutdown(): Promise<void> {
+    if (this.memRefreshTimer) {
+      clearInterval(this.memRefreshTimer)
+      this.memRefreshTimer = undefined
+    }
     await this.stopAll()
   }
 
@@ -120,10 +135,10 @@ export class ServiceManager {
 
   list(): ServiceState[] {
     const rows = listServices()
-    // 内存要批量查（一次 wmic），不能在 toState 里逐条查 —— 那样每查一个
-    // PID 就把共享缓存覆盖掉，后面的服务全部查不到
     const mem = pidMemoryMb(this.managedPids())
-    return rows.map((s) => this.toState(s, mem))
+    // 极致：端口表转 Map，100 服务 × 50 端口时由 O(N*M) 降为 O(N+M)
+    const portMap = this.buildPortMap()
+    return rows.map((s) => this.toState(s, mem, portMap))
   }
 
   get(id: string): ServiceState | null {
@@ -131,7 +146,25 @@ export class ServiceManager {
     if (!s) return null
     const proc = this.procs.get(s.id)
     const mem = proc?.pid ? pidMemoryMb([proc.pid]) : null
-    return this.toState(s, mem ?? undefined)
+    const portMap = this.buildPortMap()
+    return this.toState(s, mem ?? undefined, portMap)
+  }
+
+  private buildPortMap(): Map<number, PortSnapshot> | null {
+    if (!this.portProvider) return null
+    const arr = this.portProvider()
+    const m = new Map<number, PortSnapshot>()
+    for (const p of arr) m.set(p.port, p)
+    return m
+  }
+
+  /** 异步 variant：需要最新内存时用（非热路径），会等待 wmic 完成 */
+  async listAsync(): Promise<ServiceState[]> {
+    const rows = listServices()
+    const pids = this.managedPids()
+    const mem = pids.length > 0 ? await pidMemoryMbAsync(pids) : new Map()
+    const portMap = this.buildPortMap()
+    return rows.map((s) => this.toState(s, mem, portMap))
   }
 
   private managedPids(): number[] {
@@ -199,7 +232,9 @@ export class ServiceManager {
     }
     const s = getService(id)
     if (!s) return { ok: false, error: '服务不存在' }
-    if (!existsSync(s.cwd)) {
+    try {
+      await statAsync(s.cwd)
+    } catch {
       return { ok: false, error: `工作目录不存在: ${s.cwd}` }
     }
     if (!existsSync(this.paths.logsDir)) {
@@ -207,7 +242,8 @@ export class ServiceManager {
     }
     const logPath = join(this.paths.logsDir, `${id}.log`)
     const header = `--- ${new Date().toISOString()} start ---\n`
-    writeFileSync(logPath, header)
+    try { await writeFile(logPath, header) } catch {}
+    // 非热路径的二次校验仍用同步，但包 try 避免异常冒泡
     const commandIssue = diagnoseCommand(s.command)
     if (commandIssue) {
       return {
@@ -257,7 +293,10 @@ export class ServiceManager {
       trigger,
       logStream: null,
       logBytes: Buffer.byteLength(header),
-      pending: []
+      pending: [],
+      logBatch: [],
+      logBatchBytes: 0,
+      logFlushScheduled: false
     }
     this.procs.set(id, proc)
     this.openLogStream(proc)
@@ -463,6 +502,7 @@ export class ServiceManager {
   }
 
   private closeLogStream(proc: RunningProc): void {
+    this.flushLogBatch(proc)
     try {
       proc.logStream?.end()
     } catch {
@@ -478,6 +518,7 @@ export class ServiceManager {
    * 高频输出的服务会周期性卡住主进程。rename 是元数据操作，成本恒定。
    */
   private rotateLog(proc: RunningProc): void {
+    this.flushLogBatch(proc)
     const old = proc.logStream
     proc.logStream = null
 
@@ -511,36 +552,60 @@ export class ServiceManager {
     if (!proc) return
     proc.logBytes = 0
     proc.pending = []
+    proc.logBatch = []
+    proc.logBatchBytes = 0
+    proc.logFlushScheduled = false
   }
 
   private appendLog(proc: RunningProc, chunk: string | Buffer): void {
-    const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
-    const bytes = Buffer.byteLength(text)
+    const isBuf = typeof chunk !== 'string'
+    const text = isBuf ? (chunk as Buffer).toString('utf8') : chunk
+    const bytes = isBuf ? (chunk as Buffer).length : Buffer.byteLength(text)
 
     if (proc.logStream) {
-      proc.logStream.write(text)
+      // 微批次：16ms 内聚合，减少高频小 write 的 syscall 次数
+      proc.logBatch.push(text)
+      proc.logBatchBytes += bytes
       proc.logBytes += bytes
+      if (proc.logBatchBytes >= 8192 || proc.logBatch.length >= 32) {
+        this.flushLogBatch(proc)
+      } else if (!proc.logFlushScheduled) {
+        proc.logFlushScheduled = true
+        setImmediate(() => this.flushLogBatch(proc))
+      }
       if (proc.logBytes > LOG_MAX_BYTES) this.rotateLog(proc)
     } else if (proc.pending.length === 0 && bytes < LOG_PENDING_MAX) {
-      // 轮转窗口（流关闭 → 重开）很短，攒一下再补写，不直接丢
       proc.pending.push(text)
     }
   }
 
+  private flushLogBatch(proc: RunningProc): void {
+    if (!proc.logStream || proc.logBatch.length === 0) {
+      proc.logFlushScheduled = false
+      return
+    }
+    const batch = proc.logBatch.join('')
+    proc.logBatch = []
+    proc.logBatchBytes = 0
+    proc.logFlushScheduled = false
+    try { proc.logStream.write(batch) } catch {}
+  }
+
   private toState(
     s: ServiceRow,
-    mem?: Map<number, number>
+    mem?: Map<number, number>,
+    portMap?: Map<number, PortSnapshot> | null
   ): ServiceState {
     const proc = this.procs.get(s.id)
     let listening = false
     let portPid: number | null = null
     let portProcessName: string | null = null
-    if (s.port && this.portProvider) {
-      const hit = this.portProvider().find((p) => p.port === s.port)
+    if (s.port) {
+      const map = portMap ?? this.buildPortMap()
+      const hit = map?.get(s.port)
       if (hit) {
         listening = true
         portPid = hit.pid
-        // 本台托管的进程由 pid 字段表达，外部占用才带进程名
         if (!proc || proc.pid !== hit.pid) {
           portProcessName = hit.process_name
         }
@@ -582,7 +647,7 @@ export class ServiceManager {
     }
     const pid = hit.pid
     // netstat 缓存最长 2 秒，二次确认 PID 仍存活，防止误杀到复用 PID 的新进程
-    if (!pidAlive(pid)) {
+    if (!(await pidAliveAsync(pid))) {
       return { ok: false, error: `进程 ${pid} 已退出（端口数据尚未刷新）` }
     }
     try {
@@ -597,16 +662,18 @@ export class ServiceManager {
     // 等进程真正退出（最多 3 秒），给随后的「启动」一个干净端口
     const deadline = Date.now() + 3000
     while (Date.now() < deadline) {
-      if (!pidAlive(pid)) return { ok: true, pid }
+      if (!(await pidAliveAsync(pid))) return { ok: true, pid }
       await new Promise<void>((r) => setTimeout(r, 300))
     }
     return { ok: true, pid }
   }
 
   // ========== 项目识别 ==========
-
-  detectProject(cwd: string): ProjectDetection {
-    if (!existsSync(cwd)) {
+  // 极致：全异步，避免同步 stat/read 阻塞主线程（用户选目录时触发，非轮询但仍需不卡）
+  async detectProject(cwd: string): Promise<ProjectDetection> {
+    try {
+      await statAsync(cwd)
+    } catch {
       return { ok: false, cwd, name: basename(cwd), files: [], candidates: [] }
     }
     const name = basename(cwd)
@@ -614,19 +681,27 @@ export class ServiceManager {
     const candidates: ProjectDetection['candidates'] = []
 
     const pkgPath = join(cwd, 'package.json')
-    if (existsSync(pkgPath)) {
+    let hasPkg = false
+    try {
+      await statAsync(pkgPath)
+      hasPkg = true
+    } catch {}
+    if (hasPkg) {
       files.push('package.json')
       try {
-        const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
+        const raw = await readFile(pkgPath, 'utf8')
+        const pkg = JSON.parse(raw) as {
           scripts?: Record<string, string>
           packageManager?: string
         }
         const scripts = pkg.scripts || {}
-        const usePnpm =
-          existsSync(join(cwd, 'pnpm-lock.yaml')) ||
-          existsSync(join(cwd, 'pnpm-workspace.yaml')) ||
-          String(pkg.packageManager || '').includes('pnpm')
-        const useYarn = existsSync(join(cwd, 'yarn.lock'))
+        let usePnpm = String(pkg.packageManager || '').includes('pnpm')
+        let useYarn = false
+        if (!usePnpm) {
+          try { await statAsync(join(cwd, 'pnpm-lock.yaml')); usePnpm = true } catch {}
+          if (!usePnpm) try { await statAsync(join(cwd, 'pnpm-workspace.yaml')); usePnpm = true } catch {}
+        }
+        if (!usePnpm) try { await statAsync(join(cwd, 'yarn.lock')); useYarn = true } catch {}
         const runner = usePnpm ? 'pnpm' : useYarn ? 'yarn' : 'npm'
         const svcKeys = new Set([
           'd', 's', 'dev', 'start', 'serve', 'preview', 'p', 'run'
@@ -650,10 +725,10 @@ export class ServiceManager {
       }
     }
 
-    if (
-      existsSync(join(cwd, 'pyproject.toml')) ||
-      existsSync(join(cwd, 'requirements.txt'))
-    ) {
+    let hasPy = false
+    try { await statAsync(join(cwd, 'pyproject.toml')); hasPy = true } catch {}
+    if (!hasPy) try { await statAsync(join(cwd, 'requirements.txt')); hasPy = true } catch {}
+    if (hasPy) {
       files.push('python')
       candidates.push({
         command: 'python -m uvicorn main:app --reload',
@@ -665,7 +740,9 @@ export class ServiceManager {
       })
     }
 
-    if (existsSync(join(cwd, 'Cargo.toml'))) {
+    let hasCargo = false
+    try { await statAsync(join(cwd, 'Cargo.toml')); hasCargo = true } catch {}
+    if (hasCargo) {
       files.push('Cargo.toml')
       candidates.push({
         command: 'cargo run',
@@ -678,6 +755,34 @@ export class ServiceManager {
     }
 
     return { ok: true, cwd, name, files, candidates }
+  }
+
+  // 同步兼容：保留给极少数同步调用方，回退为异步的同步快照（已不推荐）
+  detectProjectSync(cwd: string): ProjectDetection {
+    // 极致兜底：同步版仅做最小检查，避免在新代码中被误用
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+      const { existsSync: es, readFileSync: rfs } = require('node:fs') as typeof import('node:fs')
+      if (!es(cwd)) return { ok: false, cwd, name: basename(cwd), files: [], candidates: [] }
+      const name = basename(cwd)
+      const files: string[] = []
+      const candidates: ProjectDetection['candidates'] = []
+      const pkgPath = join(cwd, 'package.json')
+      if (es(pkgPath)) {
+        files.push('package.json')
+        try {
+          const pkg = JSON.parse(rfs(pkgPath, 'utf8')) as { scripts?: Record<string, string> }
+          const scripts = pkg.scripts || {}
+          for (const [k, v] of Object.entries(scripts)) {
+            if (typeof v !== 'string') continue
+            candidates.push({ command: `npm ${k}`, label: `npm ${k}`, source: 'package.json', port: this.guessPort(v), kind: 'service', detail: v.slice(0, 80) })
+          }
+        } catch {}
+      }
+      return { ok: true, cwd, name, files, candidates }
+    } catch {
+      return { ok: false, cwd, name: basename(cwd), files: [], candidates: [] }
+    }
   }
 
   private guessPort(cmd: string): number | null {

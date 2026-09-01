@@ -81,6 +81,8 @@ const DEFAULT: PricingTable = {
 }
 
 let cached: PricingTable | null = null
+// 极致：priceFor 模糊匹配命中后常驻内存，5000 行扫描由 40 万次 startsWith 降至数百次
+const priceCache = new Map<string, ModelPrice>()
 
 function pricePath(): string {
   // 不能依赖 electron 的 app.getPath：MCP 子进程是 ELECTRON_RUN_AS_NODE=1 跑的，
@@ -101,17 +103,20 @@ export function loadPricing(): PricingTable {
         models?: Record<string, ModelPrice>
       }
       cached = { ...DEFAULT, ...(raw.models ?? {}) }
+      priceCache.clear()
       return cached
     } catch {
       // 忽略
     }
   }
   cached = { ...DEFAULT }
+  priceCache.clear()
   return cached
 }
 
 export function savePricing(table: PricingTable): void {
   cached = table
+  priceCache.clear()
   const p = pricePath()
   const dir = join(p, '..')
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
@@ -119,15 +124,26 @@ export function savePricing(table: PricingTable): void {
 }
 
 export function priceFor(model: string): ModelPrice {
+  const hit = priceCache.get(model)
+  if (hit) return hit
   const t = loadPricing()
   // 精确匹配
-  if (t[model]) return t[model]!
+  if (t[model]) {
+    priceCache.set(model, t[model]!)
+    return t[model]!
+  }
   // 模糊匹配：按前缀（处理 claude-opus-4-7 vs claude-opus-4）
   for (const k of Object.keys(t)) {
-    if (model.startsWith(k) || k.startsWith(model)) return t[k]!
+    if (model.startsWith(k) || k.startsWith(model)) {
+      const v = t[k]!
+      priceCache.set(model, v)
+      return v
+    }
   }
   // 默认 0
-  return { input: 0, output: 0, cache_read: 0, cache_write: 0 }
+  const zero: ModelPrice = { input: 0, output: 0, cache_read: 0, cache_write: 0 }
+  priceCache.set(model, zero)
+  return zero
 }
 
 /**

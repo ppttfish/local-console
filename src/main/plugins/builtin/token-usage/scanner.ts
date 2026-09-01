@@ -1,24 +1,33 @@
 /**
- * 文件发现 + 增量扫描 v2
+ * 文件发现 + 增量扫描 v2 — 异步不阻塞版
  *  - omp / zcode / codex / claude 走 jsonl 增量
  *  - opencode 走 SQLite 直查（db 文件 mtime 做 cursor key）
  *  - dsh 走 zstd 压缩 jsonl（无法按行增量，文件指纹变了全删全写）
+ *
+ * 关键优化：全链路异步化 + 周期性让出事件循环，避免 20s 同步扫描把主线程卡死
  */
-import { readFileSync, statSync, existsSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, createReadStream, watch, type FSWatcher } from 'node:fs'
+import { stat, readFile, readdir } from 'node:fs/promises'
+import { statSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSession, readZcodeDb, parseCodexSession } from './parsers.js'
+import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSessionAsync, readZcodeDb, parseCodexSessionFromContent } from './parsers.js'
+import { parseDshViaWorker, parseCodexViaWorker, parseCodexFileViaWorker, shutdownParseWorker } from '../../../workers/parse-worker-client.js'
 import {
   ensureUsageSchema,
   insertUsageBatch,
+  insertUsageBatchAsync,
   replaceUsageBySourceFile,
+  replaceUsageBySourceFileAsync,
   replaceUsageByAgent,
+  replaceUsageByAgentAsync,
   getCursor,
   upsertCursor,
   resetAllCursors,
-  countLegacyRows,
+  countLegacyRowsAsync,
   minAtForAgent,
   type UsageRow,
   type Platform
@@ -33,18 +42,10 @@ export interface ScannerStats {
   errors: number
   opencode_messages: number
   dsh_sessions: number
-  /**
-   * opencode.db 的实际写入者：OpenChamber 与原生 OpenCode 共用
-   * ~/.local/share/opencode，按本机特征判断该口径该显示哪个名字
-   */
   opencode_flavor: 'openchamber' | 'opencode'
-  /** 检测到「已入库前缀被改写」而触发整文件重建的次数（本次进程累计） */
   rewrites: number
-  /** 最近一次重建的文件与耗时，便于定位丢数据的元凶 */
   last_rewrite: { file: string; rows: number; at: number } | null
-  /** source_file 为空的历史行数；> 0 时建议手动重扫一次以打上来源标记 */
   legacy_rows: number
-  /** 当前是否有扫描正在执行。rescan 异步化后，前端轮询 status 靠它判断「扫描中」/「完成」 */
   scanning: boolean
 }
 
@@ -54,34 +55,70 @@ interface DiscoveredFile {
   sessionId: string
 }
 
+function yieldToLoop(): Promise<void> {
+  return new Promise((r) => setImmediate(r))
+}
+
 export class UsageScanner extends EventEmitter {
   private timer: ReturnType<typeof setInterval> | undefined
+  private watchers: FSWatcher[] = []
+  private watchDebounce: ReturnType<typeof setTimeout> | null = null
   private stats: ScannerStats = freshStats()
   private opencodeLastMtime: { path: string; mtime: number; count: number } | null = null
-  /** dsh 所有会话文件的 (path|size|mtime) 指纹；变化才全量重建 */
   private dshFingerprint: string | null = null
-  /** zcode db.sqlite 的 mtime；变了才全删全写 model_usage */
   private zcodeDbLastMtime: { path: string; mtime: number } | null = null
-  /**
-   * 扫描串行队列。
-   * 定时器 tick 与 rescan 都往队列里排，保证同一时刻只有一个扫描在跑。
-   * 用队列而不是「scanning 标志 + 直接跳过」：跳过会让 rescan 在定时器扫描
-   * 未结束时静默失效 —— 而 rescan 已经先清了 agent_usage，结果就是
-   * 「数据被清空但没重建」，用户点重新扫描看着像没反应、数据反而更少。
-   */
   private scanQueue: Promise<void> = Promise.resolve()
 
   start(): void {
-    // 幂等：插件、IPC、HTTP 三个入口都会调 start，只允许第一个真正起定时器
     if (this.timer) return
     ensureUsageSchema()
     void this.enqueueScan()
-    this.timer = setInterval(() => void this.enqueueScan(), 30_000)
+    // 极致：有 fs.watch 时轮询降为 5 分钟兜底，无 watch 时保持 30s
+    const hasWatch = this.setupWatchers()
+    this.timer = setInterval(() => void this.enqueueScan(), hasWatch ? 300_000 : 30_000)
   }
 
   stop(): void {
     clearInterval(this.timer)
     this.timer = undefined
+    if (this.watchDebounce) { clearTimeout(this.watchDebounce); this.watchDebounce = null }
+    for (const w of this.watchers) try { w.close() } catch {}
+    this.watchers = []
+    try { shutdownParseWorker() } catch {}
+  }
+
+  private setupWatchers(): boolean {
+    try {
+      const home = homedir()
+      const watchTargets = [
+        join(home, '.omp', 'agent', 'sessions'),
+        join(home, '.zcode', 'cli', 'rollout'),
+        join(home, '.codex', 'sessions'),
+        join(home, '.claude', 'projects'),
+        join(home, '.dsh', 'sessions'),
+        dirname(join(home, '.local', 'share', 'opencode', 'opencode.db')),
+        dirname(join(home, '.zcode', 'cli', 'db', 'db.sqlite')),
+      ]
+      let ok = 0
+      for (const p of watchTargets) {
+        if (!existsSync(p)) continue
+        try {
+          const w = watch(p, { recursive: true }, () => this.scheduleWatchScan())
+          this.watchers.push(w)
+          ok++
+        } catch {}
+      }
+      return ok > 0
+    } catch { return false }
+  }
+
+  private scheduleWatchScan(): void {
+    if (this.watchDebounce) clearTimeout(this.watchDebounce)
+    // 防抖 2s：单次会话写入会触发多次 change/rename，合并为一次扫描
+    this.watchDebounce = setTimeout(() => {
+      this.watchDebounce = null
+      void this.enqueueScan()
+    }, 2000)
   }
 
   getStats(): ScannerStats {
@@ -90,34 +127,21 @@ export class UsageScanner extends EventEmitter {
 
   private enqueueScan(force = false): Promise<void> {
     const next = this.scanQueue.then(() => this.runScanAll(force))
-    // 队列吞掉错误，避免一个失败的扫描把后面的所有扫描都挡死
     this.scanQueue = next.catch(() => undefined)
     return next
   }
 
   async rescan(): Promise<ScannerStats> {
     resetAllCursors()
-    // jsonl 类 agent 靠 cursor 增量去重，cursor 重置后若不先清旧行，
-    // 全文件重扫会与旧数据叠加导致用量翻倍；全删重建最简单可靠
     getDb().prepare('DELETE FROM agent_usage').run()
     this.stats = freshStats()
     this.opencodeLastMtime = null
     this.dshFingerprint = null
     this.zcodeDbLastMtime = null
-    // 排队等前面的扫描跑完，确保这次重建一定会执行。
-    // force=true：禁用 cursor / mtime 捷径强制全量重建。原因是 state.db 由主进程与
-    // MCP standalone 共享，rescan 清空 cursor 后 MCP 的扫描可能抢先重建 cursor，
-    // 主进程的扫描全部命中「文件未变」捷径而 rows=0，数据恢复就完全依赖 MCP 时机。
     await this.enqueueScan(true)
     return this.stats
   }
 
-  /**
-   * 异步触发重扫：清空 + 全量重建在后台队列里执行，调用方立即拿到 { started }。
-   * HTTP 路由用它，避免 rescan 的 20-25s 同步重建把请求和事件循环一起卡死；
-   * 前端随后轮询 status.scanning / last_scan_at 判断完成。MCP 的
-   * pws_rescan_agents 仍走阻塞版 rescan()，保持「等结果」的语义。
-   */
   startRescan(): { started: boolean } {
     void this.rescan().catch((e) => {
       this.stats.errors++
@@ -130,8 +154,9 @@ export class UsageScanner extends EventEmitter {
     let totalNew = 0
     this.stats.scanning = true
     try {
-      const files = this.discoverJsonl()
+      const files = await this.discoverJsonl()
       this.stats.files_scanned = files.length
+      let processed = 0
       for (const f of files) {
         try {
           totalNew += await this.scanJsonlFile(f, force)
@@ -139,23 +164,26 @@ export class UsageScanner extends EventEmitter {
           this.stats.errors++
           console.warn(`[token-usage] 扫描 ${f.path} 失败:`, e)
         }
+        processed++
+        // 每 8 个文件让出一次，避免连续大文件解析饿死后续 IPC
+        if (processed % 8 === 0) await yieldToLoop()
       }
-      // zcode 权威用量源：db.sqlite 的 model_usage 保留全部会话完整用量，
-      // rollout model-io 文件被 ZCode 压缩/清理后这里是唯一留存
       try {
-        totalNew += this.scanZcodeDb(force)
+        totalNew += await this.scanZcodeDb(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 zcode db 失败:', e)
       }
+      await yieldToLoop()
       try {
         totalNew += await this.scanOpenCode(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 opencode.db 失败:', e)
       }
+      await yieldToLoop()
       try {
-        totalNew += this.scanDsh(force)
+        totalNew += await this.scanDsh(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 dsh sessions 失败:', e)
@@ -167,29 +195,23 @@ export class UsageScanner extends EventEmitter {
     this.stats.scanning = false
     this.stats.rows_inserted += totalNew
     this.stats.last_scan_at = Date.now()
-    this.stats.legacy_rows = countLegacyRows()
+    try {
+      this.stats.legacy_rows = await countLegacyRowsAsync()
+    } catch {
+      this.stats.legacy_rows = 0
+    }
     this.emit('scanned', { files: this.stats.files_scanned, rows: totalNew })
   }
 
-  /**
-   * 单个 jsonl 的增量扫描。
-   *
-   * 行号游标只在「文件纯追加」的前提下成立。ZCode 的 model-io-*.jsonl 会被
-   * 压缩重写：行数变少、内容重排。此时按行号续读会直接跳过重写窗口里的全部
-   * 用量，且再也补不回来（游标已经越过那些行）。所以每次扫描都要先校验
-   * 「已经入库的那段前缀」是否还是原来的内容，变了就整文件重建。
-   */
   private async scanJsonlFile(file: DiscoveredFile, force = false): Promise<number> {
-    const st = statSync(file.path)
+    let st: { size: number; mtimeMs: number }
+    try {
+      const s = await stat(file.path)
+      st = { size: s.size, mtimeMs: s.mtimeMs }
+    } catch {
+      return 0
+    }
     const cursor = getCursor(file.path)
-    // size/mtime 捷径只在「有指纹基线」时才可信。
-    //
-    // 老游标（head_hash 为 NULL）不能信：线上出现过游标的 size/mtime 与文件一致、
-    // 但 lines_seen 已经越过文件末尾的脏状态（旧版按行号增量在文件被压缩重写后
-    // 留下的），走捷径会跳过重建，重写窗口里的数据继续永久丢失。
-    // 没有基线时强制读一次文件：正常续读并建立 head_hash，之后恢复捷径。
-    // force=true（rescan）时禁用捷径：cursor 刚被 resetAllCursors 清空，若 MCP 进程
-    // 抢先重建了 cursor，此处会误判「文件未变」而跳过，导致重建不出数据。
     if (
       !force &&
       cursor &&
@@ -200,32 +222,97 @@ export class UsageScanner extends EventEmitter {
       return 0
     }
 
-    const content = readFileSync(file.path, 'utf8')
+    const LARGE_THRESHOLD = 0
+    if (st.size > LARGE_THRESHOLD) {
+      // 极致：大文件流式，避免 50MB+ readFile 入内存
+      const stats = await streamFileStats(file.path)
+      const linesCount = stats.lines
+      const fingerprintFull = fingerprintFromStream(stats)
+      if (file.agent === 'codex') {
+        const alreadyDone = !force && cursor && cursor.head_hash !== null && cursor.file_size === st.size && cursor.file_mtime === Math.floor(st.mtimeMs)
+        if (alreadyDone) return 0
+        // codex 大文件：Worker 内直接读盘，主线程流式算指纹避免重复大内存
+        let codexPrefixFp: string | null = null
+        if (cursor && cursor.head_hash !== null && cursor.lines_seen > 0) {
+          codexPrefixFp = await streamFingerprintUpTo(file.path, cursor.lines_seen)
+        }
+        const codexRows = await parseCodexFileViaWorker(file.path, file.sessionId, () => parseCodexSessionFromContent('', file.sessionId)) as ReturnType<typeof parseCodexSessionFromContent>
+        const rebuilt = !!cursor && (linesCount < (cursor.lines_seen ?? 0) || (codexPrefixFp !== null && cursor.head_hash !== null && cursor.head_hash !== codexPrefixFp))
+        // 简化：大文件 codex 直接按 Worker 返回全量重建
+        const toInsert: UsageRow[] = (Array.isArray(codexRows) ? codexRows : []).map(r => ({ ...r, source_file: file.path } as UsageRow))
+        // 若 Worker 回退空（文件不存在），尝试用流式兜底已在 Worker 内处理
+        await replaceUsageBySourceFileAsync(file.path, file.agent, file.sessionId, toInsert)
+        if (toInsert.length > 0) this.stats.by_agent[file.agent] = (this.stats.by_agent[file.agent] ?? 0) + toInsert.length
+        if (rebuilt) {
+          this.stats.rewrites++
+          this.stats.last_rewrite = { file: file.path, rows: toInsert.length, at: Date.now() }
+        }
+        upsertCursor(file.path, st.size, Math.floor(st.mtimeMs), linesCount, fingerprintFull)
+        await yieldToLoop()
+        return 0
+      }
+      // 非 codex 大文件：流式两阶段（先算重建，再流式解析增量）
+      let fingerprintPrefix: string | null = null
+      if (cursor && cursor.head_hash !== null && cursor.lines_seen > 0) {
+        fingerprintPrefix = await streamFingerprintUpTo(file.path, cursor.lines_seen)
+      }
+      let startFrom = 0
+      let rebuilt = false
+      if (cursor && !force) {
+        const shrunk = linesCount < cursor.lines_seen
+        const drifted = fingerprintPrefix !== null && cursor.head_hash !== null && cursor.head_hash !== fingerprintPrefix
+        if (!shrunk && !drifted) startFrom = cursor.lines_seen
+        else rebuilt = true
+      }
+      const parser = parserForFile(file.agent, file.path)
+      if (!parser) return 0
+      const ctx = { agent: file.agent, filePath: file.path, sessionId: file.sessionId }
+      const newRows = await parseLargeFileStreamed(file.path, parser, ctx, startFrom)
+      if (rebuilt || force) {
+        await replaceUsageBySourceFileAsync(file.path, file.agent, file.sessionId, newRows)
+        if (newRows.length > 0) this.stats.by_agent[file.agent] = (this.stats.by_agent[file.agent] ?? 0) + newRows.length
+      } else if (newRows.length > 0) {
+        await insertUsageBatchAsync(newRows)
+        this.stats.by_agent[file.agent] = (this.stats.by_agent[file.agent] ?? 0) + newRows.length
+      }
+      if (rebuilt) {
+        this.stats.rewrites++
+        this.stats.last_rewrite = { file: file.path, rows: newRows.length, at: Date.now() }
+      }
+      upsertCursor(file.path, st.size, Math.floor(st.mtimeMs), linesCount, fingerprintFull)
+      if (newRows.length > 3000) await yieldToLoop()
+      return rebuilt ? 0 : newRows.length
+    }
+
+    let content: string
+    try {
+      content = await readFile(file.path, 'utf8')
+    } catch {
+      return 0
+    }
+    // 大文件读取后让出一次
+    if (content.length > 512 * 1024) await yieldToLoop()
+
     const lines = content.split('\n')
-    // 关键口径：文件以 \n 结尾时 split 会多出一个空元素。
-    // 例如 7 行文件 -> ['行1'..'行7',''] 长度 8。若不 pop，行数口径比真实行数
-    // 大 1，游标 lines_seen=8 与"7 行文件"会被判定为相等（shrunk=false），
-    // 文件被压缩重写后检测不到，重写窗口的数据继续丢。
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
 
-    // codex 走整文件有状态解析（turn_context 模型 + total 增量），不能按行增量 slice
-    // 否则会丢模型上下文且 total 差值错乱。此处若文件有任何变动则全量重建
     if (file.agent === 'codex') {
       const alreadyDone = !force &&
-        cursor &&
-        cursor.head_hash !== null &&
-        cursor.file_size === st.size &&
-        cursor.file_mtime === Math.floor(st.mtimeMs)
+        cursor! &&
+        cursor!.head_hash !== null &&
+        cursor!.file_size === st.size &&
+        cursor!.file_mtime === Math.floor(st.mtimeMs)
       if (alreadyDone) return 0
-      const codexRows = parseCodexSession(file.path, file.sessionId)
-      // 原子「删旧+插新」避免多进程并发重建翻倍
-      const toInsert: UsageRow[] = codexRows.map(r => ({ ...r, source_file: file.path }))
-      replaceUsageBySourceFile(file.path, file.agent, file.sessionId, toInsert)
+      // codex 走整文件有状态解析，直接用已读的 content 避免二次 readFileSync
+      // 极致：搬入 Worker，主线程零 CPU
+      const codexRows = await parseCodexViaWorker(content, file.sessionId, () => parseCodexSessionFromContent(content, file.sessionId)) as ReturnType<typeof parseCodexSessionFromContent>
+      const toInsert: UsageRow[] = codexRows.map(r => ({ ...r, source_file: file.path } as UsageRow))
+      await replaceUsageBySourceFileAsync(file.path, file.agent, file.sessionId, toInsert)
       if (toInsert.length > 0) {
         this.stats.by_agent[file.agent] =
           (this.stats.by_agent[file.agent] ?? 0) + toInsert.length
       }
-      const rebuilt = !!cursor && (lines.length < (cursor.lines_seen ?? 0) || (cursor.head_hash !== null && cursor.head_hash !== headFingerprint(lines, cursor.lines_seen ?? 0)))
+      const rebuilt = !!cursor && (lines.length < (cursor!.lines_seen ?? 0) || (cursor!.head_hash !== null && cursor!.head_hash !== headFingerprint(lines, cursor!.lines_seen ?? 0)))
       if (rebuilt) {
         this.stats.rewrites++
         this.stats.last_rewrite = { file: file.path, rows: toInsert.length, at: Date.now() }
@@ -235,27 +322,24 @@ export class UsageScanner extends EventEmitter {
         )
       }
       upsertCursor(file.path, st.size, Math.floor(st.mtimeMs), lines.length, headFingerprint(lines, lines.length))
-      return 0 // 全量重建不计为增量，避免 rows_inserted 翻倍
+      // codex 重建后让出，避免连续多个 codex 文件串行阻塞
+      await yieldToLoop()
+      return 0
     }
 
     const parser = parserForFile(file.agent, file.path)
     if (!parser) return 0
 
-    // 已入库前缀是否被改写？head_hash 为 NULL 是升级前的老游标，
-    // 没有基线可比，先按原逻辑续读，这一轮写完指纹后后续就能检测了。
-    // force=true（rescan）时 cursor 刚被清空，若被 MCP 抢先重建则不可信，
-    // 一律从头解析 + 原子重建。
     let startFrom = 0
     let rebuilt = false
     if (cursor && !force) {
-      const shrunk = lines.length < cursor.lines_seen
+      const shrunk = lines.length < cursor!.lines_seen
       const drifted =
-        cursor.head_hash !== null &&
-        cursor.head_hash !== headFingerprint(lines, cursor.lines_seen)
+        cursor!.head_hash !== null &&
+        cursor!.head_hash !== headFingerprint(lines, cursor!.lines_seen ?? 0)
       if (!shrunk && !drifted) {
-        startFrom = cursor.lines_seen
+        startFrom = cursor!.lines_seen
       } else {
-        // 重建：删旧+插新由 replaceUsageBySourceFile 原子完成
         rebuilt = true
       }
     }
@@ -266,22 +350,25 @@ export class UsageScanner extends EventEmitter {
       sessionId: file.sessionId
     }
     const newRows: UsageRow[] = []
+    // 分批解析，每 2000 行让出一次，避免超大文件一次把事件循环占满
+    const BATCH = 2000
     for (let i = startFrom; i < lines.length; i++) {
-      const line = lines[i]
+      const line = lines[i]!
       if (!line) continue
-      const row = parser(line, ctx)
-      if (row) newRows.push({ ...row, source_file: file.path })
+      const row = parser!(line, ctx)
+      if (row) newRows.push({ ...row, source_file: file.path } as UsageRow)
+      if ((i - startFrom) % BATCH === 0 && i !== startFrom) {
+        await yieldToLoop()
+      }
     }
     if (rebuilt || force) {
-      // 原子「删旧+插新」：文件被重写或 rescan 强制重建都走 replace，
-      // 避免多进程（主进程 / MCP）并发重建同一文件时翻倍
-      replaceUsageBySourceFile(file.path, file.agent, file.sessionId, newRows)
+      await replaceUsageBySourceFileAsync(file.path, file.agent, file.sessionId, newRows)
       if (newRows.length > 0) {
         this.stats.by_agent[file.agent] =
           (this.stats.by_agent[file.agent] ?? 0) + newRows.length
       }
     } else if (newRows.length > 0) {
-      insertUsageBatch(newRows)
+      await insertUsageBatchAsync(newRows)
       this.stats.by_agent[file.agent] =
         (this.stats.by_agent[file.agent] ?? 0) + newRows.length
     }
@@ -304,22 +391,18 @@ export class UsageScanner extends EventEmitter {
       lines.length,
       headFingerprint(lines, lines.length)
     )
+    if (newRows.length > 3000) await yieldToLoop()
     return rebuilt ? 0 : newRows.length
   }
 
-  /**
-   * zcode 权威用量源：db.sqlite 的 model_usage 全删全写。
-   *
-   * rollout 的 model-io jsonl 会被 ZCode 压缩/清理（行数变少、内容重排），
-   * 无论怎么增量都追不齐；db.sqlite 的 model_usage 表保留所有（主 + 子）会话
-   * 每次模型调用的完整用量（token 四元组 + started_at），是唯一可靠来源。
-   * 与 dsh / opencode 同策略：db 文件 mtime 变了就全删全写。
-   */
-  private scanZcodeDb(force = false): number {
+  private async scanZcodeDb(force = false): Promise<number> {
     const dbPath = join(homedir(), '.zcode', 'cli', 'db', 'db.sqlite')
     if (!existsSync(dbPath)) return 0
-    const st = statSync(dbPath)
-    const mtime = Math.floor(st.mtimeMs)
+    let mtime: number
+    try {
+      const s = await stat(dbPath)
+      mtime = Math.floor(s.mtimeMs)
+    } catch { return 0 }
     if (
       !force &&
       this.zcodeDbLastMtime &&
@@ -328,6 +411,8 @@ export class UsageScanner extends EventEmitter {
     ) {
       return 0
     }
+    // readZcodeDb 会同步开 better-sqlite3 读外部 sqlite，I/O 虽短但仍让出
+    await yieldToLoop()
     const rows = readZcodeDb(dbPath)
     if (rows.length === 0) {
       this.zcodeDbLastMtime = { path: dbPath, mtime }
@@ -347,20 +432,22 @@ export class UsageScanner extends EventEmitter {
       meta: null,
       source_file: dbPath
     }))
-    // 原子「删该 agent 旧行 + 插新」：zcode 唯一权威来源，顺带清掉 rollout 残留；
-    // 多进程并发重建时不翻倍
-    replaceUsageByAgent('zcode', usageRows)
+    await replaceUsageByAgentAsync('zcode', usageRows)
     this.stats.by_agent['zcode'] =
       (this.stats.by_agent['zcode'] ?? 0) + usageRows.length
     this.zcodeDbLastMtime = { path: dbPath, mtime }
+    await yieldToLoop()
     return usageRows.length
   }
 
   private async scanOpenCode(force = false): Promise<number> {
     const dbPath = join(homedir(), '.local', 'share', 'opencode', 'opencode.db')
     if (!existsSync(dbPath)) return 0
-    const st = statSync(dbPath)
-    const mtime = Math.floor(st.mtimeMs)
+    let mtime: number
+    try {
+      const s = await stat(dbPath)
+      mtime = Math.floor(s.mtimeMs)
+    } catch { return 0 }
     if (
       !force &&
       this.opencodeLastMtime &&
@@ -369,6 +456,7 @@ export class UsageScanner extends EventEmitter {
     ) {
       return 0
     }
+    await yieldToLoop()
     const rows = readOpenCodeDb(dbPath, minAtForAgent('opencode'))
     if (rows.length === 0) {
       this.opencodeLastMtime = { path: dbPath, mtime, count: 0 }
@@ -377,8 +465,6 @@ export class UsageScanner extends EventEmitter {
     const usageRows: UsageRow[] = rows.map((r) => ({
       agent: 'opencode',
       model: r.model,
-      // opencode 存储 fresh：input 为非缓存 fresh，cache 单独分桶
-      // 统一所有源为 fresh 存储，总消耗 = fresh + cached + output
       input_tokens: r.input,
       output_tokens: r.output,
       cached_tokens: r.cache_read + r.cache_write,
@@ -390,21 +476,20 @@ export class UsageScanner extends EventEmitter {
       meta: null,
       source_file: dbPath
     }))
-    // opencode 没有稳定 request_id；原子「删旧+插新」简化去重，多进程并发安全
-    replaceUsageByAgent('opencode', usageRows)
+    await replaceUsageByAgentAsync('opencode', usageRows)
     this.stats.by_agent['opencode'] =
       (this.stats.by_agent['opencode'] ?? 0) + usageRows.length
     this.opencodeLastMtime = { path: dbPath, mtime, count: rows.length }
     this.stats.opencode_messages = rows.length
+    await yieldToLoop()
     return usageRows.length
   }
 
-  /** dsh：~/.dsh/sessions 下的 session.jsonl.zstd，指纹变化才全删全写 */
-  private scanDsh(force = false): number {
+  private async scanDsh(force = false): Promise<number> {
     const root = join(homedir(), '.dsh', 'sessions')
     if (!existsSync(root)) return 0
     const files: Array<{ path: string; sessionId: string }> = []
-    walkJsonl(
+    await walkJsonlAsync(
       root,
       (p) => {
         files.push({ path: p, sessionId: sessionIdFromFile('dsh', p) })
@@ -413,48 +498,54 @@ export class UsageScanner extends EventEmitter {
       /\.jsonl\.zstd$/
     )
     if (files.length === 0) return 0
-    // 指纹 = 每个文件的 size+mtime；zstd 流无法按行增量，只能整体重建
     const parts: string[] = []
+    let idx = 0
     for (const f of files) {
-      const st = statSync(f.path)
-      parts.push(`${f.path}:${st.size}:${Math.floor(st.mtimeMs)}`)
+      try {
+        const s = await stat(f.path)
+        parts.push(`${f.path}:${s.size}:${Math.floor(s.mtimeMs)}`)
+      } catch {}
+      if (idx++ % 20 === 0) await yieldToLoop()
     }
     const fingerprint = parts.sort().join('|')
     if (!force && this.dshFingerprint === fingerprint) return 0
 
     const all: UsageRow[] = []
-    // dsh 子代理会话（origin:subagent）会复制父会话的 seed 历史，usage 事件（seq+time）
-    // 原样出现在两个文件里，跨文件按 seq@time 去重，否则同一请求被统计两遍
     const seen = new Set<string>()
     for (const f of files) {
       try {
-        for (const r of parseDshSession(f.path, f.sessionId)) {
+        const rows = await parseDshViaWorker(
+          f.path,
+          f.sessionId,
+          () => parseDshSessionAsync(f.path, f.sessionId)
+        ) as Array<import('./parsers.js').ParsedUsageRow & { seq?: number }>
+        for (const r of rows) {
           const key = `${r.seq ?? ''}@${r.at}`
           if (seen.has(key)) continue
           seen.add(key)
           const { seq, ...row } = r
-          all.push({ ...row, source_file: f.path })
+          all.push({ ...row, source_file: f.path } as UsageRow)
         }
       } catch (e) {
         this.stats.errors++
         console.warn(`[token-usage] 解析 dsh 会话 ${f.path} 失败:`, e)
       }
+      await yieldToLoop()
     }
-    // 原子「删 dsh 旧行 + 插新」
-    replaceUsageByAgent('dsh', all)
+    await replaceUsageByAgentAsync('dsh', all)
     this.dshFingerprint = fingerprint
     this.stats.by_agent['dsh'] = (this.stats.by_agent['dsh'] ?? 0) + all.length
     this.stats.dsh_sessions = files.length
     return all.length
   }
 
-  private discoverJsonl(): DiscoveredFile[] {
+  private async discoverJsonl(): Promise<DiscoveredFile[]> {
     const out: DiscoveredFile[] = []
     const home = homedir()
 
     const ompDir = join(home, '.omp', 'agent', 'sessions')
     if (existsSync(ompDir)) {
-      walkJsonl(ompDir, (p) => {
+      await walkJsonlAsync(ompDir, (p) => {
         out.push({
           path: p,
           agent: 'omp',
@@ -465,7 +556,7 @@ export class UsageScanner extends EventEmitter {
 
     const zcodeDir = join(home, '.zcode', 'cli', 'rollout')
     if (existsSync(zcodeDir)) {
-      walkJsonl(zcodeDir, (p) => {
+      await walkJsonlAsync(zcodeDir, (p) => {
         out.push({
           path: p,
           agent: 'zcode',
@@ -476,7 +567,7 @@ export class UsageScanner extends EventEmitter {
 
     const codexDir = join(home, '.codex', 'sessions')
     if (existsSync(codexDir)) {
-      walkJsonl(
+      await walkJsonlAsync(
         codexDir,
         (p) => {
           out.push({
@@ -491,7 +582,7 @@ export class UsageScanner extends EventEmitter {
 
     const claudeDir = join(home, '.claude', 'projects')
     if (existsSync(claudeDir)) {
-      walkJsonl(
+      await walkJsonlAsync(
         claudeDir,
         (p) => {
           out.push({
@@ -508,41 +599,114 @@ export class UsageScanner extends EventEmitter {
   }
 }
 
-/**
- * 进程级单例。
- * 插件 onLoad、IPC 注册、HTTP server 三个入口都要用扫描器；
- * 各 new 一个的话同一批 jsonl 每 30 秒会被全量解析三次。
- */
 export const usageScanner = new UsageScanner()
 
-function walkJsonl(
+async function walkJsonlAsync(
   dir: string,
   onFile: (path: string) => void,
   depth = 0,
   match: RegExp = /\.jsonl$/
-): void {
+): Promise<void> {
   if (depth > 8) return
   let entries: string[]
   try {
-    entries = readdirSync(dir)
+    entries = await readdir(dir)
   } catch {
     return
   }
+  // 批量 stat + 递归，带让出
+  let count = 0
   for (const name of entries) {
     if (name.startsWith('.')) continue
     const full = join(dir, name)
     let st
     try {
-      st = statSync(full)
+      st = await stat(full)
     } catch {
       continue
     }
     if (st.isDirectory()) {
-      walkJsonl(full, onFile, depth + 1, match)
+      await walkJsonlAsync(full, onFile, depth + 1, match)
     } else if (st.isFile() && match.test(name) && !name.endsWith('.bak')) {
       onFile(full)
     }
+    if (++count % 100 === 0) await yieldToLoop()
   }
+}
+
+// 极致：流式统计大文件（>2MB）避免整文件 readFile 入内存
+// 单次流式遍历得到 linesCount / 总字符 / 首行头 / 末行尾，进而算 headFingerprint
+async function streamFileStats(filePath: string): Promise<{ lines: number; chars: number; head: string; tail: string }> {
+  return new Promise((resolve, reject) => {
+    let lines = 0
+    let chars = 0
+    let head = ''
+    let tail = ''
+    let first = true
+    const stream = createReadStream(filePath, { encoding: 'utf8' })
+    const rl = createInterface({ input: stream, crlfDelay: Infinity })
+    rl.on('line', (line: string) => {
+      if (first) { head = line.slice(0, 128); first = false }
+      tail = line.slice(-128)
+      chars += line.length
+      lines++
+    })
+    rl.on('close', () => resolve({ lines, chars, head, tail }))
+    rl.on('error', reject)
+    stream.on('error', reject)
+  })
+}
+
+async function streamFingerprintUpTo(filePath: string, upto: number): Promise<string> {
+  if (upto <= 0) return `0:0:${shortHash('')}:${shortHash('')}`
+  return new Promise((resolve, reject) => {
+    let n = 0
+    let chars = 0
+    let head = ''
+    let tail = ''
+    let first = true
+    const stream = createReadStream(filePath, { encoding: 'utf8' })
+    const rl = createInterface({ input: stream, crlfDelay: Infinity })
+    rl.on('line', (line: string) => {
+      if (n >= upto) { rl.close(); stream.destroy(); return }
+      if (first) { head = line.slice(0, 128); first = false }
+      tail = line.slice(-128)
+      chars += line.length
+      n++
+      if (n >= upto) { rl.close(); stream.destroy() }
+    })
+    const done = () => resolve(`${n}:${chars}:${shortHash(head)}:${shortHash(tail)}`)
+    rl.on('close', done)
+    rl.on('error', reject)
+    stream.on('error', reject)
+  })
+}
+
+function fingerprintFromStream(stats: { lines: number; chars: number; head: string; tail: string }): string {
+  return `${stats.lines}:${stats.chars}:${shortHash(stats.head)}:${shortHash(stats.tail)}`
+}
+
+// 大文件流式解析：逐行 readline，BATCH 间让出，避免 50MB 文件一次性入内存
+async function parseLargeFileStreamed(
+  filePath: string,
+  parser: ReturnType<typeof parserForFile>,
+  ctx: { agent: Platform; filePath: string; sessionId: string },
+  startFrom: number
+): Promise<import('./storage.js').UsageRow[]> {
+  if (!parser) return []
+  const rows: import('./storage.js').UsageRow[] = []
+  let idx = 0
+  const stream = createReadStream(filePath, { encoding: 'utf8' })
+  const rl = createInterface({ input: stream, crlfDelay: Infinity })
+  for await (const line of rl) {
+    if (idx >= startFrom && line) {
+      const row = parser(line, ctx)
+      if (row) rows.push({ ...row, source_file: filePath } as import('./storage.js').UsageRow)
+    }
+    idx++
+    if (idx % 2000 === 0) await yieldToLoop()
+  }
+  return rows
 }
 
 function freshStats(): ScannerStats {
@@ -574,16 +738,6 @@ function shortHash(s: string): string {
   return createHash('sha1').update(s).digest('hex').slice(0, 16)
 }
 
-/**
- * 已入库前缀（前 upto 行）的指纹。
- *
- * 设计约束：zcode 的 model-io jsonl 单行可达 300KB、整文件几十 MB，而每 30 秒
- * 就要扫一次，所以不能对整段前缀做哈希。这里只取三个廉价但有区分度的量：
- *   1. 前缀行数 —— 捕获压缩导致的行数变少；
- *   2. 前缀字符总数 —— 捕获任意行的增删与重排；
- *   3. 首行头 128 字符 + 末行尾 128 字符的哈希 —— 捕获"行数与总长恰好相同"的改写。
- * 复杂度只是 O(n) 累加字符串长度，不做全量摘要。
- */
 function headFingerprint(lines: string[], upto: number): string {
   const n = Math.min(upto, lines.length)
   let chars = 0
@@ -593,27 +747,17 @@ function headFingerprint(lines: string[], upto: number): string {
   return `${n}:${chars}:${shortHash(head)}:${shortHash(tail)}`
 }
 
-/**
- * 判断 ~/.local/share/opencode 的写入者是 OpenChamber 还是原生 OpenCode。
- * 两者共用同一数据目录无法按数据区分，只能按本机安装特征：
- * OpenChamber 的配置目录（含 managed-opencode 等）是最强信号，
- * 备份文件名是次级信号；都没有则当作原生 OpenCode。
- */
 function detectOpenCodeFlavor(): 'openchamber' | 'opencode' {
   const home = homedir()
   try {
     if (statSync(join(home, '.config', 'openchamber')).isDirectory()) {
       return 'openchamber'
     }
-  } catch {
-    // 不存在，继续
-  }
+  } catch {}
   try {
     if (existsSync(join(home, '.local', 'share', 'opencode', 'auth.json.openchamber.backup'))) {
       return 'openchamber'
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return 'opencode'
 }

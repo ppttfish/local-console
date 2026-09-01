@@ -19,8 +19,8 @@ const api = {
   restartService: (id: string) => invoke(IpcChannels.ServiceRestart, id),
   stopExternalService: (id: string) => invoke(IpcChannels.ServiceStopExternal, id),
   reorderServices: (ids: string[]) => invoke(IpcChannels.ServiceReorder, ids),
-  getServiceLogs: (id: string, tail = 300) =>
-    invoke(IpcChannels.ServiceLogs, { id, tail }),
+  getServiceLogs: (id: string, tail = 300, force?: boolean) =>
+    invoke(IpcChannels.ServiceLogs, { id, tail, force }),
   clearServiceLogs: (id: string) => invoke(IpcChannels.ServiceClearLogs, id),
   /** 清空日志后把主进程侧的内存字节计数归零，免得紧接着触发一次轮转 */
   resetLogCounter: (id: string) =>
@@ -52,6 +52,14 @@ const api = {
   usageRescan: () => invoke(IpcChannels.UsageRescan),
   usageStatus: () => invoke(IpcChannels.UsageStatus),
   usageRecap: () => invoke(IpcChannels.UsageRecap),
+  usageBatch: (args: { filter: unknown; granularity: string; limit?: number }) =>
+    invoke(IpcChannels.UsageBatch, args) as Promise<{
+      summary: unknown
+      timeline: unknown
+      sessions: unknown
+      models: unknown
+      status: unknown
+    }>,
 
   // 订阅监控
   subList: () => invoke(IpcChannels.SubList),

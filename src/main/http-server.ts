@@ -3,7 +3,8 @@
  * 可以在 Electron 内部启动，也可以 standalone 启动（无 GUI 模式）
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
-import { createReadStream, existsSync, statSync } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
+import { stat as statAsync } from 'node:fs/promises'
 import { join, extname, normalize } from 'node:path'
 import { URL } from 'node:url'
 import { initDatabase, closeDatabase } from './services/db.js'
@@ -14,11 +15,15 @@ import { EventBus } from './services/event-bus.js'
 import {
   ensureUsageSchema,
   querySummary,
+  querySummaryAsync,
   queryRecap,
+  queryRecapAsync,
   queryTimeline,
+  queryTimelineAsync,
   listDistinctModels,
   listDistinctAgents,
-  listSessions
+  listSessions,
+  listSessionsAsync
 } from './plugins/builtin/token-usage/storage.js'
 import { usageScanner } from './plugins/builtin/token-usage/scanner.js'
 import { subscriptionRefresher } from './plugins/builtin/token-usage/refresh.js'
@@ -51,6 +56,11 @@ interface Runtime {
 let runtime: Runtime | null = null
 let port = 9600
 let rendererDir: string | null = null
+/** standalone 模式下没有 Electron app，用启动时传入的 userData 兜底 app/info */
+let dataDir: string | null = null
+// 极致：静态资源 stat 缓存，renderer 首次加载 20+ 文件不再逐个 stat
+const statCache = new Map<string, { at: number; stat: import('node:fs').Stats | null }>()
+const STAT_TTL = 5000
 
 export async function startHttpServer(opts: {
   userData: string
@@ -66,6 +76,7 @@ export async function startHttpServer(opts: {
 }): Promise<void> {
   port = opts.port
   rendererDir = opts.rendererDir
+  dataDir = opts.userData
 
   // 初始化 db（同路径时幂等，Electron 主进程已经初始化过就直接复用）
   initDatabase(opts.userData)
@@ -140,11 +151,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.end('forbidden')
     return
   }
-  let st = null
-  try {
-    st = statSync(filePath)
-  } catch {
-    st = null
+  // 极致：stat 缓存 + ETag/304，避免 20+ 静态资源每次刷新都 stat + 全量下发
+  let st: import('node:fs').Stats | null = null
+  const cached = statCache.get(filePath)
+  if (cached && Date.now() - cached.at < STAT_TTL) {
+    st = cached.stat
+  } else {
+    try { st = await statAsync(filePath) } catch { st = null }
+    statCache.set(filePath, { at: Date.now(), stat: st })
+    if (statCache.size > 200) {
+      const first = statCache.keys().next().value
+      if (first) statCache.delete(first)
+    }
   }
   if (!st || !st.isFile()) {
     // SPA fallback（hash 路由下除静态资源外都回 index.html）
@@ -172,8 +190,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     '.ico': 'image/x-icon',
     '.woff2': 'font/woff2'
   }
+  const etag = `"${st.size}-${st.mtimeMs.toString(36)}"`
+  const ifNoneMatch = req.headers['if-none-match']
+  const ifModifiedSince = req.headers['if-modified-since']
+  if (ifNoneMatch === etag || (ifModifiedSince && new Date(ifModifiedSince).getTime() >= Math.floor(st.mtimeMs))) {
+    res.statusCode = 304
+    res.end()
+    return
+  }
   res.setHeader('Content-Type', mime[ext] ?? 'application/octet-stream')
   res.setHeader('Content-Length', st.size)
+  res.setHeader('ETag', etag)
+  res.setHeader('Last-Modified', new Date(st.mtimeMs).toUTCString())
   // Vite 产物文件名带 hash，可以放心长缓存；非 hash 的 index.html 走上面的 no-cache
   res.setHeader(
     'Cache-Control',
@@ -219,11 +247,16 @@ async function handleApi(
       return json(res, 200, await openLocalUrl(url))
     }
     if (pathname === '/api/app/info' && req.method === 'GET') {
+      // standalone（ELECTRON_RUN_AS_NODE）下 import 到的 electron 只是路径字符串，
+      // app 为 undefined，getName/getVersion/getPath 都会抛错，这里全部兜底
+      const appName = typeof app?.getName === 'function' ? app.getName() : '小福鱼'
+      const appVersion =
+        typeof app?.getVersion === 'function' ? app.getVersion() : '0.0.0'
       return json(res, 200, {
-        name: app.getName(),
-        version: app.getVersion(),
-        dataDir: getDataDir(),
-        logDir: getLogDir(),
+        name: appName,
+        version: appVersion,
+        dataDir: dataDir ?? getDataDir(),
+        logDir: dataDir ? join(dataDir, 'logs') : getLogDir(),
         homeDir: homedir()
       })
     }
@@ -286,14 +319,18 @@ async function handleApi(
       return json(res, 200, { ok: true })
     }
     if (pathname === '/api/service/logs' && req.method === 'POST') {
-      const { id, tail } = body as { id: string; tail?: number }
-      return json(res, 200, r.log.tail(id, tail ?? 300))
+      const { id, tail, force } = body as {
+        id: string
+        tail?: number
+        force?: boolean
+      }
+      return json(res, 200, await r.log.tail(id, tail ?? 300, force))
     }
 
     // Project detect
     if (pathname === '/api/project/detect' && req.method === 'POST') {
       const { cwd } = body as { cwd: string }
-      return json(res, 200, r.svc.detectProject(cwd))
+      return json(res, 200, await r.svc.detectProject(cwd))
     }
     // Web 端没有原生目录选择框，返回"不支持"而不是 404，
     // 免得前端把它当接口缺失
@@ -354,7 +391,26 @@ async function handleApi(
       return json(res, 200, usageScanner.getStats())
     }
     if (pathname === '/api/usage/recap' && req.method === 'GET') {
-      return json(res, 200, queryRecap())
+      try { return json(res, 200, await queryRecapAsync()) } catch { return json(res, 200, queryRecap()) }
+    }
+    if (pathname === '/api/usage/batch' && req.method === 'POST') {
+      const { filter, granularity, limit } = body as {
+        filter: Parameters<typeof querySummary>[0]
+        granularity: 'hour' | 'day' | 'month'
+        limit?: number
+      }
+      const summary = await querySummaryAsync(filter)
+      await new Promise<void>((r) => setImmediate(r))
+      const tl = await queryTimelineAsync(filter, granularity)
+      await new Promise<void>((r) => setImmediate(r))
+      const sessions = await listSessionsAsync(filter, limit ?? 50)
+      return json(res, 200, {
+        summary,
+        timeline: { timeline: tl },
+        sessions,
+        models: listDistinctModels(),
+        status: usageScanner.getStats()
+      })
     }
 
     // ===== 订阅监控 =====

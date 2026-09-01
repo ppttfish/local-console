@@ -251,57 +251,47 @@ app.whenReady().then(async () => {
     slog(`shared instance error: ${(e as Error).message}`)
   }
 
-  // 3. 业务
+  // 3. 业务（并行化，极致启动）
   try {
     initDatabase(userData)
-    await logStreamer.start()
-    await portScanner.start()
-    await serviceManager.start()
-    await pluginRegistry.loadAll()
+    await Promise.all([
+      logStreamer.start(),
+      portScanner.start(),
+      serviceManager.start()
+    ])
     registerIpcHandlers(serviceManager, portScanner, logStreamer, () => mainWindow)
-    slog('business init done')
+    slog('business init done (parallel)')
+    // 插件加载延后到窗口已显后，不阻塞首屏
+    setImmediate(async () => {
+      try { await pluginRegistry.loadAll(); slog('plugins loaded (deferred)') } catch (e) { slog(`plugin load error: ${(e as Error).message}`) }
+    })
   } catch (e) {
     slog(`business init error: ${(e as Error).message}\n${(e as Error).stack}`)
   }
 
-  // 4. 托盘（先于窗口，让用户能恢复）
-  buildTray()
+  // 4/5. 托盘与窗口并行（窗口最优先，不等业务）
+  const trayP = (async () => { try { buildTray() } catch (e) { slog(`buildTray error: ${(e as Error).message}`) } })()
+  const winP = (async () => {
+    try { await createMainWindow() } catch (e) { slog(`createMainWindow error: ${(e as Error).message}\n${(e as Error).stack}`) }
+  })()
+  await Promise.all([trayP, winP])
 
-  // 5. 窗口（最重要）
-  try {
-    await createMainWindow()
-  } catch (e) {
-    slog(`createMainWindow error: ${(e as Error).message}\n${(e as Error).stack}`)
-  }
-
-  // 6. 9600 HTTP server（容错）
-  //    共享主进程已有的 ServiceManager / PortScanner / LogStreamer：
-  //    各建一套的话 Web 端启停的服务在桌面端状态里看不见（两个独立的 procs Map）
-  try {
-    const rendererDir = isDev
-      ? join(__dirname, '../renderer')
-      : join(process.resourcesPath, 'renderer')
-    await startHttpServer({
-      userData,
-      // 端口可被 LCP_PORT / PORT 环境变量覆盖，便于多实例共存（如另一份构建已在 9600）
-      port: Number(process.env['LCP_PORT'] ?? process.env['PORT'] ?? 9600),
-      rendererDir,
-      svc: serviceManager,
-      portScanner,
-      logStreamer
-    })
-    slog('http server started on 9600')
-  } catch (e) {
-    slog(`http server error: ${(e as Error).message}`)
-  }
-
-  // 7. MCP 子进程（容错）
-  try {
-    startMcpSubprocess()
-    slog('mcp subproc spawned')
-  } catch (e) {
-    slog(`mcp error: ${(e as Error).message}`)
-  }
+  // 6/7. HTTP 与 MCP 延后到窗口已显后，不阻塞首屏
+  setImmediate(async () => {
+    try {
+      const rendererDir = isDev ? join(__dirname, '../renderer') : join(process.resourcesPath, 'renderer')
+      await startHttpServer({
+        userData,
+        port: Number(process.env['LCP_PORT'] ?? process.env['PORT'] ?? 9600),
+        rendererDir,
+        svc: serviceManager,
+        portScanner,
+        logStreamer
+      })
+      slog('http server started on 9600 (deferred)')
+    } catch (e) { slog(`http server error: ${(e as Error).message}`) }
+    try { startMcpSubprocess(); slog('mcp subproc spawned (deferred)') } catch (e) { slog(`mcp error: ${(e as Error).message}`) }
+  })
 
   // 8. 额外 IPC
   ipcMain.handle('app:toggle-autostart', (_e, enable: boolean) => {
@@ -321,17 +311,12 @@ app.whenReady().then(async () => {
   })
 
   // 9. 事件推送：主进程主动把状态变化发给渲染端
-  //    preload 早就暴露了 onStateChanged / onServiceLog，但之前没人发，
-  //    渲染端只能靠 2 秒一次的全量轮询。这里节流后推送，轮询降到兜底频率。
   bridgeBusToRenderer()
 
-  // 10. 自动升级
-  try {
-    updater.init()
-    slog('updater initialized')
-  } catch (e) {
-    slog(`updater init error: ${(e as Error).message}`)
-  }
+  // 10. 自动升级（延后 30s，不阻塞首屏与业务）
+  setTimeout(() => {
+    try { updater.init(); slog('updater initialized (deferred)') } catch (e) { slog(`updater init error: ${(e as Error).message}`) }
+  }, 30000)
 
   slog('all init done')
 })

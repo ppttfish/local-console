@@ -17,7 +17,9 @@ export default defineConfig({
         input: {
           index: resolve('src/main/index.ts'),
           'mcp/standalone': resolve('src/main/mcp/standalone.ts'),
-          'http-standalone': resolve('src/main/http-standalone.ts')
+          'http-standalone': resolve('src/main/http-standalone.ts'),
+          'workers/parse-worker': resolve('src/main/workers/parse-worker.ts'),
+          'workers/db-worker': resolve('src/main/workers/db-worker.ts')
         },
         output: {
           /**

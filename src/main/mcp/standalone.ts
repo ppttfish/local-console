@@ -97,7 +97,7 @@ server.tool(
   async ({ id, name, tail: n }) => {
     const t = resolveService(id, name)
     if (!t) return textResult(`未找到服务: ${id ?? name}`, true)
-    const r = log.tail(t.id, n)
+    const r = await log.tail(t.id, n)
     return textResult(r.text || '(暂无日志)')
   }
 )
