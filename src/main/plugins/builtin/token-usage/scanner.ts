@@ -14,7 +14,7 @@ import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSessionAsync, readZcodeDb, parseCodexSessionFromContent } from './parsers.js'
+import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSessionAsync, readZcodeDb, parseCodexSession, parseCodexSessionFromContent } from './parsers.js'
 import { parseDshViaWorker, parseCodexViaWorker, parseCodexFileViaWorker, shutdownParseWorker } from '../../../workers/parse-worker-client.js'
 import {
   ensureUsageSchema,
@@ -33,6 +33,9 @@ import {
   type Platform
 } from './storage.js'
 import { getDb } from '../../../services/db.js'
+
+/** 超过该大小的 jsonl 走流式大文件路径；流式有固定开销，小文件整读反而更快 */
+const LARGE_THRESHOLD = 5 * 1024 * 1024
 
 export interface ScannerStats {
   files_scanned: number
@@ -222,9 +225,8 @@ export class UsageScanner extends EventEmitter {
       return 0
     }
 
-    const LARGE_THRESHOLD = 0
     if (st.size > LARGE_THRESHOLD) {
-      // 极致：大文件流式，避免 50MB+ readFile 入内存
+      // 大文件流式，避免 50MB+ readFile 入内存
       const stats = await streamFileStats(file.path)
       const linesCount = stats.lines
       const fingerprintFull = fingerprintFromStream(stats)
@@ -236,11 +238,12 @@ export class UsageScanner extends EventEmitter {
         if (cursor && cursor.head_hash !== null && cursor.lines_seen > 0) {
           codexPrefixFp = await streamFingerprintUpTo(file.path, cursor.lines_seen)
         }
-        const codexRows = await parseCodexFileViaWorker(file.path, file.sessionId, () => parseCodexSessionFromContent('', file.sessionId)) as ReturnType<typeof parseCodexSessionFromContent>
+        // 兜底必须按路径重新读盘解析：解析空串会返回 0 行，随后按空「删旧+插新」
+        // 会把该文件已入库的行清光（打包态 worker 起不来时曾致 codex 有史 0 行）
+        const codexRows = await parseCodexFileViaWorker(file.path, file.sessionId, () => parseCodexSession(file.path, file.sessionId)) as ReturnType<typeof parseCodexSessionFromContent>
         const rebuilt = !!cursor && (linesCount < (cursor.lines_seen ?? 0) || (codexPrefixFp !== null && cursor.head_hash !== null && cursor.head_hash !== codexPrefixFp))
         // 简化：大文件 codex 直接按 Worker 返回全量重建
         const toInsert: UsageRow[] = (Array.isArray(codexRows) ? codexRows : []).map(r => ({ ...r, source_file: file.path } as UsageRow))
-        // 若 Worker 回退空（文件不存在），尝试用流式兜底已在 Worker 内处理
         await replaceUsageBySourceFileAsync(file.path, file.agent, file.sessionId, toInsert)
         if (toInsert.length > 0) this.stats.by_agent[file.agent] = (this.stats.by_agent[file.agent] ?? 0) + toInsert.length
         if (rebuilt) {

@@ -18,9 +18,16 @@ const pending = new Map<number, Pending>()
 let workerDisabled = false
 
 function getWorkerPath(): string | null {
-  // CJS 主进程：__dirname 指向 out/main
-  // 开发期：src/main/workers 尚未打包，尝试多个候选
+  // 打包态 __dirname 位于 app.asar 内，而 worker_threads 无法从 asar 加载文件
+  //（Electron 限制），electron-builder 的 asarUnpack 会把 worker 解到
+  // app.asar.unpacked 下——必须优先命中解包后的真实路径
+  const unpackedDir = __dirname.includes('app.asar')
+    ? __dirname.replace('app.asar', 'app.asar.unpacked')
+    : null
   const candidates = [
+    ...(unpackedDir ? [join(unpackedDir, 'workers/parse-worker.cjs'), join(unpackedDir, 'parse-worker.cjs')] : []),
+    // CJS 主进程：__dirname 指向 out/main
+    // 开发期：src/main/workers 尚未打包，尝试多个候选
     join(__dirname, 'workers/parse-worker.cjs'),
     join(__dirname, 'parse-worker.cjs'),
     resolve('out/main/workers/parse-worker.cjs'),

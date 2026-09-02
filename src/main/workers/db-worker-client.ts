@@ -16,7 +16,13 @@ let workerDisabled = false
 let initPromise: Promise<void> | null = null
 
 function getWorkerPath(): string | null {
+  // 同 parse-worker-client：打包态 worker 在 asar 内无法被 worker_threads 加载，
+  // 须优先命中 asarUnpack 解出的 app.asar.unpacked 真实路径
+  const unpackedDir = __dirname.includes('app.asar')
+    ? __dirname.replace('app.asar', 'app.asar.unpacked')
+    : null
   const candidates = [
+    ...(unpackedDir ? [join(unpackedDir, 'workers/db-worker.cjs'), join(unpackedDir, 'db-worker.cjs')] : []),
     join(__dirname, 'workers/db-worker.cjs'),
     join(__dirname, 'db-worker.cjs'),
     resolve('out/main/workers/db-worker.cjs'),

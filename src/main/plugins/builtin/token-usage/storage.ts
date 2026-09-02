@@ -208,18 +208,10 @@ export async function replaceUsageBySourceFileAsync(
     summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
     return n
   }
-  if (rows.length <= 500) return replaceUsageBySourceFile(filePath, agent, sessionId, rows)
-  // 大批量：先原子删，再分片插，每片让出
-  deleteUsageBySourceFile(filePath, agent, sessionId)
-  const stmt = prepare(USAGE_INSERT_SQL)
-  for (let i = 0; i < rows.length; i += 500) {
-    const slice = rows.slice(i, i + 500)
-    const tx = getDb().transaction((items: UsageRow[]) => { for (const r of items) stmt.run(r) })
-    tx(slice)
-    if (i + 500 < rows.length) await new Promise<void>((r) => setImmediate(r))
-  }
-  summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
-  return rows.length
+  // 删旧+插新必须在同一事务一次提交：分片提交时，另一进程（Electron / MCP standalone
+  // 各持独立 Scanner）的 DELETE 可能落在本进程两次提交之间，交错后整文件行数翻倍
+  // （2026-09-02 实证 zcode/opencode 全历史精确 ×2）。原子性优先于分片让出。
+  return replaceUsageBySourceFile(filePath, agent, sessionId, rows)
 }
 
 /** 原子「删该 agent 全部旧行 + 插新」（zcode / opencode / dsh 全量重建路径） */
@@ -246,22 +238,8 @@ export function replaceUsageByAgent(agent: Platform, rows: UsageRow[]): number {
 }
 
 export async function replaceUsageByAgentAsync(agent: Platform, rows: UsageRow[]): Promise<number> {
-  if (rows.length === 0) {
-    prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
-    summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
-    return 0
-  }
-  if (rows.length <= 500) return replaceUsageByAgent(agent, rows)
-  prepare('DELETE FROM agent_usage WHERE agent = ?').run(agent)
-  const stmt = prepare(USAGE_INSERT_SQL)
-  for (let i = 0; i < rows.length; i += 500) {
-    const slice = rows.slice(i, i + 500)
-    const tx = getDb().transaction((items: UsageRow[]) => { for (const r of items) stmt.run(r) })
-    tx(slice)
-    if (i + 500 < rows.length) await new Promise<void>((r) => setImmediate(r))
-  }
-  summaryCache.clear(); timelineCache.clear(); sessionCache.clear(); legacyRowsCache = null
-  return rows.length
+  // 同 replaceUsageBySourceFileAsync：删/插分片提交在多进程并发全量替换时会精确翻倍
+  return replaceUsageByAgent(agent, rows)
 }
 
 /** 某个 agent 当前最早一条的时间戳；没有数据返回 0（表示从头扫） */

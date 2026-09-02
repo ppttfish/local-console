@@ -141,6 +141,7 @@
       "identity": null
     },
     "asar": true,
+    "asarUnpack": ["out/main/workers/**"],
     "compression": "maximum",
     "publish": {
       "provider": "github",
