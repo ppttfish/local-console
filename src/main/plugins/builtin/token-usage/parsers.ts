@@ -1,14 +1,13 @@
 /**
- * 五个 agent 的 JSONL/SQLite 解析器
+ * 六个 agent 的 JSONL/SQLite 解析器
  *  每个 parser 返回 UsageRow | null
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { readFile as readFileAsync } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import Database from 'better-sqlite3'
-import { decompress as zstdDecompress } from 'fzstd'
 import type { Platform, UsageRow } from './storage.js'
 import { calcCost } from './pricing.js'
+import { parseDshFile, parseDshFileAsync, type DshUsageRow } from './dsh-parse.js'
 
 /**
  * 解析器产出的行：不含 source_file。
@@ -394,140 +393,113 @@ function parseClaudeLine(line: string, ctx: ParseContext): ParsedUsageRow | null
 }
 
 // ============================================================
+// workbuddy（腾讯 CodeBuddy 系的国产 agent）
+//   ~/.workbuddy/projects/<project>/<session-uuid>.jsonl
+//   {type:'message'|'function_call', role?, timestamp(ms), sessionId,
+//    providerData:{messageId, model, requestModelId, rawUsage:{...}}}
+// rawUsage 是 OpenAI 口径 + 国产厂商扩展：
+//   prompt_tokens（含缓存命中）/ completion_tokens / total_tokens
+//   prompt_cache_hit_tokens / prompt_cache_miss_tokens / prompt_cache_write_tokens
+//   prompt_tokens_details.cached_tokens / cache_read_input_tokens / cache_creation_input_tokens
+// 模型名形如 hy4-preview / deepseek-v4.1-flash / glm-5.2 / qwen3.7-max / kimi-k2.7
+//
+// ⚠️ WorkBuddy 把 usage 挂在 **每一步 tool call** 上（function_call 记录），
+// 纯文本回答挂在 assistant message 上：一个 16MB 的会话里 1261 条 function_call
+// 带 rawUsage，而 assistant message 只有 19 条带。只认 message 会漏掉 98% 的用量
+// （实测 101 行 vs 真实 ~3165 次调用）。
+// 每条 rawUsage 记录的 providerData.messageId 都不同（= 一次独立模型调用），
+// 所以「两种记录都收 + message 只收不含 tool call 的纯回答」不会重复计。
+// ============================================================
+function workBuddyHasToolCall(content: unknown): boolean {
+  if (!Array.isArray(content)) return false
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    const b = block as Record<string, unknown>
+    if (String(b['type'] ?? '').includes('tool')) return true
+    if ('toolCallId' in b || 'callId' in b) return true
+  }
+  return false
+}
+
+function parseWorkBuddyLine(line: string, ctx: ParseContext): ParsedUsageRow | null {
+  let ev: unknown
+  try {
+    ev = JSON.parse(line)
+  } catch {
+    return null
+  }
+  if (!ev || typeof ev !== 'object') return null
+  const e = ev as Record<string, unknown>
+  const t = e['type']
+  if (t === 'message') {
+    // 只收「纯回答」：带 tool call 的 assistant message 与对应 function_call 是同一次调用
+    if (e['role'] !== 'assistant' || workBuddyHasToolCall(e['content'])) return null
+  } else if (t !== 'function_call') {
+    return null
+  }
+  const pd = e['providerData'] as Record<string, unknown> | undefined
+  if (!pd) return null
+  const raw = (pd['rawUsage'] ?? pd['usage']) as Record<string, unknown> | undefined
+  if (!raw) return null
+
+  const prompt = numOr(raw['prompt_tokens'], 0)
+  const output = numOr(raw['completion_tokens'], 0)
+  const details = raw['prompt_tokens_details'] as Record<string, unknown> | undefined
+  const cacheRead = Math.max(
+    numOr(raw['prompt_cache_hit_tokens'], 0),
+    numOr(details?.['cached_tokens'], 0),
+    numOr(raw['cache_read_input_tokens'], 0),
+    numOr(raw['cached_tokens'], 0)
+  )
+  const cacheWrite = Math.max(
+    numOr(raw['prompt_cache_write_tokens'], 0),
+    numOr(raw['cache_creation_input_tokens'], 0)
+  )
+  // prompt_tokens 是「含缓存命中」的全量：优先用厂商给的 miss 拆分，
+  // 否则按 prompt - cacheRead 扣减（与 zcode / codex 的 fresh 口径一致）
+  const missRaw = raw['prompt_cache_miss_tokens']
+  const input =
+    typeof missRaw === 'number' && Number.isFinite(missRaw)
+      ? missRaw
+      : Math.max(0, prompt - cacheRead)
+  if (input + output + cacheRead + cacheWrite === 0) return null
+
+  const model = strOr(pd['model'], strOr(pd['requestModelId'], 'unknown'))
+  return {
+    agent: 'workbuddy',
+    model,
+    input_tokens: input,
+    output_tokens: output,
+    cached_tokens: cacheRead + cacheWrite,
+    cache_read_tokens: cacheRead,
+    cache_write_tokens: cacheWrite,
+    cost_usd: calcCost(model, input, output, cacheRead, cacheWrite),
+    at: numOr(e['timestamp'], Date.now()),
+    session_id: strOr(e['sessionId'], ctx.sessionId),
+    meta: null
+  }
+}
+
+// ============================================================
 // dsh (DeepSeek Harness)  ~/.dsh/sessions/**/session-<uuid>/session.jsonl.zstd
-// 整文件 zstd 压缩，解压后按行：
-//   {type:'session', id}                          → 会话 id
-//   {type:'request/context', data:{model}}        → 当前 model
-//   {type:'assistant/chunk', data:{chunk:{type:'usage', usage:{inputTokens,outputTokens,cacheReadTokens}}}}
-// usage 跨行依赖当前 model，必须整文件解析（不能按行独立喂）
+// 整文件 zstd 压缩；usage 跨行有状态（model 来自 request/*），必须整文件解析。
+// 两代事件格式（v2 assistant/chunk、v3 assistant/message）见 dsh-parse.ts。
 // ============================================================
 export function parseDshSession(
   filePath: string,
   fallbackSessionId: string
-): Array<ParsedUsageRow & { seq?: number }> {
+): DshUsageRow[] {
   if (!existsSync(filePath)) return []
-  let raw: Uint8Array
-  try {
-    raw = zstdDecompress(readFileSync(filePath))
-  } catch {
-    return [] // 损坏的压缩流直接跳过，下次 mtime 变了会重试
-  }
-  const rows: Array<ParsedUsageRow & { seq?: number }> = []
-  let sessionId = fallbackSessionId
-  let model = 'unknown'
-  for (const line of new TextDecoder().decode(raw).split('\n')) {
-    if (!line) continue
-    let ev: unknown
-    try {
-      ev = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (!ev || typeof ev !== 'object') continue
-    const e = ev as Record<string, unknown>
-    const data = (e['data'] ?? {}) as Record<string, unknown>
-    const t = e['type']
-    if (t === 'session') {
-      sessionId = strOr(e['id'] as string | undefined, sessionId)
-    } else if (t === 'request/context') {
-      model = strOr(data['model'] as string | undefined, model)
-    } else if (t === 'request/header') {
-      const cfg = data['header'] as Record<string, unknown> | undefined
-      const m = (cfg?.['config'] as Record<string, unknown> | undefined)?.['model']
-      model = strOr(m as string | undefined, model)
-    } else if (t === 'assistant/chunk') {
-      const chunk = data['chunk'] as Record<string, unknown> | undefined
-      if (!chunk || chunk['type'] !== 'usage') continue
-      const usage = chunk['usage'] as Record<string, unknown> | undefined
-      if (!usage) continue
-      const input = numOr(usage['inputTokens'], 0)
-      const output = numOr(usage['outputTokens'], 0)
-      const cacheRead = numOr(usage['cacheReadTokens'], 0)
-      if (input + output + cacheRead === 0) continue
-      rows.push({
-        agent: 'dsh',
-        model,
-        input_tokens: input,
-        output_tokens: output,
-        cached_tokens: cacheRead,
-        cache_read_tokens: cacheRead,
-        cache_write_tokens: 0,
-        cost_usd: calcCost(model, input, output, cacheRead, 0),
-        at: numOr(e['time'], Date.now()),
-        session_id: sessionId,
-        meta: null,
-        seq: typeof e['seq'] === 'number' ? e['seq'] : undefined
-      })
-    }
-  }
-  return rows
+  return parseDshFile(filePath, fallbackSessionId)
 }
 
-/** 异步版：文件读取走 fs/promises，不阻塞主线程；解压仍为同步（fzstd 纯 JS），但已在 scanner 的让出切片中 */
+/** 异步版：文件读取走 fs/promises，不阻塞主线程；解压仍为同步（fzstd 纯 JS） */
 export async function parseDshSessionAsync(
   filePath: string,
   fallbackSessionId: string
-): Promise<Array<ParsedUsageRow & { seq?: number }>> {
+): Promise<DshUsageRow[]> {
   if (!existsSync(filePath)) return []
-  let raw: Uint8Array
-  try {
-    const buf = await readFileAsync(filePath)
-    raw = zstdDecompress(buf)
-  } catch {
-    return []
-  }
-  const rows: Array<ParsedUsageRow & { seq?: number }> = []
-  let sessionId = fallbackSessionId
-  let model = 'unknown'
-  for (const line of new TextDecoder().decode(raw).split('\n')) {
-    if (!line) continue
-    let ev: unknown
-    try {
-      ev = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (!ev || typeof ev !== 'object') continue
-    const e = ev as Record<string, unknown>
-    const data = (e['data'] ?? {}) as Record<string, unknown>
-    const t = e['type']
-    if (t === 'session') {
-      // id 在事件顶层，不在 data 里
-      sessionId = strOr(e['id'] as string | undefined, sessionId)
-    } else if (t === 'request/context') {
-      model = strOr(data['model'] as string | undefined, model)
-    } else if (t === 'request/header') {
-      const cfg = data['header'] as Record<string, unknown> | undefined
-      const m = (cfg?.['config'] as Record<string, unknown> | undefined)?.['model']
-      model = strOr(m as string | undefined, model)
-    } else if (t === 'assistant/chunk') {
-      const chunk = data['chunk'] as Record<string, unknown> | undefined
-      if (!chunk || chunk['type'] !== 'usage') continue
-      const usage = chunk['usage'] as Record<string, unknown> | undefined
-      if (!usage) continue
-      const input = numOr(usage['inputTokens'], 0)
-      const output = numOr(usage['outputTokens'], 0)
-      const cacheRead = numOr(usage['cacheReadTokens'], 0)
-      if (input + output + cacheRead === 0) continue
-      // dsh 的 totalTokens = inputTokens + outputTokens + cacheReadTokens，
-      // 即 inputTokens 为 fresh（不含缓存命中），与 omp 同口径，无需扣减
-      rows.push({
-        agent: 'dsh',
-        model,
-        input_tokens: input,
-        output_tokens: output,
-        cached_tokens: cacheRead,
-        cache_read_tokens: cacheRead,
-        cache_write_tokens: 0,
-        cost_usd: calcCost(model, input, output, cacheRead, 0),
-        at: numOr(e['time'], Date.now()),
-        session_id: sessionId,
-        meta: null,
-        seq: typeof e['seq'] === 'number' ? e['seq'] : undefined
-      })
-    }
-  }
-  return rows
+  return parseDshFileAsync(filePath, fallbackSessionId)
 }
 
 // ============================================================
@@ -568,32 +540,92 @@ export interface OpenCodeRow {
  *   opencode 走「全删全写」，所以传入当前库里已有 opencode 行的最早时间即可，
  *   opencode.db 每变一次 mtime 就要重跑一遍，不设下界会让全表扫随时间线性变慢。
  */
+export interface OpenCodeReadResult {
+  rows: OpenCodeRow[]
+  /** 本次读到的最大 rowid；0 表示一条没读到 */
+  maxRowid: number
+}
+
+/**
+ * 增量读：只取 rowid 大于游标的消息。
+ *
+ * 为什么必须按 rowid 增量：本机 opencode.db 已经涨到 16GB（2.3 万行 message，
+ * 平均每行几百 KB）。老实现 `WHERE time_created >= MIN(已入库 at)` 等于把全表
+ * data 字段读一遍（实测 4.7s 读 + 3.6s JSON.parse），而且 opencode.db 每变一次
+ * mtime 就重跑一遍，是主线程卡死的两大来源之一。rowid 是 INTEGER PRIMARY KEY，
+ * `rowid > ?` 走主键索引，只读新增行。
+ */
+export function readOpenCodeDbAfter(dbPath: string, afterRowid: number): OpenCodeReadResult {
+  return readOpenCodeCore(dbPath, 'rowid > ?', afterRowid)
+}
+
+/** 全量读（rescan / 首次入仓用）；sinceMs 为 0 表示不设下界 */
 export function readOpenCodeDb(dbPath: string, sinceMs = 0): OpenCodeRow[] {
-  if (!existsSync(dbPath)) return []
+  return readOpenCodeCore(dbPath, 'time_created >= ?', sinceMs).rows
+}
+
+/**
+ * 游标种子：库里已有 opencode 数据时，取「time_created <= 已入库最新时间」的最大 rowid。
+ * 走 (session_id, time_created, id) 覆盖索引，不碰 data 大字段，毫秒级返回；
+ * 这样升级后第一次扫描不用把 16GB 全读一遍。
+ */
+export function maxOpenCodeRowidUpTo(dbPath: string, upToMs: number): number {
+  if (!existsSync(dbPath)) return 0
   let db: Database.Database
   try {
     db = new Database(dbPath, { readonly: true, fileMustExist: true })
   } catch {
-    return []
+    return 0
+  }
+  try {
+    const r = db
+      .prepare('SELECT COALESCE(MAX(rowid), 0) AS m FROM message WHERE time_created <= ?')
+      .get(upToMs) as { m: number }
+    return r?.m ?? 0
+  } catch {
+    return 0
+  } finally {
+    try {
+      db.close()
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function readOpenCodeCore(
+  dbPath: string,
+  where: string,
+  param: number
+): OpenCodeReadResult {
+  if (!existsSync(dbPath)) return { rows: [], maxRowid: 0 }
+  let db: Database.Database
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true })
+  } catch {
+    return { rows: [], maxRowid: 0 }
   }
   try {
     // 不再用 data LIKE '%assistant%' AND data LIKE '%tokens%' 过滤：
     // 两个前置通配符的 LIKE 无法走索引，等于对每行几百 KB 的 JSON 做全表字符串匹配，
     // 而 role/tokens 本来就在下面的 JSON.parse 之后判空，过滤是重复的。
-    const rows = db
+    const raw = db
       .prepare(
-        `SELECT id, session_id, time_created, data
+        `SELECT rowid AS rid, id, session_id, time_created, data
          FROM message
-         WHERE time_created >= ?`
+         WHERE ${where}`
       )
-      .all(sinceMs) as Array<{
+      .all(param) as Array<{
+      rid: number
       id: string
       session_id: string
       time_created: number
       data: string
     }>
     const out: OpenCodeRow[] = []
-    for (const r of rows) {
+    let maxRowid = 0
+    for (const r of raw) {
+      if (r.rid > maxRowid) maxRowid = r.rid
       try {
         const d = JSON.parse(r.data) as Record<string, unknown>
         if (d['role'] !== 'assistant') continue
@@ -633,7 +665,7 @@ export function readOpenCodeDb(dbPath: string, sinceMs = 0): OpenCodeRow[] {
         // 忽略单行解析错
       }
     }
-    return out
+    return { rows: out, maxRowid }
   } finally {
     try {
       db.close()
@@ -647,7 +679,7 @@ export function readOpenCodeDb(dbPath: string, sinceMs = 0): OpenCodeRow[] {
 // 文件类型分发
 // ============================================================
 export function parserForFile(agent: Platform, filePath: string): LineParser | null {
-  // omp / zcode / codex / claude 都用 .jsonl
+  // omp / zcode / codex / claude / workbuddy 都用 .jsonl
   if (!filePath.endsWith('.jsonl')) return null
   switch (agent) {
     case 'omp':
@@ -658,6 +690,8 @@ export function parserForFile(agent: Platform, filePath: string): LineParser | n
       return parseCodexLine
     case 'claude':
       return parseClaudeLine
+    case 'workbuddy':
+      return parseWorkBuddyLine
     default:
       return null
   }
@@ -677,6 +711,9 @@ export function sessionIdFromFile(agent: Platform, filePath: string): string {
     case 'dsh':
       // session-<uuid>/session.jsonl.zstd —— 会话 id 在目录名上
       return basename(dirname(filePath))
+    case 'workbuddy':
+      // <session-uuid>.jsonl
+      return base
     case 'codex':
     case 'claude':
       return base

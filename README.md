@@ -16,7 +16,7 @@
 |---|---|---|
 | **启动台** | ✅ | 长期服务 / 批处理任务的增删改查、启停、重启、复制命令 |
 | **服务监控** | ✅ | 每 2 秒扫描本机 LISTEN 端口，标记已纳管 / 外部进程 |
-| **Token 用量** | ✅ | 5 个 agent 的 token / 成本 / 缓存命中率，**多维筛选**（平台/模型/日期/粒度）+ Chart.js 图表 |
+| **Token 用量** | ✅ | 7 个 agent 的 token / 成本 / 缓存命中率，**多维筛选**（平台/模型/日期/粒度）+ Chart.js 图表 |
 | **日志中心** | ✅ | 每个服务独立日志文件，自动轮转 2MB |
 | **MCP server** | ✅ | stdio JSON-RPC，11 个工具，被 Claude / Codex / Cursor 等任意 MCP 客户端调用 |
 | **CLI `lcp`** | ✅ | 命令行也能用（list / start / stop / restart / logs / ports / add） |
@@ -103,9 +103,10 @@ src/
 │   │   └── event-bus.ts           # 进程内事件
 │   ├── plugins/builtin/token-usage/  # 第一个插件
 │   │   ├── index.ts               # 插件入口
-│   │   ├── source-registry.ts     # agent 路径表
+│   │   ├── source-registry.ts     # agent 路径表（含 dataSubpath 扫描根）
 │   │   ├── scanner.ts             # 增量扫描
-│   │   ├── parsers.ts             # 5 个 JSONL 解析器 + SQLite
+│   │   ├── parsers.ts             # 6 个 JSONL 解析器 + SQLite
+│   │   ├── dsh-parse.ts           # DSH 会话（v2/v3 两代格式，主/Worker 共用）
 │   │   ├── pricing.ts             # 模型定价表
 │   │   └── storage.ts             # SQLite 表 + 查询
 │   ├── ipc/index.ts               # IPC handlers
@@ -154,7 +155,7 @@ src/
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `agent` | text | `omp` / `zcode` / `opencode` / `codex` / `claude` |
+| `agent` | text | `omp` / `zcode` / `opencode` / `codex` / `claude` / `dsh` / `workbuddy` |
 | `model` | text | `MiniMaxAI/MiniMax-M3` / `GLM-5.3` / ... |
 | `input_tokens` | int | 非缓存输入 |
 | `output_tokens` | int | 输出 |
@@ -183,6 +184,9 @@ src/
   description: '...',
   type: 'jsonl',
   homeSubpath: '.your-agent',
+  // 扫描根目录（相对 home）+ fs.watch 目标：必须是「会话目录」本身，
+  // 写成 agent 根目录会把 logs/blobs/vendor 几万个无关文件也 stat 一遍
+  dataSubpath: '.your-agent/sessions',
   pathGlob: 'sessions/**/*.jsonl',
   filePattern: /\.jsonl$/,
   parser: 'your-agent'
@@ -193,17 +197,22 @@ src/
 
 ```ts
 export type Platform =
-  | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude'
+  | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh' | 'workbuddy'
   | 'your-agent'  // ← 新增
 
-function parseYourAgentLine(line: string, ctx: ParseContext): UsageRow | null {
+function parseYourAgentLine(line: string, ctx: ParseContext): ParsedUsageRow | null {
   // 解析你的 JSONL
 }
 ```
 
-**3. 重启** —— scanner 自动遍历新 source，识别新目录，**未识别 agent 目录**会写到 `startup.log` 提醒。
+**3. 重启** —— 扫描器自动遍历新 source（`discoverJsonl`/`setupWatchers` 都是表驱动），
+未识别 agent 目录会写到 `startup.log`。
 
-> 💡 不知道是不是 agent？看 `startup.log` 里有 "未识别渠道" 列表，常见候选（`~/.deepseek-harness`、`~/.kilocode` 等）已内置探测。
+> 💡 不知道是不是 agent？看 `startup.log` 里的「已识别渠道 / 未识别的 agent 目录」两行，
+> 常见候选（`.trae`、`.qoder`、`.kilo`、`.windsurf` 等）已内置探测。
+>
+> ⚠️ 若新 agent 的 usage 不在「助手消息」上（例如 WorkBuddy 挂在每一步 tool call 的
+> `providerData.rawUsage`），解析器要按「一次模型调用一行」来收，否则会大幅少算。
 
 ---
 
@@ -228,7 +237,7 @@ function parseYourAgentLine(line: string, ctx: ParseContext): UsageRow | null {
 
 - **启动台** —— 服务卡片 + 一键启停
 - **服务监控** —— 端口 TOP 50，已纳管 / 外部进程标记
-- **Token 用量** —— 4 KPI + 折线图（双 Y 轴 token + 成本）+ 甜甜圈（按平台）+ 条形图（按模型 TOP 10）
+- **Token 用量** —— 4 KPI + 折线图（双 Y 轴 token + 成本）+ 甜甜圈（按平台）+ 条形图 / 饼图（按模型 TOP 10，可切换）
 - **日志中心** —— 服务日志实时查看 + 100/300/1000 行切换 + 自动滚到底
 - **设置** —— 主题切换 ☀ 🌙 ⚙
 

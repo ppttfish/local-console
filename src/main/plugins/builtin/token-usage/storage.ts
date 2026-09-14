@@ -5,7 +5,15 @@ import { getDb, prepare } from '../../../services/db.js'
 import { calcCost, priceFor, loadPricing, type ModelPrice } from './pricing.js'
 import { dbWorkerQuerySummary, dbWorkerQueryTimeline, dbWorkerListSessions, dbWorkerQueryRecap, dbWorkerCountLegacy } from '../../../workers/db-worker-client.js'
 
-export type Platform = 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh' | 'unknown'
+export type Platform =
+  | 'omp'
+  | 'zcode'
+  | 'opencode'
+  | 'codex'
+  | 'claude'
+  | 'dsh'
+  | 'workbuddy'
+  | 'unknown'
 
 export interface UsageRow {
   agent: Platform
@@ -247,6 +255,64 @@ export function minAtForAgent(agent: Platform): number {
   const r = prepare('SELECT MIN(at) AS m FROM agent_usage WHERE agent = ?')
     .get(agent) as { m: number | null }
   return r.m ?? 0
+}
+
+/** 某个 agent 当前最新一条的时间戳；没有数据返回 0 */
+export function maxAtForAgent(agent: Platform): number {
+  const r = prepare('SELECT MAX(at) AS m FROM agent_usage WHERE agent = ?')
+    .get(agent) as { m: number | null }
+  return r.m ?? 0
+}
+
+/** 某个 agent 已入库行数（走 agent 索引，毫秒级） */
+export function countRowsForAgent(agent: Platform): number {
+  const r = prepare('SELECT COUNT(*) AS n FROM agent_usage WHERE agent = ?')
+    .get(agent) as { n: number }
+  return r.n ?? 0
+}
+
+/** 一个会话在本次增量里新增行的时间下界 */
+export interface SessionWindow {
+  sessionId: string
+  fromAt: number
+}
+
+/**
+ * 原子「按会话窗口删旧 + 插新」。
+ *
+ * opencode 用 rowid 增量读（只读新增消息），但整体 replaceUsageByAgent 那种
+ * 「全删全写」又不能用了：多个进程（Electron GUI / MCP standalone）各自的扫描器
+ * 都可能在滚同一个游标，直接 append 会双计。折中做法是——每个受影响会话，把
+ * `at >= 本次新增最早时间` 的旧行删掉再插，删除范围覆盖了并发进程可能写进来的
+ * 重复行，重复执行结果一致（幂等），且只碰少量新增行。
+ */
+export function replaceUsageBySessionWindows(
+  agent: Platform,
+  windows: SessionWindow[],
+  rows: UsageRow[]
+): number {
+  const del = prepare(
+    'DELETE FROM agent_usage WHERE agent = @agent AND session_id = @sessionId AND at >= @fromAt'
+  )
+  const stmt = prepare(USAGE_INSERT_SQL)
+  const tx = getDb().transaction(() => {
+    for (const w of windows) del.run({ agent, sessionId: w.sessionId, fromAt: w.fromAt })
+    for (const r of rows) stmt.run(r)
+  })
+  tx()
+  summaryCache.clear()
+  timelineCache.clear()
+  sessionCache.clear()
+  legacyRowsCache = null
+  return rows.length
+}
+
+export async function replaceUsageBySessionWindowsAsync(
+  agent: Platform,
+  windows: SessionWindow[],
+  rows: UsageRow[]
+): Promise<number> {
+  return replaceUsageBySessionWindows(agent, windows, rows)
 }
 
 let legacyRowsCache: { at: number; val: number } | null = null

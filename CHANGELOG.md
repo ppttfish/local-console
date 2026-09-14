@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.6 (2026-09-14) — 卡死根治 + DSH 断数 + 国产 agent（WorkBuddy）接入
+
+### 修复
+
+- **频繁卡死（三处主线程阻塞叠加）**：
+  - **Worker 在打包版从未生效**：`parse-worker-client` / `db-worker-client` 用 `__dirname + 'workers/x.cjs'` 找 Worker，但打包后本模块被 rollup 打进 `out/main/chunks/*.cjs`，`__dirname` 是 `app.asar/out/main/chunks`，六个候选路径全部落空 → `workerDisabled`，DSH zstd 解压（实测 23.6MB→75MB、25.5 秒）与 Codex 全量解析全部回落到主线程同步执行。现在用统一的 `workers/worker-path.ts` 逐级向上 + `app.asar.unpacked` 优先解析，并实测确认 Worker 从 `app.asar.unpacked` 里 **require 不到 asar 内的依赖**（`Cannot find module 'fzstd'`），故 `asarUnpack` 补齐 `out/main/chunks/**`、`fzstd`、`better-sqlite3`、`bindings`、`file-uri-to-path`；Worker 找不到时打一条显式 warn（镜像进 startup.log），不再静默降级
+  - **DSH 每次会话写入都全量重解压**：指纹机制导致任一会话文件变动就把 43 个会话（75MB 文本）重解压一遍。改为**按文件游标增量**（size+mtime 命中即跳过），只重解压真正变动的那个会话（实测 25.5s → 0.5~1.5s）
+  - **opencode.db 每次 mtime 变化全表重读**：本机 `opencode.db` 已 16GB / 2.3 万行 message，旧查询 `WHERE time_created >= MIN(已入库 at)` 等于把全表 data 字段读一遍（实测 4.7s 读 + 3.6s JSON.parse）+ 全量删重插 2 万行。改为 **rowid 游标增量**（rowid 是主键，只读新增行，实测 0~6ms），入库用「按会话窗口删旧+插新」保证多进程幂等；首次升级用覆盖索引种游标，不必把 16GB 重读一遍
+- **DSH 自 2026-09-07 起完全不入统计**：DSH 已换用 v3 会话格式（`session.v3.jsonl.zstd`），usage 从 `assistant/chunk` 事件搬到了 `assistant/message.data.usage`，老解析器一条都匹配不到（DB 里 dsh 最后一条停在 09-07）。新增 `dsh-parse.ts` 同时支持 v2/v3（模型取 `data.message.source.model`），主进程与 parse-worker 共用同一份实现——历史上前者一份、Worker 里又拷一份，格式升级时必然漏一边
+- **国产 agent（WorkBuddy）完全不进统计**：新增 workbuddy 数据源（`~/.workbuddy/projects/**/*.jsonl`）。usage 挂在**每一步 tool call** 的 `providerData.rawUsage` 上（一个 16MB 会话里 1261 条 function_call 带 usage、assistant message 只有 19 条带），只认 message 会漏掉 98%；现按「function_call 全收 + 不含 tool call 的纯回答 message」统计，实测 101 行 → 3165 行、覆盖混元 hy3/hy4-preview、deepseek-v4.x、glm-5.2、qwen3.7-max、kimi-k2.7 共 9 个模型
+- **扫描根目录写错导致单次扫描多花 8 秒**：渠道改表驱动后 walk 从 `homeSubpath`（如 `~/.workbuddy` 4.4 万文件、`~/.codex` 1.6 万文件）开始，而不是会话目录；新增 `Source.dataSubpath` 精确定位（`~/.workbuddy/projects` 等），实测 8.9s → 0.1s
+- **扫描被 watch 事件无限推迟**：agent 活跃时 `fs.watch` 事件连绵不断，2s 防抖被反复重置，可能长时间不出新数据；新增 15s 最长等待，到点即扫
+- **「未识别渠道」提示从未生效**：`listUnknownAgents()` 写了但没人调用，README 承诺的启动日志提醒一直不存在；现在启动时打印已识别渠道 + 未识别目录（含 `.trae`/`.qoder`/`.kilo` 等国产 agent），并把 `console.warn/error` 与 `[token-usage]` 诊断镜像进 `startup.log`（打包态 GUI 没有终端，此前所有告警都看不到）
+- **扫描耗时可视化**：每次扫描（>3s 或强制）输出分阶段耗时 `jsonl/zcode/opencode/dsh`，DSH 输出重解压文件数，opencode 输出游标增量条数
+
+### 新增
+
+- **Token 用量页「按模型 TOP 10」支持柱状 / 饼图切换**：模型卡片右上角加分段开关（柱状图 / 饼图），饼图为甜甜圈图、右侧图例、tooltip 带占比；超过 10 个模型时尾部合并为「其他（N 个模型）」，饼图模式卡片加高到 300px 并收紧图例行距，11 条图例不会超出画布
+- `Platform` 增加 `workbuddy`：MCP `pws_query_agent_usage` 枚举、Token 用量页筛选项/配色/标签、空态目录提示同步
+- 定价表补充国产模型（`hy3`/`hy4-preview`/`hy4-preview-x`/`qwen3.7-max`/`kimi-k2.7`/`deepseek-v4*`/小写 `glm-5.*` 别名）——均为**估算默认值**，可在设置页 `model-pricing.json` 覆盖
+
+### 验证
+
+- `npm run typecheck` 0 error，`npm run build` 通过
+- 实测（standalone 9600 + 真实数据）：首扫 <3s（此前 25s+ 主线程阻塞），后续扫描仅重解压变动的 1/43 个 DSH 会话（0.5~1.5s）；`scanning:false` 稳定回落到空闲，不再出现扫描排队不停
+- 数据核对：dsh 859 行（最新 2026-09-14 当天，模型 `deepseek/deepseek-v4.1-flash`）、workbuddy 3165 行 / 9 模型、opencode 游标稳定在 rowid 25199 不再全表重读
+- Worker 打包链路实测：打包版 Worker 路径命中 `app.asar.unpacked/out/main/workers/parse-worker.cjs`，DSH 解析在 Worker 内完成（主线程无阻塞）
+- 模型分布饼图 e2e（playwright + standalone 9701 + 真实库）：默认柱状图 → 切饼图标题变「Token 占比」→ canvas 扇区像素占比 0.35 / 15 种色 → tooltip 带百分比 → 可切回柱状图，8 项断言全过、无 console 错误
+
 ## v0.4.5 (2026-09-01) — 极致性能
 
 ### 性能

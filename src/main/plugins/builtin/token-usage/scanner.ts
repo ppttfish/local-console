@@ -14,21 +14,23 @@ import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { parserForFile, sessionIdFromFile, readOpenCodeDb, parseDshSessionAsync, readZcodeDb, parseCodexSession, parseCodexSessionFromContent } from './parsers.js'
+import { parserForFile, sessionIdFromFile, readOpenCodeDb, readOpenCodeDbAfter, maxOpenCodeRowidUpTo, parseDshSessionAsync, readZcodeDb, parseCodexSession, parseCodexSessionFromContent } from './parsers.js'
+import { dedupeDshRows } from './dsh-parse.js'
 import { parseDshViaWorker, parseCodexViaWorker, parseCodexFileViaWorker, shutdownParseWorker } from '../../../workers/parse-worker-client.js'
+import { listDiscoveredSources, listUnknownAgents } from './source-registry.js'
 import {
   ensureUsageSchema,
-  insertUsageBatch,
   insertUsageBatchAsync,
-  replaceUsageBySourceFile,
   replaceUsageBySourceFileAsync,
-  replaceUsageByAgent,
   replaceUsageByAgentAsync,
+  replaceUsageBySessionWindowsAsync,
   getCursor,
   upsertCursor,
   resetAllCursors,
   countLegacyRowsAsync,
-  minAtForAgent,
+  maxAtForAgent,
+  countRowsForAgent,
+  type SessionWindow,
   type UsageRow,
   type Platform
 } from './storage.js'
@@ -66,19 +68,50 @@ export class UsageScanner extends EventEmitter {
   private timer: ReturnType<typeof setInterval> | undefined
   private watchers: FSWatcher[] = []
   private watchDebounce: ReturnType<typeof setTimeout> | null = null
+  private watchFirstEventAt: number | null = null
   private stats: ScannerStats = freshStats()
   private opencodeLastMtime: { path: string; mtime: number; count: number } | null = null
-  private dshFingerprint: string | null = null
   private zcodeDbLastMtime: { path: string; mtime: number } | null = null
   private scanQueue: Promise<void> = Promise.resolve()
+  private channelsLogged = false
+  /** 本轮扫描里真正被解析（游标未命中）的文件，用于性能诊断 */
+  private parsedFiles: string[] = []
 
   start(): void {
     if (this.timer) return
     ensureUsageSchema()
+    this.logChannels()
     void this.enqueueScan()
     // 极致：有 fs.watch 时轮询降为 5 分钟兜底，无 watch 时保持 30s
     const hasWatch = this.setupWatchers()
     this.timer = setInterval(() => void this.enqueueScan(), hasWatch ? 300_000 : 30_000)
+  }
+
+  /**
+   * 把「扫到了哪些渠道 / 哪些目录没被识别」写进启动日志。
+   * README 一直承诺有这个提醒，但代码里从没调用过 —— 国产 agent（WorkBuddy、
+   * Qoder、Trae、Kimi Code…）数据进不来时用户完全无感知。
+   */
+  private logChannels(): void {
+    if (this.channelsLogged) return
+    this.channelsLogged = true
+    try {
+      const found = listDiscoveredSources()
+      console.info(
+        `[token-usage] 已识别渠道 ${found.length} 个：` +
+          found.map((s) => `${s.displayName}(${s.agent})`).join(' / ')
+      )
+      const unknown = listUnknownAgents()
+      if (unknown.length > 0) {
+        console.info(
+          `[token-usage] 未识别的 agent 目录（不会进统计）：` +
+            unknown.map((u) => u.name).join(', ') +
+            '；需要在 source-registry.ts + parsers.ts 里加适配'
+        )
+      }
+    } catch (e) {
+      console.warn('[token-usage] 渠道探测失败:', e)
+    }
   }
 
   stop(): void {
@@ -93,17 +126,19 @@ export class UsageScanner extends EventEmitter {
   private setupWatchers(): boolean {
     try {
       const home = homedir()
-      const watchTargets = [
-        join(home, '.omp', 'agent', 'sessions'),
-        join(home, '.zcode', 'cli', 'rollout'),
-        join(home, '.codex', 'sessions'),
-        join(home, '.claude', 'projects'),
-        join(home, '.dsh', 'sessions'),
-        dirname(join(home, '.local', 'share', 'opencode', 'opencode.db')),
-        dirname(join(home, '.zcode', 'cli', 'db', 'db.sqlite')),
-      ]
+      // 监听目标全部来自 source-registry（dataSubpath），加新 agent 不用改这里。
+      // 注意别去 watch 整个 agent 根目录：.workbuddy/daemon.log 之类的日志每秒都在写，
+      // recursive watch 会被噪音拖着不停触发全量扫描。
+      const targets = new Set<string>()
+      for (const s of listDiscoveredSources()) {
+        targets.add(join(home, s.dataSubpath ?? s.homeSubpath))
+      }
+      // zcode 的用量权威来源是 db.sqlite，单独挂一个监听
+      targets.add(join(home, '.zcode', 'cli', 'db'))
+      targets.add(dirname(join(home, '.local', 'share', 'opencode', 'opencode.db')))
+
       let ok = 0
-      for (const p of watchTargets) {
+      for (const p of targets) {
         if (!existsSync(p)) continue
         try {
           const w = watch(p, { recursive: true }, () => this.scheduleWatchScan())
@@ -116,12 +151,19 @@ export class UsageScanner extends EventEmitter {
   }
 
   private scheduleWatchScan(): void {
+    // 防抖 2s：单次会话写入会触发多次 change/rename，合并为一次扫描。
+    // 但 agent 活跃时事件是连绵不断的，纯防抖会让扫描被无限推迟（一直不更新），
+    // 所以再加一个 15s 的最长等待：超过就直接扫。
+    const now = Date.now()
+    if (this.watchFirstEventAt === null) this.watchFirstEventAt = now
+    const waited = now - this.watchFirstEventAt
     if (this.watchDebounce) clearTimeout(this.watchDebounce)
-    // 防抖 2s：单次会话写入会触发多次 change/rename，合并为一次扫描
+    const delay = waited > 15000 ? 0 : 2000
     this.watchDebounce = setTimeout(() => {
       this.watchDebounce = null
+      this.watchFirstEventAt = null
       void this.enqueueScan()
-    }, 2000)
+    }, delay)
   }
 
   getStats(): ScannerStats {
@@ -139,7 +181,6 @@ export class UsageScanner extends EventEmitter {
     getDb().prepare('DELETE FROM agent_usage').run()
     this.stats = freshStats()
     this.opencodeLastMtime = null
-    this.dshFingerprint = null
     this.zcodeDbLastMtime = null
     await this.enqueueScan(true)
     return this.stats
@@ -155,42 +196,67 @@ export class UsageScanner extends EventEmitter {
 
   private async runScanAll(force = false): Promise<void> {
     let totalNew = 0
+    const scanStartedAt = Date.now()
+    const phase = { jsonl: 0, zcode: 0, opencode: 0, dsh: 0 }
+    const mark = () => Date.now()
     this.stats.scanning = true
     try {
+      let t = mark()
       const files = await this.discoverJsonl()
       this.stats.files_scanned = files.length
       let processed = 0
+      const slow: Array<{ p: string; ms: number }> = []
+      this.parsedFiles = []
       for (const f of files) {
+        const fileStart = Date.now()
         try {
           totalNew += await this.scanJsonlFile(f, force)
         } catch (e) {
           this.stats.errors++
           console.warn(`[token-usage] 扫描 ${f.path} 失败:`, e)
         }
+        const cost = Date.now() - fileStart
+        if (cost > 300) slow.push({ p: f.path, ms: cost })
         processed++
         // 每 8 个文件让出一次，避免连续大文件解析饿死后续 IPC
         if (processed % 8 === 0) await yieldToLoop()
       }
+      phase.jsonl = mark() - t
+      if (phase.jsonl > 2000) {
+        slow.sort((a, b) => b.ms - a.ms)
+        console.info(
+          `[token-usage] jsonl 解析了 ${this.parsedFiles.length}/${files.length} 个文件`,
+          slow.length > 0
+            ? `慢文件: ${slow.slice(0, 5).map((s) => `${s.ms}ms ${s.p}`).join(' | ')}`
+            : `样例: ${this.parsedFiles.slice(0, 3).join(' , ')}`
+        )
+      }
+      t = mark()
       try {
         totalNew += await this.scanZcodeDb(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 zcode db 失败:', e)
       }
+      phase.zcode = mark() - t
       await yieldToLoop()
+      t = mark()
       try {
         totalNew += await this.scanOpenCode(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 opencode.db 失败:', e)
       }
+      phase.opencode = mark() - t
       await yieldToLoop()
+      t = mark()
       try {
         totalNew += await this.scanDsh(force)
       } catch (e) {
         this.stats.errors++
         console.warn('[token-usage] 扫 dsh sessions 失败:', e)
       }
+      phase.dsh = mark() - t
     } catch (e) {
       this.stats.errors++
       console.error('[token-usage] scanAll 异常:', e)
@@ -198,6 +264,14 @@ export class UsageScanner extends EventEmitter {
     this.stats.scanning = false
     this.stats.rows_inserted += totalNew
     this.stats.last_scan_at = Date.now()
+    // 扫描耗时进日志：卡顿排查时一眼能看出是「谁」慢（DSH 全量解压 / opencode 全表读…）
+    const totalMs = Date.now() - scanStartedAt
+    if (force || totalMs > 3000) {
+      console.info(
+        `[token-usage] 扫描完成 ${totalMs}ms（文件 ${this.stats.files_scanned}，新增行 ${totalNew}${force ? '，强制全量' : ''}）` +
+          ` 分阶段: jsonl=${phase.jsonl}ms zcode=${phase.zcode}ms opencode=${phase.opencode}ms dsh=${phase.dsh}ms`
+      )
+    }
     try {
       this.stats.legacy_rows = await countLegacyRowsAsync()
     } catch {
@@ -224,6 +298,7 @@ export class UsageScanner extends EventEmitter {
     ) {
       return 0
     }
+    this.parsedFiles.push(file.path)
 
     if (st.size > LARGE_THRESHOLD) {
       // 大文件流式，避免 50MB+ readFile 入内存
@@ -443,6 +518,15 @@ export class UsageScanner extends EventEmitter {
     return usageRows.length
   }
 
+  /**
+   * opencode.db 扫描 —— rowid 游标增量。
+   *
+   * 本机 opencode.db 已涨到 16GB（2.3 万行 message，平均每行几百 KB）。老实现每次
+   * mtime 变化都 `WHERE time_created >= MIN(已入库 at)` + 全表 data 重读 + JSON.parse
+   * （实测 4.7s + 3.6s）+ replaceUsageByAgent 全删全写 2 万行，且 opencode 活跃时
+   * 这个循环几乎不停。现在：rowid 是主键，`rowid > 游标` 只读新增行；入库用
+   * 「按会话窗口删旧+插新」，多进程并发也幂等。
+   */
   private async scanOpenCode(force = false): Promise<number> {
     const dbPath = join(homedir(), '.local', 'share', 'opencode', 'opencode.db')
     if (!existsSync(dbPath)) return 0
@@ -451,6 +535,7 @@ export class UsageScanner extends EventEmitter {
       const s = await stat(dbPath)
       mtime = Math.floor(s.mtimeMs)
     } catch { return 0 }
+    const cursorRow = getCursor(dbPath)
     if (
       !force &&
       this.opencodeLastMtime &&
@@ -460,11 +545,50 @@ export class UsageScanner extends EventEmitter {
       return 0
     }
     await yieldToLoop()
-    const rows = readOpenCodeDb(dbPath, minAtForAgent('opencode'))
+
+    // 首次入仓：如果库里已经有 opencode 数据，把游标种在「已入库最新时间」对应的
+    // 最大 rowid 上（走覆盖索引，毫秒级），避免为了对齐而把 16GB 重读一遍
+    let afterRowid = cursorRow?.lines_seen ?? 0
+    if (!cursorRow && !force) {
+      const maxAt = maxAtForAgent('opencode')
+      if (maxAt > 0) {
+        afterRowid = maxOpenCodeRowidUpTo(dbPath, maxAt)
+        if (afterRowid > 0) {
+          console.info(
+            `[token-usage] opencode 首次增量扫描：游标种子 rowid=${afterRowid}（跳过全量 16GB 重读）`
+          )
+        }
+      }
+    }
+
+    const read = force
+      ? { rows: readOpenCodeDb(dbPath, 0), maxRowid: 0 }
+      : readOpenCodeDbAfter(dbPath, afterRowid)
+    const rows = read.rows
+    this.opencodeLastMtime = { path: dbPath, mtime, count: rows.length }
+    if (rows.length > 0 || force) {
+      console.info(
+        `[token-usage] opencode ${force ? '全量' : '增量'}读取 ${rows.length} 条（游标 ${afterRowid} → ${read.maxRowid || '全量'}）`
+      )
+    }
+
     if (rows.length === 0) {
-      this.opencodeLastMtime = { path: dbPath, mtime, count: 0 }
+      // 一条新消息都没有：游标必须原地不动。
+      // （曾经这里写成「把游标推到本次读到的 maxRowid」——没读到行时 maxRowid=0，
+      //   等于把游标清零，下一次扫描又把整张 16GB 表重读一遍。）
+      if (!cursorRow) {
+        upsertCursor(
+          dbPath,
+          0,
+          mtime,
+          force ? maxOpenCodeRowidUpTo(dbPath, Date.now()) : afterRowid,
+          'opencode'
+        )
+      }
+      this.stats.opencode_messages = countRowsForAgent('opencode')
       return 0
     }
+
     const usageRows: UsageRow[] = rows.map((r) => ({
       agent: 'opencode',
       model: r.model,
@@ -479,15 +603,42 @@ export class UsageScanner extends EventEmitter {
       meta: null,
       source_file: dbPath
     }))
-    await replaceUsageByAgentAsync('opencode', usageRows)
+
+    if (force) {
+      // 显式重扫：全量重建，游标随后指向当前最大 rowid（否则下一次扫描又要把
+      // 16GB 重读一遍）
+      await replaceUsageByAgentAsync('opencode', usageRows)
+      upsertCursor(dbPath, 0, mtime, maxOpenCodeRowidUpTo(dbPath, Date.now()), 'opencode')
+    } else {
+      // 按会话窗口删旧+插新：同一会话在本次新增区间内的旧行清掉再写，
+      // 并发扫描器重复执行结果一致
+      const windows = new Map<string, number>()
+      for (const r of usageRows) {
+        const prev = windows.get(r.session_id)
+        if (prev === undefined || r.at < prev) windows.set(r.session_id, r.at)
+      }
+      const list: SessionWindow[] = [...windows.entries()].map(([sessionId, fromAt]) => ({
+        sessionId,
+        fromAt
+      }))
+      await replaceUsageBySessionWindowsAsync('opencode', list, usageRows)
+      upsertCursor(dbPath, 0, mtime, read.maxRowid, 'opencode')
+    }
     this.stats.by_agent['opencode'] =
       (this.stats.by_agent['opencode'] ?? 0) + usageRows.length
-    this.opencodeLastMtime = { path: dbPath, mtime, count: rows.length }
-    this.stats.opencode_messages = rows.length
+    this.stats.opencode_messages = countRowsForAgent('opencode')
     await yieldToLoop()
     return usageRows.length
   }
 
+  /**
+   * DSH 会话扫描 —— 按文件增量。
+   *
+   * 老实现每次指纹变化（任何会话文件被写）就把全部 43 个会话重新解压解析一遍：
+   * 23.6MB zstd → 75MB 文本 → 5.2 万行 JSON，单线程实测 25.5 秒，而会话活跃期间
+   * 指纹每 2 秒就变一次 —— 这是「卡死」最粗的那根管子。
+   * 现在每个文件有自己的游标（size+mtime），只重解压真正变了的那个文件。
+   */
   private async scanDsh(force = false): Promise<number> {
     const root = join(homedir(), '.dsh', 'sessions')
     if (!existsSync(root)) return 0
@@ -501,103 +652,88 @@ export class UsageScanner extends EventEmitter {
       /\.jsonl\.zstd$/
     )
     if (files.length === 0) return 0
-    const parts: string[] = []
+
+    this.stats.dsh_sessions = files.length
+    let total = 0
     let idx = 0
+    const dshStartedAt = Date.now()
+    let reparsed = 0
     for (const f of files) {
       try {
         const s = await stat(f.path)
-        parts.push(`${f.path}:${s.size}:${Math.floor(s.mtimeMs)}`)
-      } catch {}
-      if (idx++ % 20 === 0) await yieldToLoop()
-    }
-    const fingerprint = parts.sort().join('|')
-    if (!force && this.dshFingerprint === fingerprint) return 0
-
-    const all: UsageRow[] = []
-    const seen = new Set<string>()
-    for (const f of files) {
-      try {
-        const rows = await parseDshViaWorker(
-          f.path,
-          f.sessionId,
-          () => parseDshSessionAsync(f.path, f.sessionId)
-        ) as Array<import('./parsers.js').ParsedUsageRow & { seq?: number }>
-        for (const r of rows) {
-          const key = `${r.seq ?? ''}@${r.at}`
-          if (seen.has(key)) continue
-          seen.add(key)
-          const { seq, ...row } = r
-          all.push({ ...row, source_file: f.path } as UsageRow)
+        const size = s.size
+        const mtime = Math.floor(s.mtimeMs)
+        const cursor = getCursor(f.path)
+        const unchanged =
+          !force &&
+          !!cursor &&
+          cursor.head_hash !== null &&
+          cursor.file_size === size &&
+          cursor.file_mtime === mtime
+        if (!unchanged) {
+          const rows = await parseDshViaWorker(
+            f.path,
+            f.sessionId,
+            () => parseDshSessionAsync(f.path, f.sessionId)
+          )
+          const parsed = dedupeDshRows(
+            (Array.isArray(rows) ? rows : []) as Array<
+              import('./dsh-parse.js').DshUsageRow
+            >
+          )
+          const withSource: UsageRow[] = parsed.map((r) => {
+            const { seq, ...rest } = r
+            void seq
+            return { ...rest, source_file: f.path } as UsageRow
+          })
+          // 解析抛错（压缩流损坏/读取失败）时 parser 会 throw → 外层 catch；
+          // 真解析成功但 0 行时才按空重建（会话确实没有计费调用）
+          await replaceUsageBySourceFileAsync(f.path, 'dsh', f.sessionId, withSource)
+          upsertCursor(f.path, size, mtime, withSource.length, `dsh:${size}:${mtime}`)
+          total += withSource.length
+          reparsed++
+          this.stats.by_agent['dsh'] =
+            (this.stats.by_agent['dsh'] ?? 0) + withSource.length
         }
       } catch (e) {
         this.stats.errors++
-        console.warn(`[token-usage] 解析 dsh 会话 ${f.path} 失败:`, e)
+        console.warn(`[token-usage] 解析 dsh 会话 ${f.path} 失败（保留已入库数据）:`, e)
       }
-      await yieldToLoop()
+      if (idx++ % 8 === 0) await yieldToLoop()
     }
-    await replaceUsageByAgentAsync('dsh', all)
-    this.dshFingerprint = fingerprint
-    this.stats.by_agent['dsh'] = (this.stats.by_agent['dsh'] ?? 0) + all.length
-    this.stats.dsh_sessions = files.length
-    return all.length
+    if (reparsed > 0) {
+      console.info(
+        `[token-usage] dsh 重解压 ${reparsed}/${files.length} 个会话，用时 ${Date.now() - dshStartedAt}ms，行 ${total}`
+      )
+    }
+    return total
   }
 
   private async discoverJsonl(): Promise<DiscoveredFile[]> {
     const out: DiscoveredFile[] = []
     const home = homedir()
-
-    const ompDir = join(home, '.omp', 'agent', 'sessions')
-    if (existsSync(ompDir)) {
-      await walkJsonlAsync(ompDir, (p) => {
-        out.push({
-          path: p,
-          agent: 'omp',
-          sessionId: sessionIdFromFile('omp', p)
-        })
-      })
-    }
-
-    const zcodeDir = join(home, '.zcode', 'cli', 'rollout')
-    if (existsSync(zcodeDir)) {
-      await walkJsonlAsync(zcodeDir, (p) => {
-        out.push({
-          path: p,
-          agent: 'zcode',
-          sessionId: sessionIdFromFile('zcode', p)
-        })
-      })
-    }
-
-    const codexDir = join(home, '.codex', 'sessions')
-    if (existsSync(codexDir)) {
+    // 渠道表驱动：SOURCES 里类型为 jsonl 的全部自动遍历，
+    // 不再为每个 agent 手写一段（之前加 agent 必须同时改 scanner）
+    for (const s of listDiscoveredSources()) {
+      if (s.type !== 'jsonl') continue
+      // 扫描根目录 = dataSubpath（精确到会话目录），绝不能退化成 homeSubpath：
+      // ~/.codex、~/.workbuddy 这类根目录下有 1.6 万 / 4.4 万个无关文件
+      const dir = join(home, s.dataSubpath ?? s.homeSubpath)
+      if (!existsSync(dir)) continue
       await walkJsonlAsync(
-        codexDir,
+        dir,
         (p) => {
           out.push({
             path: p,
-            agent: 'codex',
-            sessionId: sessionIdFromFile('codex', p)
+            agent: s.agent,
+            sessionId: sessionIdFromFile(s.agent, p)
           })
         },
-        5
+        0,
+        s.filePattern ?? /\.jsonl$/,
+        s.maxDepth ?? 8
       )
     }
-
-    const claudeDir = join(home, '.claude', 'projects')
-    if (existsSync(claudeDir)) {
-      await walkJsonlAsync(
-        claudeDir,
-        (p) => {
-          out.push({
-            path: p,
-            agent: 'claude',
-            sessionId: sessionIdFromFile('claude', p)
-          })
-        },
-        5
-      )
-    }
-
     return out
   }
 }
@@ -608,9 +744,10 @@ async function walkJsonlAsync(
   dir: string,
   onFile: (path: string) => void,
   depth = 0,
-  match: RegExp = /\.jsonl$/
+  match: RegExp = /\.jsonl$/,
+  maxDepth = 8
 ): Promise<void> {
-  if (depth > 8) return
+  if (depth > maxDepth) return
   let entries: string[]
   try {
     entries = await readdir(dir)
@@ -629,7 +766,7 @@ async function walkJsonlAsync(
       continue
     }
     if (st.isDirectory()) {
-      await walkJsonlAsync(full, onFile, depth + 1, match)
+      await walkJsonlAsync(full, onFile, depth + 1, match, maxDepth)
     } else if (st.isFile() && match.test(name) && !name.endsWith('.bak')) {
       onFile(full)
     }
@@ -724,6 +861,7 @@ function freshStats(): ScannerStats {
       codex: 0,
       claude: 0,
       dsh: 0,
+      workbuddy: 0,
       unknown: 0
     },
     errors: 0,

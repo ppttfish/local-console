@@ -162,6 +162,7 @@ const AGENT_LABEL_STATIC: Record<string, string> = {
   codex: 'Codex',
   claude: 'Claude',
   dsh: 'DSH (DeepSeek)',
+  workbuddy: 'WorkBuddy',
   unknown: '未知'
 }
 const agentLabels = computed<Record<string, string>>(() => ({
@@ -179,15 +180,16 @@ const AGENT_COLOR: Record<string, string> = {
   codex: '#8b5cf6',
   claude: '#ef4444',
   dsh: '#14b8a6',
+  workbuddy: '#6366f1',
   unknown: '#94a3b8'
 }
 
 type PresetRange = 'today' | '24h' | '7d' | '30d' | 'all'
 type Granularity = 'hour' | 'day' | 'month'
 
-const agent = ref<'all' | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh'>(
-  'all'
-)
+const agent = ref<
+  'all' | 'omp' | 'zcode' | 'opencode' | 'codex' | 'claude' | 'dsh' | 'workbuddy'
+>('all')
 const model = ref<string>('all')
 const models = ref<string[]>([])
 const granularity = ref<Granularity>('hour')
@@ -630,6 +632,75 @@ const modelBarOptions = computed<ChartOptions<'bar'>>(
     }) as ChartOptions<'bar'>
 )
 
+// ===== 模型分布：柱状 / 饼图切换 =====
+const modelTab = ref<'bar' | 'doughnut'>('bar')
+
+/** 饼图配色：模型数量多且没有稳定色板，用一组区分度够高的固定色（明暗主题都能看） */
+const MODEL_COLORS = [
+  '#0ea5e9',
+  '#8b5cf6',
+  '#10b981',
+  '#f59e0b',
+  '#ef4444',
+  '#14b8a6',
+  '#6366f1',
+  '#ec4899',
+  '#84cc16',
+  '#f97316'
+]
+const MODEL_OTHER_COLOR = '#94a3b8'
+
+const modelDoughnut = ref<ChartData<'doughnut'>>({ labels: [], datasets: [] })
+let pieIdle: number | null = null
+watch([() => summary.value?.by_model, theme], () => {
+  if (pieIdle) cancelIdle(pieIdle)
+  pieIdle = scheduleIdle(() => {
+    const all = summary.value?.by_model ?? []
+    const top = all.slice(0, 10)
+    const rest = all.slice(10)
+    const labels = top.map((r) => r.model)
+    const data = top.map((r) => r.tokens)
+    const colors = top.map((_, i) => MODEL_COLORS[i % MODEL_COLORS.length]!)
+    if (rest.length > 0) {
+      labels.push(`其他（${rest.length} 个模型）`)
+      data.push(rest.reduce((a, b) => a + b.tokens, 0))
+      colors.push(MODEL_OTHER_COLOR)
+    }
+    modelDoughnut.value = {
+      labels,
+      datasets: [{ data, backgroundColor: colors, borderWidth: 0 }]
+    }
+  })
+}, { immediate: true, deep: true })
+
+const modelDoughnutOptions = computed<ChartOptions<'doughnut'>>(() => {
+  const base = withThemeColors({
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: 'right' },
+      tooltip: {
+        callbacks: {
+          label: (ctx) => {
+            const v = num(ctx.parsed)
+            const total = (ctx.dataset.data as number[]).reduce(
+              (a, b) => a + num(b),
+              0
+            )
+            const pct = total > 0 ? ((v / total) * 100).toFixed(1) : '0'
+            return `${ctx.label}: ${fmtToken(v)} (${pct}%)`
+          }
+        }
+      }
+    }
+  }) as ChartOptions<'doughnut'>
+  // withThemeColors 会用主题默认值覆盖整个 legend.labels，收紧行距要在它之后再改：
+  // TOP 10 + 其他 最多 11 条图例，11×默认行高会超出 240px 画布被裁掉
+  const labels = base.plugins?.legend?.labels
+  if (labels) Object.assign(labels, { padding: 7, font: { size: 10 } })
+  return base
+})
+
 // 启动主题监听
 onMounted(() => {
   stopThemeWatch = watchTheme(() => {
@@ -673,7 +744,8 @@ const agentOptions = computed(() => [
   { value: 'opencode', label: opencodeLabel.value },
   { value: 'codex', label: 'Codex' },
   { value: 'claude', label: 'Claude' },
-  { value: 'dsh', label: 'DSH' }
+  { value: 'dsh', label: 'DSH' },
+  { value: 'workbuddy', label: 'WorkBuddy' }
 ])
 
 const rangeOptions = computed(() => [
@@ -911,9 +983,43 @@ const modelOptions = computed(() => [
             </p>
           </Card>
           <Card class="p-4">
-            <CardTitle class="mb-2">Token 分布 · 按模型 TOP 10</CardTitle>
-            <div class="h-60">
+            <div class="mb-2 flex items-center justify-between">
+              <CardTitle>
+                {{
+                  modelTab === 'bar'
+                    ? 'Token 分布 · 按模型 TOP 10'
+                    : 'Token 占比 · 按模型 TOP 10'
+                }}
+              </CardTitle>
+              <div class="flex items-center gap-1 rounded-md bg-muted p-0.5 text-[11px]">
+                <button
+                  :class="[
+                    'rounded px-2 py-0.5 transition-colors',
+                    modelTab === 'bar' ? 'bg-card shadow-sm' : 'text-muted-foreground'
+                  ]"
+                  @click="modelTab = 'bar'"
+                >
+                  柱状图
+                </button>
+                <button
+                  :class="[
+                    'rounded px-2 py-0.5 transition-colors',
+                    modelTab === 'doughnut' ? 'bg-card shadow-sm' : 'text-muted-foreground'
+                  ]"
+                  @click="modelTab = 'doughnut'"
+                >
+                  饼图
+                </button>
+              </div>
+            </div>
+            <div :class="modelTab === 'doughnut' ? 'h-[300px]' : 'h-60'">
+              <Doughnut
+                v-if="modelTab === 'doughnut'"
+                :data="modelDoughnut"
+                :options="modelDoughnutOptions"
+              />
               <Bar
+                v-else
                 :data="modelBar"
                 :options="modelBarOptions"
               />
@@ -1098,7 +1204,8 @@ const modelOptions = computed(() => [
             · <code>~/.claude/projects/</code><br />
             · <code>~/.local/share/opencode/opencode.db</code>
             (OpenCode / OpenChamber)<br />
-            · <code>~/.dsh/sessions/</code> (DSH)
+            · <code>~/.dsh/sessions/</code> (DSH)<br />
+            · <code>~/.workbuddy/projects/</code> (WorkBuddy / CodeBuddy 系)
           </CardDescription>
         </Card>
       </TabsContent>

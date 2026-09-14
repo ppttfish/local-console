@@ -1,11 +1,15 @@
 /**
  * 解析 Worker —— 把 CPU 最重的 DSH zstd 解压 + Codex 全量解析搬离主线程
  * 主线程通过 postMessage 发任务，Worker 回包，期间主线程事件循环完全空闲
+ *
+ * 注意：Worker 与主线程共用 plugins/builtin/token-usage/dsh-parse.ts 里的会话解析，
+ * 别再往这里拷一份（历史上拷了一份，v3 格式上线后 Worker 里那份没跟上，
+ * 打包态又刚好只能走 Worker，等于 DSH 直接扫不出数据）。
  */
 import { parentPort } from 'node:worker_threads'
-import { readFileSync, existsSync } from 'node:fs'
-import { decompress as zstdDecompress } from 'fzstd'
+import { readFileSync } from 'node:fs'
 import { calcCost } from '../plugins/builtin/token-usage/pricing.js'
+import { parseDshFile } from '../plugins/builtin/token-usage/dsh-parse.js'
 
 function numOr(v: unknown, fallback: number): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback
@@ -45,7 +49,7 @@ if (!parentPort) throw new Error('parse-worker must run as Worker')
 parentPort.on('message', (task: Task) => {
   try {
     if (task.type === 'dsh') {
-      const rows = parseDshSync(task.filePath, task.fallbackSessionId)
+      const rows = parseDshFile(task.filePath, task.fallbackSessionId)
       parentPort!.postMessage({ id: task.id, ok: true, rows })
     } else if (task.type === 'codex') {
       const rows = parseCodexFromContent(task.content, task.fallbackSessionId)
@@ -59,61 +63,6 @@ parentPort.on('message', (task: Task) => {
     parentPort!.postMessage({ id: (task as Task).id, ok: false, error: String(e) })
   }
 })
-
-function parseDshSync(filePath: string, fallbackSessionId: string) {
-  if (!existsSync(filePath)) return []
-  let raw: Uint8Array
-  try {
-    raw = zstdDecompress(readFileSync(filePath))
-  } catch {
-    return []
-  }
-  const rows: Array<Record<string, unknown>> = []
-  let sessionId = fallbackSessionId
-  let model = 'unknown'
-  for (const line of new TextDecoder().decode(raw).split('\n')) {
-    if (!line) continue
-    let ev: unknown
-    try { ev = JSON.parse(line) } catch { continue }
-    if (!ev || typeof ev !== 'object') continue
-    const e = ev as Record<string, unknown>
-    const data = (e['data'] ?? {}) as Record<string, unknown>
-    const t = e['type']
-    if (t === 'session') {
-      sessionId = strOr(e['id'] as string | undefined, sessionId)
-    } else if (t === 'request/context') {
-      model = strOr(data['model'] as string | undefined, model)
-    } else if (t === 'request/header') {
-      const cfg = data['header'] as Record<string, unknown> | undefined
-      const m = (cfg?.['config'] as Record<string, unknown> | undefined)?.['model']
-      model = strOr(m as string | undefined, model)
-    } else if (t === 'assistant/chunk') {
-      const chunk = data['chunk'] as Record<string, unknown> | undefined
-      if (!chunk || chunk['type'] !== 'usage') continue
-      const usage = chunk['usage'] as Record<string, unknown> | undefined
-      if (!usage) continue
-      const input = numOr(usage['inputTokens'], 0)
-      const output = numOr(usage['outputTokens'], 0)
-      const cacheRead = numOr(usage['cacheReadTokens'], 0)
-      if (input + output + cacheRead === 0) continue
-      rows.push({
-        agent: 'dsh',
-        model,
-        input_tokens: input,
-        output_tokens: output,
-        cached_tokens: cacheRead,
-        cache_read_tokens: cacheRead,
-        cache_write_tokens: 0,
-        cost_usd: calcCost(model, input, output, cacheRead, 0),
-        at: numOr(e['time'], Date.now()),
-        session_id: sessionId,
-        meta: null,
-        seq: typeof e['seq'] === 'number' ? e['seq'] : undefined
-      })
-    }
-  }
-  return rows
-}
 
 function parseCodexFromContent(content: string, fallbackSessionId: string) {
   const lines = content.split('\n')

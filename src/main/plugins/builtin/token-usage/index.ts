@@ -39,9 +39,9 @@ import { listProviderMetas } from './providers/index.js'
 export const tokenUsagePlugin: Plugin = {
   id: 'token-usage',
   name: 'Agent Token 用量统计',
-  version: '2.1.0',
+  version: '2.2.0',
   description:
-    '统计本机 agent (omp / zcode / opencode / codex / claude / dsh) 的 token 用量、成本与模型分布；监控 AI 服务商订阅配额',
+    '统计本机 agent (omp / zcode / opencode / codex / claude / dsh / workbuddy) 的 token 用量、成本与模型分布；监控 AI 服务商订阅配额',
 
 
   async onLoad(ctx) {
@@ -64,10 +64,10 @@ export const tokenUsagePlugin: Plugin = {
   registerMcpTools(server: McpServer) {
     server.tool(
       'pws_query_agent_usage',
-      '查询 agent token 用量与成本。agent: omp|zcode|opencode|codex|claude|dsh|all；model: 模型名；from/to: 毫秒时间戳；granularity: hour|day|month。返回总 token、输入/输出/缓存、缓存命中率、调用次数、USD 成本、按 agent/model/day 分桶、趋势时间序列。',
+      '查询 agent token 用量与成本。agent: omp|zcode|opencode|codex|claude|dsh|workbuddy|all；model: 模型名；from/to: 毫秒时间戳；granularity: hour|day|month。返回总 token、输入/输出/缓存、缓存命中率、调用次数、USD 成本、按 agent/model/day 分桶、趋势时间序列。',
       {
         agent: z
-          .enum(['omp', 'zcode', 'opencode', 'codex', 'claude', 'dsh', 'all'])
+          .enum(['omp', 'zcode', 'opencode', 'codex', 'claude', 'dsh', 'workbuddy', 'all'])
           .optional()
           .default('all'),
         model: z.string().optional(),

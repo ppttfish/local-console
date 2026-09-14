@@ -3,8 +3,7 @@
  * 失败自动回退到同步查询，保证 dev 未打包 / Worker 崩溃时仍可工作
  */
 import { Worker } from 'node:worker_threads'
-import { join, resolve } from 'node:path'
-import { existsSync } from 'node:fs'
+import { workerPath } from './worker-path.js'
 import { getDbPath } from '../services/db.js'
 
 type Pending = { resolve:(v:unknown)=>void; reject:(e:unknown)=>void; timer:ReturnType<typeof setTimeout> }
@@ -13,29 +12,28 @@ let worker: Worker | null = null
 let nextId = 1
 const pending = new Map<number, Pending>()
 let workerDisabled = false
+let warned = false
 let initPromise: Promise<void> | null = null
 
 function getWorkerPath(): string | null {
-  // 同 parse-worker-client：打包态 worker 在 asar 内无法被 worker_threads 加载，
-  // 须优先命中 asarUnpack 解出的 app.asar.unpacked 真实路径
-  const unpackedDir = __dirname.includes('app.asar')
-    ? __dirname.replace('app.asar', 'app.asar.unpacked')
-    : null
-  const candidates = [
-    ...(unpackedDir ? [join(unpackedDir, 'workers/db-worker.cjs'), join(unpackedDir, 'db-worker.cjs')] : []),
-    join(__dirname, 'workers/db-worker.cjs'),
-    join(__dirname, 'db-worker.cjs'),
-    resolve('out/main/workers/db-worker.cjs'),
-  ]
-  for (const p of candidates) if (existsSync(p)) return p
-  return null
+  return workerPath('db-worker.cjs')
 }
 
 function ensureWorker(): Worker | null {
   if (workerDisabled) return null
   if (worker) return worker
   const p = getWorkerPath()
-  if (!p) { workerDisabled = true; return null }
+  if (!p) {
+    workerDisabled = true
+    if (!warned) {
+      warned = true
+      console.warn(
+        '[db-worker] 未找到 db-worker.cjs，聚合查询回落到主线程。' +
+          '打包态请确认 asarUnpack 覆盖 out/main/workers/** 与 out/main/chunks/**'
+      )
+    }
+    return null
+  }
   try {
     worker = new Worker(p)
     worker.on('message', (msg: { id:number; ok:boolean; result?:unknown; error?:string }) => {
@@ -46,8 +44,14 @@ function ensureWorker(): Worker | null {
       if (msg.ok) ent.resolve(msg.result)
       else ent.reject(new Error(msg.error))
     })
-    worker.on('error', () => {
-      for (const [,e] of pending){ clearTimeout(e.timer); e.reject(new Error('db worker error')) }
+    worker.on('error', (e) => {
+      if (!warned) {
+        warned = true
+        console.warn(
+          `[db-worker] Worker 崩溃，聚合查询回落到主线程：${e instanceof Error ? e.message : String(e)}`
+        )
+      }
+      for (const [,e2] of pending){ clearTimeout(e2.timer); e2.reject(new Error('db worker error')) }
       pending.clear()
       try{ worker?.terminate()}catch{} worker=null; workerDisabled=true
     })

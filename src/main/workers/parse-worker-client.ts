@@ -3,8 +3,7 @@
  * 失败自动回退到同步解析，保证在 dev 未打包 / Worker 崩溃时仍可工作
  */
 import { Worker } from 'node:worker_threads'
-import { join, resolve } from 'node:path'
-import { existsSync } from 'node:fs'
+import { workerPath } from './worker-path.js'
 
 type Pending = {
   resolve: (v: unknown) => void
@@ -16,27 +15,10 @@ let worker: Worker | null = null
 let nextId = 1
 const pending = new Map<number, Pending>()
 let workerDisabled = false
+let warned = false
 
 function getWorkerPath(): string | null {
-  // 打包态 __dirname 位于 app.asar 内，而 worker_threads 无法从 asar 加载文件
-  //（Electron 限制），electron-builder 的 asarUnpack 会把 worker 解到
-  // app.asar.unpacked 下——必须优先命中解包后的真实路径
-  const unpackedDir = __dirname.includes('app.asar')
-    ? __dirname.replace('app.asar', 'app.asar.unpacked')
-    : null
-  const candidates = [
-    ...(unpackedDir ? [join(unpackedDir, 'workers/parse-worker.cjs'), join(unpackedDir, 'parse-worker.cjs')] : []),
-    // CJS 主进程：__dirname 指向 out/main
-    // 开发期：src/main/workers 尚未打包，尝试多个候选
-    join(__dirname, 'workers/parse-worker.cjs'),
-    join(__dirname, 'parse-worker.cjs'),
-    resolve('out/main/workers/parse-worker.cjs'),
-    resolve('src/main/workers/parse-worker.ts')
-  ]
-  for (const p of candidates) {
-    if (existsSync(p)) return p
-  }
-  return null
+  return workerPath('parse-worker.cjs')
 }
 
 function ensureWorker(): Worker | null {
@@ -45,6 +27,13 @@ function ensureWorker(): Worker | null {
   const p = getWorkerPath()
   if (!p) {
     workerDisabled = true
+    if (!warned) {
+      warned = true
+      console.warn(
+        '[parse-worker] 未找到 parse-worker.cjs，解析回落到主线程（会卡 UI）。' +
+          '打包态请确认 asarUnpack 覆盖 out/main/workers/** 与 out/main/chunks/**'
+      )
+    }
     return null
   }
   try {
@@ -58,8 +47,14 @@ function ensureWorker(): Worker | null {
       if (msg.ok) entry.resolve(msg.rows)
       else entry.reject(new Error(msg.error))
     })
-    worker.on('error', () => {
+    worker.on('error', (e) => {
       // Worker 崩溃：拒绝所有 pending 并禁用，后续回退同步
+      if (!warned) {
+        warned = true
+        console.warn(
+          `[parse-worker] Worker 崩溃，解析回落到主线程（会卡 UI）：${e instanceof Error ? e.message : String(e)}`
+        )
+      }
       for (const [, ent] of pending) {
         clearTimeout(ent.timer)
         ent.reject(new Error('worker error'))

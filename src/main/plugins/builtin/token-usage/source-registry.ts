@@ -8,7 +8,6 @@ import { join } from 'node:path'
 import { existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import type { Platform } from './storage.js'
-import type { LineParser } from './parsers.js'
 
 /** 单个 agent 数据源配置 */
 export interface Source {
@@ -27,7 +26,16 @@ export interface Source {
   /** 文件名匹配（正则），过滤掉非日志文件 */
   filePattern?: RegExp
   /** jsonl 类型：用哪个 parser */
-  parser?: 'omp' | 'zcode' | 'codex' | 'claude'
+  parser?: 'omp' | 'zcode' | 'codex' | 'claude' | 'workbuddy'
+  /**
+   * 数据目录（相对 home）—— 扫描根目录 + fs.watch 监听目标。
+   * 必须精确到会话目录：写成 agent 根目录（~/.workbuddy、~/.codex 这类）
+   * 会把 logs / blobs / vendor 里几万个无关文件也 stat 一遍，
+   * 单次扫描白白多花 8 秒（实测 830 → 72000 个文件）。
+   */
+  dataSubpath?: string
+  /** 递归深度上限（默认 8） */
+  maxDepth?: number
   /** sqlite 类型：SQL + 字段映射 */
   sqlite?: {
     /** 相对 homeSubpath 的 db 文件路径 */
@@ -67,7 +75,8 @@ export const SOURCES: Source[] = [
     homeSubpath: '.omp',
     pathGlob: 'agent/sessions/**/*.jsonl',
     filePattern: /\.jsonl$/,
-    parser: 'omp'
+    parser: 'omp',
+    dataSubpath: '.omp/agent/sessions'
   },
   {
     agent: 'dsh',
@@ -76,7 +85,8 @@ export const SOURCES: Source[] = [
     type: 'zstd-jsonl',
     homeSubpath: '.dsh',
     pathGlob: 'sessions/**/*.jsonl.zstd',
-    filePattern: /\.jsonl\.zstd$/
+    filePattern: /\.jsonl\.zstd$/,
+    dataSubpath: '.dsh/sessions'
   },
   {
     agent: 'zcode',
@@ -86,7 +96,8 @@ export const SOURCES: Source[] = [
     homeSubpath: '.zcode',
     pathGlob: 'cli/rollout/*.jsonl',
     filePattern: /^model-io-sess_/,
-    parser: 'zcode'
+    parser: 'zcode',
+    dataSubpath: '.zcode/cli/rollout'
   },
   {
     agent: 'codex',
@@ -96,7 +107,9 @@ export const SOURCES: Source[] = [
     homeSubpath: '.codex',
     pathGlob: 'sessions/**/*.jsonl',
     filePattern: /^rollout-/,
-    parser: 'codex'
+    parser: 'codex',
+    dataSubpath: '.codex/sessions',
+    maxDepth: 5
   },
   {
     agent: 'claude',
@@ -106,7 +119,22 @@ export const SOURCES: Source[] = [
     homeSubpath: '.claude',
     pathGlob: 'projects/**/*.jsonl',
     filePattern: /\.jsonl$/,
-    parser: 'claude'
+    parser: 'claude',
+    dataSubpath: '.claude/projects',
+    maxDepth: 5
+  },
+  {
+    agent: 'workbuddy',
+    displayName: 'WorkBuddy',
+    description: '腾讯 WorkBuddy / CodeBuddy 系国产 agent（混元 / DeepSeek / GLM / Qwen / Kimi）',
+    type: 'jsonl',
+    homeSubpath: '.workbuddy',
+    pathGlob: 'projects/**/*.jsonl',
+    filePattern: /\.jsonl$/,
+    parser: 'workbuddy',
+    // 只监听 projects：.workbuddy 根下 daemon.log 每秒都在写，
+    // 整目录 recursive watch 会让扫描被日志噪音拖着一直跑
+    dataSubpath: '.workbuddy/projects'
   },
   {
     agent: 'opencode',
@@ -120,15 +148,20 @@ export const SOURCES: Source[] = [
       query: `SELECT id, session_id, time_created, data
               FROM message
               WHERE data LIKE '%assistant%' AND data LIKE '%tokens%'`,
-      extract: (row) => {
-        // 行级解析挪到 scanner 调用 extractRow 之前
-        // 这里返回标记，实际在 scanner 里做
+      extract: (_row) => {
+        // opencode 的 sqlite 读取没有走 Source.sqlite（scanner 直接调
+        // parsers.readOpenCodeDbAfter 做 rowid 增量），这里只保留配置占位
         return null
       }
     }
   }
   // 以后加新 agent：复制一份，改 agent/displayName/pathGlob/parser 即可
 ]
+
+/** 按 agent 取数据源配置 */
+export function sourceFor(agent: Platform): Source | undefined {
+  return SOURCES.find((s) => s.agent === agent)
+}
 
 /** 检测一个 source 是否在本机存在（homeSubpath 目录存在） */
 export function isSourceAvailable(s: Source): boolean {

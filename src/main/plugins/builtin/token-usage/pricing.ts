@@ -62,6 +62,12 @@ const DEFAULT: PricingTable = {
   'deepseek-chat': { input: 0.14, output: 0.28, cache_read: 0.014, cache_write: 0 },
   'deepseek-reasoner': { input: 0.14, output: 2.19, cache_read: 0.014, cache_write: 0 },
   'deepseek-coder': { input: 0.14, output: 0.28, cache_read: 0.014, cache_write: 0 },
+  // DSH / WorkBuddy 上报的 deepseek-v4 系列（估算值，可在设置页改）
+  'deepseek-v4-flash': { input: 0.28, output: 1.1, cache_read: 0.028, cache_write: 0 },
+  'deepseek-v4-flash-0731': { input: 0.28, output: 1.1, cache_read: 0.028, cache_write: 0 },
+  'deepseek-v4-pro': { input: 0.55, output: 2.2, cache_read: 0.055, cache_write: 0 },
+  'deepseek-v4.1-flash': { input: 0.28, output: 1.1, cache_read: 0.028, cache_write: 0 },
+  'deepseek/deepseek-v4.1-flash': { input: 0.28, output: 1.1, cache_read: 0.028, cache_write: 0 },
 
   // GLM (zcode 模型) — GLM-5.2 按 codeburn 别名 glm-5p1 (GLM-5.1) 计费，LiteLLM 暂无独立定价
   'GLM-4.5': { input: 0.6, output: 2.2, cache_read: 0.11, cache_write: 0 },
@@ -71,6 +77,17 @@ const DEFAULT: PricingTable = {
   'GLM-5.2': { input: 1, output: 3.2, cache_read: 0.2, cache_write: 0 },
   'GLM-5.3': { input: 1, output: 3.2, cache_read: 0.2, cache_write: 0 },
   'glm-5p1': { input: 1, output: 3.2, cache_read: 0.2, cache_write: 0 },
+  // WorkBuddy 上报小写模型名（priceFor 是大小写敏感的前缀匹配，别名必须显式列）
+  'glm-5.2': { input: 1, output: 3.2, cache_read: 0.2, cache_write: 0 },
+  'glm-5.3': { input: 1, output: 3.2, cache_read: 0.2, cache_write: 0 },
+  'glm-5.1': { input: 1, output: 3.2, cache_read: 0.2, cache_write: 0 },
+
+  // 国产模型（WorkBuddy / CodeBuddy 系）—— 估算值，可在设置页改
+  'hy3': { input: 0.11, output: 0.28, cache_read: 0.022, cache_write: 0 },
+  'hy4-preview': { input: 0.15, output: 0.6, cache_read: 0.03, cache_write: 0 },
+  'hy4-preview-x': { input: 0.4, output: 1.6, cache_read: 0.08, cache_write: 0 },
+  'qwen3.7-max': { input: 1.6, output: 6.4, cache_read: 0.32, cache_write: 0 },
+  'kimi-k2.7': { input: 0.6, output: 2.5, cache_read: 0.15, cache_write: 0 },
 
   // MiniMax
   'MiniMaxAI/MiniMax-M3': { input: 0, output: 0, cache_read: 0, cache_write: 0 },

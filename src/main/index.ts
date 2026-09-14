@@ -52,6 +52,40 @@ function slog(msg: string): void {
   }
 }
 
+let consoleMirrored = false
+/**
+ * 把 console 的 warn/error（以及 token-usage 的诊断 info）也写一份到 startup.log。
+ * 打包态 GUI 没有终端，console 输出全部丢掉，扫描器的「未识别渠道 / Worker 回落
+ * 主线程 / 扫描耗时」这类关键诊断要能被看到，否则线上出问题只能靠猜。
+ * info 只放行白名单前缀，避免把日常噪音灌进日志。
+ */
+const MIRROR_INFO_PREFIXES = ['[token-usage]', '[parse-worker]', '[db-worker]']
+function mirrorConsoleToStartupLog(): void {
+  if (consoleMirrored) return
+  consoleMirrored = true
+  const fmt = (args: unknown[]): string =>
+    args
+      .map((a) => {
+        if (typeof a === 'string') return a
+        if (a instanceof Error) return `${a.message}\n${a.stack ?? ''}`
+        try {
+          return JSON.stringify(a)
+        } catch {
+          return String(a)
+        }
+      })
+      .join(' ')
+  for (const level of ['info', 'warn', 'error'] as const) {
+    const original = console[level].bind(console)
+    console[level] = (...args: unknown[]) => {
+      original(...args)
+      const msg = fmt(args)
+      if (level === 'info' && !MIRROR_INFO_PREFIXES.some((p) => msg.startsWith(p))) return
+      slog(`[${level}] ${msg}`)
+    }
+  }
+}
+
 process.on('uncaughtException', (err) => {
   slog(`UNCAUGHT: ${err.message}\n${err.stack}`)
 })
@@ -240,6 +274,10 @@ app.whenReady().then(async () => {
   slog(`userData=${userData}`)
   slog(`isPackaged=${app.isPackaged}`)
 
+  // 打包态 GUI 没有终端，console.warn/error/info 全部丢掉 —— 扫描器的
+  // 「未识别渠道 / Worker 回落主线程 / 扫描耗时」这类关键诊断要能被看到，
+  // 否则线上出问题只能靠猜。这里把 console 镜像一份进 startup.log。
+  mirrorConsoleToStartupLog()
   // 2. 单实例在拿到锁后，初始化共享模块
   try {
     serviceManager = new ServiceManager(bus, { userData, logsDir })
